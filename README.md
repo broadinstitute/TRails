@@ -1,7 +1,11 @@
-**NOTE:** The first version of TRails will be made available by the end of June, 2026.  Click "Watch" to be notified of the release.
+**NOTE:** The first version of TRails will be made available before the end of June, 2026.  Click "Watch" to be notified of the release.
 
 # TRails
 
 <b>T</b>andem <b>R</b>epeat <b>A</b>nalysis: <b>i</b>nteractive out<b>l</b>ier <b>s</b>earch
 
 An interactive search interface for prioritizing tandem repeat outlier expansions in rare disease callsets
+
+
+<img width="2592" height="3456" alt="ESHG Poster 2026 tandem repeats" src="https://github.com/user-attachments/assets/45b874bc-ff18-47cc-9a65-506c814e8449" />
+
