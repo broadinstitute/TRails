@@ -1472,17 +1472,30 @@ function renderLocusRow(locus, rowIndex) {
         : '';
     const locusIdRaw = locus.LocusId || '';
     const locusIdParts = locusIdRaw.split('-');
+    // TRExplorer search URL for this locus (reused by the standalone TRExplorer link below)
+    const trexHref = (locus.Chrom && locus.Start0Based != null && locus.End1Based != null)
+        ? (() => {
+            const chromNum = locus.Chrom.replace('chr', '');
+            const trexLocusId = locus.TRExplorerLocusId || `${chromNum}-${locus.Start0Based}-${locus.End1Based}-${locus.Motif || ''}`;
+            const igvLoc = encodeURIComponent(`${locus.Chrom}:${locus.Start0Based}-${locus.End1Based}`);
+            return `https://trexplorer.broadinstitute.org/#igvLoc=${igvLoc}&showRs=1&q=${encodeURIComponent(trexLocusId)}&source=&igv_gencode=1&igv_segdups=1&igv_36k_map=1&igv_ncannot=1`;
+        })()
+        : '';
+    // Locus id display text (truncate the motif portion when it is very long)
+    const locusMotifPart = locusIdParts.length >= 4 ? locusIdParts.slice(3).join('-') : '';
+    const locusIdTruncated = locusMotifPart.length > motifTruncLen;
+    const locusIdText = locusIdTruncated
+        ? `${escapeHtml(locusIdParts.slice(0, 3).join('-'))}-${escapeHtml(locusMotifPart.substring(0, motifTruncLen))}...`
+        : escapeHtml(locusIdRaw);
+    // Make the locus id a link to its TRExplorer search. Fall back to the click-to-expand
+    // popup only when there is no genomic position to build the link from.
     let locusIdDisplay;
-    if (locusIdParts.length >= 4) {
-        const locusMotifPart = locusIdParts.slice(3).join('-');
-        if (locusMotifPart.length > motifTruncLen) {
-            const prefix = locusIdParts.slice(0, 3).join('-');
-            locusIdDisplay = `<span class="motif-truncated" title="Click to see full locus ID" data-full-motif="${escapeHtml(locusIdRaw)}">${escapeHtml(prefix)}-${escapeHtml(locusMotifPart.substring(0, motifTruncLen))}...</span>`;
-        } else {
-            locusIdDisplay = escapeHtml(locusIdRaw);
-        }
+    if (trexHref) {
+        locusIdDisplay = `<a href="${trexHref}" target="_blank" title="${escapeHtml(locusIdRaw)} — open in TRExplorer" style="color: #2185d0; text-decoration: none;">${locusIdText}</a>`;
+    } else if (locusIdTruncated) {
+        locusIdDisplay = `<span class="motif-truncated" title="Click to see full locus ID" data-full-motif="${escapeHtml(locusIdRaw)}">${locusIdText}</span>`;
     } else {
-        locusIdDisplay = escapeHtml(locusIdRaw);
+        locusIdDisplay = locusIdText;
     }
     // Tag badges (user tags only)
     const userTagBadges = (locus.tags || []).map(t => `<span class="badge badge-tag">${escapeHtml(t)}</span>`).join(' ');
@@ -1565,15 +1578,9 @@ function renderLocusRow(locus, rowIndex) {
         ? `<a href="https://genome.ucsc.edu/cgi-bin/hgTracks?db=hg38&position=${locus.Chrom}:${locus.Start0Based + 1}-${locus.End1Based}" target="_blank" title="UCSC Genome Browser" style="color: #999; font-size: 0.8em;">UCSC</a>`
         : '';
 
-    // TRExplorer link
-    const trexLink = (locus.Chrom && locus.Start0Based != null && locus.End1Based != null)
-        ? (() => {
-            const chromNum = locus.Chrom.replace('chr', '');
-            const trexLocusId = locus.TRExplorerLocusId || `${chromNum}-${locus.Start0Based}-${locus.End1Based}-${locus.Motif || ''}`;
-            const igvLoc = encodeURIComponent(`${locus.Chrom}:${locus.Start0Based}-${locus.End1Based}`);
-            const q = encodeURIComponent(trexLocusId);
-            return `<a href="https://trexplorer.broadinstitute.org/#igvLoc=${igvLoc}&showRs=1&q=${q}&source=&igv_gencode=1&igv_segdups=1&igv_36k_map=1&igv_ncannot=1" target="_blank" title="TRExplorer" style="color: #999; font-size: 0.8em;">TRExplorer</a>`;
-        })()
+    // TRExplorer link (standalone; shares trexHref with the linked locus id above)
+    const trexLink = trexHref
+        ? `<a href="${trexHref}" target="_blank" title="TRExplorer" style="color: #999; font-size: 0.8em;">TRExplorer</a>`
         : '';
 
     // Combine external links
