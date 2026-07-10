@@ -1,0 +1,2658 @@
+<!DOCTYPE html>
+<html>
+{% include "header_template.html" %}
+
+<div class="ui grid">
+    <div class="ui row">
+        <div class="one wide column"></div>
+        <div class="fourteen wide column">
+
+            <!-- Filter Panel (Task 4) -->
+            <div id="filter-panel">
+<div class="ui form">
+
+    <div class="ui stackable grid" style="margin: 0;">
+    <!-- Left column: radio button fields -->
+    <div class="six wide column">
+
+    <!-- Outlier Type (required, default "all") -->
+    <div class="field">
+        <div class="radio-group">
+            <label>Outlier Type:</label>
+            <div class="ui radio checkbox">
+                <input type="radio" name="outlier_type" value="all" checked>
+                <label>Long Allele</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="outlier_type" value="short">
+                <label>Biallelic</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="outlier_type" value="hemi">
+                <label>Hemizygous</label>
+            </div>
+        </div>
+    </div>
+
+    <!-- Require Allele Size Affected > Unaffected (per-sample) -->
+    <div class="field">
+        <label>Require Allele Size Affected > Unaffected (per-sample)</label>
+        <div class="radio-group">
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_above_unaffected" value="" checked>
+                <label>No</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_above_unaffected" value="first">
+                <label>1+ affected</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_above_unaffected" value="second">
+                <label>2+ affected</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_above_unaffected" value="third">
+                <label>3+ affected</label>
+            </div>
+        </div>
+    </div>
+
+    <!-- Require Allele Size Affected > Unaffected (per-family) -->
+    <div class="field">
+        <label>Require Allele Size Affected > Unaffected (per-family)</label>
+        <div class="radio-group">
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_families_above_unaffected" value="" checked>
+                <label>No</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_families_above_unaffected" value="first">
+                <label>1+ families</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_families_above_unaffected" value="second">
+                <label>2+ families</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_families_above_unaffected" value="third">
+                <label>3+ families</label>
+            </div>
+        </div>
+    </div>
+
+    <!-- Require Affected Allele > Population Alleles -->
+    <div class="field">
+        <label style="display: inline;">Require Affected Allele &gt; Population Allele</label><span style="display:inline-block; margin-bottom:10px; margin-left: 4px; font-weight: normal;">( <label style="font-weight: normal; cursor: pointer;"><input type="radio" name="population_metric" value="99th" checked style="vertical-align: middle;"> 99th % </label> <label style="font-weight: normal; cursor: pointer; margin-left: 5px;"><input type="radio" name="population_metric" value="max" style="vertical-align: middle;"> max</label> <i class="question circle outline icon help-popup" style="color: #999; cursor: pointer;" data-variation="wide" data-position="top center" data-html="<b>99th %:</b> require the affected allele to exceed each population dataset's 99th-percentile allele size at a given locus. <br /><br /><b>max:</b> require it to exceed each dataset's largest observed allele at a given locus. This is a more stringent filter, but also more susceptible to noise if the max allele in one of the population datasets was overestimated."></i>)</span>
+        <div class="radio-group">
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_above_population" value="" checked>
+                <label>No</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_above_population" value="long-read">
+                <label>Long-read (HPRC256, AoU1027, AoU2High, AoU2Mid)</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_above_population" value="short-read">
+                <label>Short-read (TenK10K)</label>
+            </div>
+        </div>
+        <div class="ui checkbox" style="margin-top: 0.5em; margin-left: 1em;">
+            <input type="checkbox" name="include_loci_without_population_data">
+            <label>Also show loci without population data</label>
+        </div>
+    </div>
+
+    <!-- Source (database selector) — only shown if more than one database is available -->
+    {% if db_labels | length > 1 %}
+    <div class="field">
+        <label>Source Database</label>
+        <div class="radio-group">
+            {% for label in db_labels %}
+            <div class="ui radio checkbox">
+                <input type="radio" name="source" value="{{ label }}" {{ 'checked' if loop.first else '' }}>
+                <label>{{ label }}</label>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    </div>
+    <!-- Right column: checkbox fields -->
+    <div class="ten wide column">
+
+    <!-- Boolean flags -->
+    <div class="field">
+        <div class="checkbox-group">
+            <div class="ui checkbox">
+                <input type="checkbox" name="apply_pathogenic_threshold">
+                <label>Apply pathogenic thresholds</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="known_loci_only">
+                <label>Known disease loci only</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="known_motifs_only">
+                <label>Known disease motifs only</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="mendelian_genes_only">
+                <label>Mendelian disease genes only</label>
+            </div>
+        </div>
+    </div>
+
+    <!-- Include Gene Regions -->
+    <div class="field">
+        <label>Include Gene Regions</label>
+        <div class="checkbox-group">
+            <div class="ui checkbox"><input type="checkbox" name="gene_region_cds"><label>CDS</label></div>
+            <div class="ui checkbox"><input type="checkbox" name="gene_region_promoter"><label>Promoter</label></div>
+            <div class="ui checkbox"><input type="checkbox" name="gene_region_utr"><label>UTR</label></div>
+            <div class="ui checkbox"><input type="checkbox" name="gene_region_intron"><label>Intron</label></div>
+            <div class="ui checkbox"><input type="checkbox" name="gene_region_exon"><label>Exon</label></div>
+            <div class="ui checkbox"><input type="checkbox" name="gene_region_intergenic"><label>Intergenic</label></div>
+        </div>
+    </div>
+
+    <!-- Exclude Gene Regions -->
+    <div class="field">
+        <label>Exclude Gene Regions</label>
+        <div class="checkbox-group">
+            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_cds"><label>CDS</label></div>
+            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_promoter"><label>Promoter</label></div>
+            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_utr"><label>UTR</label></div>
+            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_intron"><label>Intron</label></div>
+            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_exon"><label>Exon</label></div>
+            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_intergenic"><label>Intergenic</label></div>
+        </div>
+    </div>
+
+    <!-- Sigma Percentile and Tag Filters (inline) -->
+    <div style="display: flex; align-items: flex-end; gap: 2em;">
+        <div class="field">
+            <label style="display: inline;">σ Percentile ≥</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="Keeps only the <b>most variable loci</b> &mdash; those whose allele-size spread (&sigma;) is among the largest across people.<br /><br />Enter a percentile from 0 to 1. The value is a cutoff on how high a locus ranks for variability: <b>0.95</b> keeps the top 5% most variable loci, <b>0.99</b> keeps the top 1%, <b>0</b> keeps everything.<br /><br />A locus is kept if it ranks that high in <b>either</b> the HPRC256 or the AoU1027 population dataset. Loci with no variability data in a dataset are not matched on it."></i>
+            <input type="text" name="min_sigma_percentile"
+                   placeholder="e.g., 0.95"
+                   style="width: 100px; display: block;"
+                   title="Filter for loci where HPRC or AoU stdev is in the top X%. Enter 0.95 for top 5%.">
+        </div>
+        <div class="field">
+            <label>Tag</label>
+            <div id="tag-filter" class="ui clearable search selection dropdown" style="max-width: 250px;">
+                <input type="hidden" name="tag">
+                <i class="dropdown icon"></i>
+                <div class="default text">All (no tag filter)</div>
+                <div class="menu"></div>
+            </div>
+        </div>
+    </div>
+
+    </div>
+    </div>
+
+    <!-- Additional filters (4 columns) -->
+    <div class="ui stackable four column grid" style="margin: 0;">
+    <div class="column">
+        <div class="field">
+            <label>Motif Size (bp)</label>
+            <input type="text" name="motif_size" placeholder="e.g., 3, 5-10, 15-" title="Examples: 3 (exact), 3-6 (range), 5- (5 and above), -10 (up to 10). Comma-separate for OR.">
+        </div>
+        <div class="field">
+            <label>Motif(s)</label>
+            <input type="text" name="motif" placeholder="e.g., CCG, CAG">
+        </div>
+        <div class="field">
+            <label>Locus Id(s)</label>
+            <input type="text" name="locus_id" placeholder="e.g., 2-89831737-89831752-CCATT">
+        </div>
+    </div>
+    <div class="column">
+        <div class="field">
+            <label>Gene Symbol(s)</label>
+            <input type="text" name="gene_symbol" placeholder="e.g., FMR1, HTT">
+        </div>
+        <div class="field">
+            <label>Gene ID</label>
+            <input type="text" name="gene_id" placeholder="e.g., ENSG00000102081">
+        </div>
+        <div class="field">
+            <label>Min pLI</label>
+            <input type="text" name="min_pli" placeholder="e.g., 0.9">
+        </div>
+    </div>
+    <div class="column">
+        <div class="field">
+            <label>Phenotype Keyword(s)</label>
+            <input type="text" name="phenotype_keyword" placeholder="e.g., ataxia, seizure">
+        </div>
+        <div class="field">
+            <label>Sample Id(s)</label>
+            <div id="sample-id-filter" class="ui fluid multiple search selection dropdown">
+                <input type="hidden" name="sample_id_keyword_hidden">
+                <i class="dropdown icon"></i>
+                <div class="default text">Search sample IDs...</div>
+                <div class="menu"></div>
+            </div>
+        </div>
+        <div class="field">
+            <label>Sample Id Keyword(s)</label>
+            <input type="text" name="sample_id_like" placeholder="e.g., BCM, UDN">
+        </div>
+    </div>
+    <div class="column">
+        <div class="field">
+            <label>Min Expansion (above ref, in repeat units)</label>
+            <input type="text" name="min_expansion" placeholder="e.g., 5">
+        </div>
+        <div class="field">
+            <label>Min Repeats (most expanded individual)</label>
+            <input type="number" name="min_repeats_threshold" min="0" placeholder="e.g., 50">
+        </div>
+    </div>
+    </div>
+
+    <!-- Sort By (multi-key): checking an option adds a priority pill; drag pills to
+         reorder priority (leftmost = primary key); × on a pill removes it. -->
+    <div class="field">
+        <div class="sort-by-control">
+            <label>Sort By</label>
+            <div id="sort-pills" class="sort-pills"></div>
+        </div>
+        <div class="radio-group" id="sort-checkboxes">
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="count" checked>
+                <label>Affected Sample Count</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="family_count">
+                <label>Affected Family Count</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="region">
+                <label>Gene Region</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="size">
+                <label>Allele Size</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="pairwise_similarity">
+                <label>Pairwise Pheno Similarity</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="gene_phenotype">
+                <label>Gene-Pheno Similarity</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="sigma_hprc_rank">
+                <label>σ<sub>HPRC256</sub> Rank</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="sigma_aou_rank">
+                <label>σ<sub>AoU1027</sub> Rank</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="aou_phase2_highcov_lps_stdev_pct">
+                <label>σ<sub>AoU2High</sub> Rank</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="aou_phase2_midcov_lps_stdev_pct">
+                <label>σ<sub>AoU2Mid</sub> Rank</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="aou_phase2_highcov_methyl_stdev_pct">
+                <label>Methyl σ<sub>AoU2High</sub> Rank</label>
+            </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="aou_phase2_midcov_methyl_stdev_pct">
+                <label>Methyl σ<sub>AoU2Mid</sub> Rank</label>
+            </div>
+        </div>
+    </div>
+
+    <!-- Search button -->
+    <button id="search-button" class="ui primary button" type="button">
+        <i class="search icon"></i> Search
+    </button>
+    <span id="total-loci-label" style="color: #888; margin-left: 15px; font-size: 0.95em;"></span>
+</div>
+            </div>
+
+            <!-- Active Filters Bar (Task 4.4 / D3) -->
+            <div id="active-filters-bar" style="display: none; margin-bottom: 12px;">
+                <span style="color: #888; font-size: 0.9em; margin-right: 8px;">Active filters:</span>
+                <span id="active-filter-chips"></span>
+                <a id="clear-all-filters" style="color: #db2828; cursor: pointer; font-size: 0.9em; margin-left: 10px;">Clear all</a>
+            </div>
+
+            <!-- Results Area -->
+            <div id="results-area">
+                <div id="loading-container" style="display: none;">
+                    <div class="loading-indicator">
+                        <div class="ui small active inline loader"></div>
+                        <span>Loading...</span>
+                    </div>
+                </div>
+                <div class="pagination-container top-pagination"></div>
+                <div id="results-container">
+                    <table id="results-table">
+                        <thead>
+                            <tr>
+                                <th class="col-expand"></th>
+                                <th class="col-row-num">#</th>
+                                <th class="col-locus">Locus</th>
+                                <th class="col-motif">Motif</th>
+                                <th class="col-region" data-sort="region">Region</th>
+                                <th class="col-gene">Gene</th>
+                                <th class="col-allele col-numeric" data-sort="size">Allele<span class="sort-icon">&#8597;</span></th>
+                                <th class="col-delta-ref col-numeric">&Delta;ref</th>
+                                <th class="col-delta-pop col-numeric">&Delta;pop</th>
+                                <th class="col-aff-unsolved col-numeric" data-sort="count">#Aff<span class="sort-icon">&#8597;</span></th>
+                                <th class="col-inheritance">Inher.</th>
+                                <th class="col-gene-pheno">Gene Phenotype</th>
+                                <th class="col-pli col-numeric">pLI</th>
+                                <th class="col-sigma-hprc col-numeric">σ<sub>HPRC256</sub></th>
+                                <th class="col-sigma-aou col-numeric">σ<sub>AoU1027</sub></th>
+                                <th class="col-gene-pheno-sim col-numeric" title="Max gene-phenotype similarity across samples">Gene Pheno</th>
+                                <th class="col-pairwise-sim col-numeric" title="Sum of pairwise phenotype similarities">2-Samp Pheno</th>
+                            </tr>
+                        </thead>
+                        <tbody id="results-tbody"></tbody>
+                    </table>
+                </div>
+                <div class="pagination-container bottom-pagination"></div>
+
+                <!-- Summary Charts -->
+                <div id="summary-charts-container" class="ui two column stackable grid" style="display: none; margin-top: 20px;">
+                    <div class="column">
+                        <h4 class="ui header" style="margin-bottom: 10px;">Canonical Motifs</h4>
+                        <div id="motif-chart-container" style="position: relative;">
+                            <canvas id="motif-chart"></canvas>
+                        </div>
+                    </div>
+                    <div class="column">
+                        <h4 class="ui header" style="margin-bottom: 10px;">Gene Regions</h4>
+                        <div id="gene-region-chart-container" style="position: relative;">
+                            <canvas id="gene-region-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="error-message" class="ui negative message" style="display: none;">
+                    <i class="close icon"></i>
+                    <div class="header">Error</div>
+                    <p id="error-text"></p>
+                </div>
+            </div>
+
+        </div>
+        <div class="one wide column"></div>
+    </div>
+</div>
+
+<!-- Edit Tags Modal -->
+<div id="add-tag-modal" class="ui small modal">
+    <div class="header">Edit Tags</div>
+    <div class="content">
+        <!-- Existing tags section -->
+        <div id="existing-tags-section" style="margin-bottom: 16px; display: none;">
+            <label style="font-weight: bold;">Existing Tags</label>
+            <div id="existing-tags-container" style="margin-top: 6px;"></div>
+        </div>
+
+        <div class="ui form">
+            <div class="field">
+                <label>Add New Tag</label>
+                <div id="add-tag-dropdown" class="ui fluid search selection dropdown">
+                    <input type="hidden" name="new-tag">
+                    <i class="dropdown icon"></i>
+                    <div class="default text">Select or enter a tag...</div>
+                    <div class="menu"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="actions">
+        <div class="ui cancel button">Cancel</div>
+        <div class="ui primary ok button">Add</div>
+    </div>
+</div>
+
+<!-- Edit Note Modal -->
+<div id="edit-note-modal" class="ui small modal">
+    <div class="header">Edit Note</div>
+    <div class="content">
+        <!-- Show existing note info if present -->
+        <div id="existing-note-section" style="display: none; margin-bottom: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="color: #888; font-size: 0.9em;">Last updated: <span id="note-updated-at"></span></span>
+                <button id="delete-note-btn" class="ui mini red basic button"><i class="trash icon"></i>Delete Note</button>
+            </div>
+        </div>
+        <div class="ui form">
+            <div class="field">
+                <label>Note</label>
+                <textarea id="note-textarea" rows="4" placeholder="Enter your note..."></textarea>
+            </div>
+        </div>
+    </div>
+    <div class="actions">
+        <div class="ui cancel button">Cancel</div>
+        <div class="ui primary ok button">Save</div>
+    </div>
+</div>
+
+<script>
+// =========================================================================
+// Task 5: Semantic UI Initialization
+// =========================================================================
+
+$(document).ready(function() {
+    // Initialize all Semantic UI components
+    $('.ui.checkbox').checkbox();
+    $('.ui.radio.checkbox').checkbox();
+    $('.ui.dropdown').dropdown();
+
+    // Help-text popups open on click of the (?) icon
+    $('.help-popup').popup({ on: 'click' });
+
+    // ---- Multi-key sort wiring ----
+    buildSortLabels();
+
+    // Checking/unchecking a sort option adds/removes its priority pill (appended last).
+    $('#sort-checkboxes input[name="sort_by"]').on('change', function() {
+        if (_suppressSortCheckboxSync) return;  // ignore programmatic syncSortCheckboxes() updates
+        const list = getSortList();
+        const i = list.indexOf(this.value);
+        if (this.checked && i < 0) list.push(this.value);
+        else if (!this.checked && i >= 0) list.splice(i, 1);
+        applySortChange(list);
+    });
+
+    // Remove a pill (× button).
+    $('#sort-pills').on('click', '.pill-remove', function() {
+        const v = String($(this).closest('.sort-pill').data('value'));
+        const list = getSortList();
+        const i = list.indexOf(v);
+        if (i >= 0) { list.splice(i, 1); applySortChange(list); }
+    });
+
+    // Drag a pill onto another to re-prioritize (insert before the drop target).
+    $('#sort-pills').on('dragstart', '.sort-pill', function(e) {
+        _draggedSortValue = String($(this).data('value'));
+        e.originalEvent.dataTransfer.effectAllowed = 'move';
+    });
+    $('#sort-pills').on('dragover', '.sort-pill', function(e) {
+        e.preventDefault();
+        e.originalEvent.dataTransfer.dropEffect = 'move';
+        $(this).addClass('drag-over');
+    });
+    $('#sort-pills').on('dragleave', '.sort-pill', function() {
+        $(this).removeClass('drag-over');
+    });
+    $('#sort-pills').on('drop', '.sort-pill', function(e) {
+        e.preventDefault();
+        $(this).removeClass('drag-over');
+        const target = String($(this).data('value'));
+        if (_draggedSortValue && target && _draggedSortValue !== target) {
+            const list = getSortList();
+            const from = list.indexOf(_draggedSortValue);
+            const to = list.indexOf(target);
+            list.splice(from, 1);
+            // Drop relative to the target by drag direction: dragging a pill onto one that
+            // sits after it lands it *after* the target; onto an earlier one lands it
+            // *before*. (Always inserting before makes a forward drag a no-op — no reorder,
+            // no animation.) After removal the target's index shifts left by one when from < to.
+            const t = list.indexOf(target);
+            list.splice(from < to ? t + 1 : t, 0, _draggedSortValue);
+            applySortChange(list);
+        }
+        _draggedSortValue = null;
+    });
+    $('#sort-pills').on('dragend', '.sort-pill', function() {
+        $('#sort-pills .sort-pill').removeClass('drag-over');
+        _draggedSortValue = null;
+    });
+
+    // Initial render (URL state is applied later via readStateFromUrl -> applyStateToUI).
+    renderSortPills();
+    syncSortCheckboxes();
+
+    // B11: Mutual exclusion between include/exclude gene region checkboxes.
+    $('#filter-panel input[name^="gene_region_"]').on('change', function() {
+        const region = this.name.replace('gene_region_', '');
+        if ($(this).parent().checkbox('is checked')) {
+            $(`input[name="exclude_gene_region_${region}"]`).parent().checkbox('uncheck');
+        }
+    });
+    $('#filter-panel input[name^="exclude_gene_region_"]').on('change', function() {
+        const region = this.name.replace('exclude_gene_region_', '');
+        if ($(this).parent().checkbox('is checked')) {
+            $(`input[name="gene_region_${region}"]`).parent().checkbox('uncheck');
+        }
+    });
+
+    // Close error message
+    $('#error-message .close').on('click', function() {
+        $(this).closest('.ui.message').hide();
+    });
+
+    // Update total loci count for the selected source database
+    // `source` defaults to the committed currentState.source; the source radio's change
+    // handler passes the live selection so the count label can preview a source WITHOUT
+    // committing it to currentState (that only happens in readStateFromUI on Search).
+    function updateTotalLociCount(source) {
+        source = source || currentState.source;
+        fetch(`${API_BASE_URL}/schema?source=${source}`)
+            .then(r => r.json())
+            .then(data => {
+                const label = data.available_sources.length > 1
+                    ? `${source} Database: ${data.total_loci.toLocaleString()} loci`
+                    : `${data.total_loci.toLocaleString()} loci`;
+                $('#total-loci-label').text(label);
+            });
+    }
+
+    // Preview the loci count when the source radio changes, but do NOT commit the selection
+    // to currentState — that happens in readStateFromUI() on Search. Committing here would
+    // desync currentState.source from the source the displayed results were loaded with,
+    // making detail-expansion fetches and Mendelian warnings use the wrong source.
+    $('input[name="source"]').on('change', function() {
+        updateTotalLociCount($(this).val());
+    });
+
+    // Initialize tag dropdown
+    $('#tag-filter').dropdown({
+        allowAdditions: false,
+        clearable: true,
+        fullTextSearch: true,
+        maxResults: 10,
+    });
+    populateTagDropdown().then(() => {
+        // Cache all tags for prompt hints
+        fetch(`${API_BASE_URL}/annotations/tags`)
+            .then(r => r.json())
+            .then(data => { window._allTagsList = data.tags || []; });
+    });
+
+    // Initialize sample ID dropdown
+    $('#sample-id-filter').dropdown({
+        allowAdditions: true,
+        clearable: true,
+        fullTextSearch: true,
+        forceSelection: false,
+    });
+
+    // Initialize add-tag dropdown (in modal)
+    $('#add-tag-dropdown').dropdown({
+        allowAdditions: true,
+        clearable: true,
+        fullTextSearch: true,
+        forceSelection: false,
+        maxResults: 10,
+    });
+
+    populateSampleIdDropdown().then(() => {
+        // Read URL state and perform initial search after dropdowns are populated
+        readStateFromUrl();
+        updateTotalLociCount();
+        performSearch();
+    });
+});
+
+// =========================================================================
+// Task 6: URL Hash State Management
+// =========================================================================
+
+// 6.1 Default State
+const API_BASE_URL = window.location.origin + '/api/v1';
+
+// Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
+const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
+// Per-source 99th-percentile outlier warnings (keyed by source, then sample_id).
+const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
+
+// Helper function to render warning icon if sample has warnings.
+// Mendelian-violation warnings are source-independent; outlier (99th-percentile) warnings are
+// per-source, so the outlier part is only included for the currently-selected `source`.
+function renderMendelianWarning(sampleId, source) {
+    if (!sampleId) return '';
+    const mendelian = MENDELIAN_WARNINGS[sampleId];
+    const outlierMap = (source && typeof OUTLIER_WARNINGS_BY_SOURCE !== 'undefined')
+        ? OUTLIER_WARNINGS_BY_SOURCE[source] : null;
+    const outlier = outlierMap ? outlierMap[sampleId] : undefined;
+    if (!mendelian && !outlier) return '';
+    const w = Object.assign({}, mendelian || {}, outlier || {});
+    // Determine tooltip text based on warning types
+    const hasMendelian = w.autosome_rate !== undefined;
+    const hasOutlier = w.outlier_bins !== undefined;
+    let tooltip = '';
+    if (hasMendelian && hasOutlier) {
+        tooltip = 'High Mendelian violation rate; TR outlier';
+    } else if (hasMendelian) {
+        tooltip = 'High Mendelian violation rate';
+    } else if (hasOutlier) {
+        tooltip = '99th percentile TR outlier';
+    }
+    return `<i class="warning sign icon mendelian-warning-icon"
+               title="${tooltip}"
+               data-warning='${JSON.stringify(w).replace(/'/g, "&apos;")}'
+               data-sample-id="${sampleId}"></i>`;
+}
+
+const DEFAULT_STATE = {
+    outlier_type: 'all',
+    require_above_unaffected: '',
+    require_families_above_unaffected: '',
+    require_above_population: '',
+    population_metric: '99th',
+    include_loci_without_population_data: false,
+    source: {{ default_source | tojson }},
+    apply_pathogenic_threshold: false,
+    known_loci_only: false,
+    known_motifs_only: false,
+    mendelian_genes_only: false,
+    gene_regions: '',
+    exclude_gene_regions: '',
+    min_expansion: '',
+    min_repeats_threshold: '',
+    min_pli: '',
+    min_sigma_percentile: '',
+    motif_size: '',
+    motif: '',
+    phenotype_keyword: '',
+    sample_id_keyword: '',
+    sample_id_like: '',
+    gene_symbol: '',
+    gene_id: '',
+    locus_id: '',
+    tag: '',
+    sort_by: 'count',
+    page: 1,
+    page_size: 50,
+};
+
+let currentState = JSON.parse(JSON.stringify(DEFAULT_STATE));
+
+// 6.2 Write State to URL
+function writeStateToUrl() {
+    const params = {};
+    for (const [key, value] of Object.entries(currentState)) {
+        // population_metric only affects results when require_above_population is set; don't
+        // persist a no-op param to the URL otherwise (matches buildApiUrl / performExport).
+        if (key === 'population_metric' && !currentState.require_above_population) continue;
+        if (value !== DEFAULT_STATE[key] && value !== '' && value !== false) {
+            params[key] = value;
+        }
+    }
+    const hash = '#' + $.param(params);
+    if (window.location.hash !== hash) {
+        window.history.pushState(null, '', hash);
+    }
+}
+
+// 6.3 Read State from URL
+function readStateFromUrl() {
+    currentState = JSON.parse(JSON.stringify(DEFAULT_STATE));
+    const hash = window.location.hash.substring(1);
+    // No early return on an empty hash: fall through so applyStateToUI() resets the visible
+    // controls to defaults too (Back navigation to the default state otherwise leaves stale
+    // filter selections shown while results reload as default). URLSearchParams('') is empty.
+    const params = new URLSearchParams(hash);
+    for (const [key, value] of params.entries()) {
+        if (key in DEFAULT_STATE) {
+            if (typeof DEFAULT_STATE[key] === 'boolean') {
+                currentState[key] = value === 'true' || value === '1';
+            } else if (typeof DEFAULT_STATE[key] === 'number') {
+                currentState[key] = Number(value);
+            } else {
+                currentState[key] = value;
+            }
+        }
+    }
+    applyStateToUI();
+}
+
+// 6.4 Apply State to UI
+function applyStateToUI() {
+    // Radio buttons
+    for (const name of ['outlier_type', 'require_above_unaffected',
+                        'require_families_above_unaffected',
+                        'require_above_population', 'source']) {
+        const val = currentState[name] || '';
+        $(`input[name="${name}"][value="${val}"]`).parent().checkbox('check');
+    }
+
+    // Sort: ordered priority pills + matching checkboxes (multi-key)
+    renderSortPills();
+    syncSortCheckboxes();
+
+    // Population metric (native inline radio, not a semantic-ui checkbox)
+    $(`input[name="population_metric"][value="${currentState.population_metric || '99th'}"]`).prop('checked', true);
+
+    // Boolean checkboxes
+    for (const name of ['apply_pathogenic_threshold', 'known_loci_only', 'known_motifs_only', 'mendelian_genes_only', 'include_loci_without_population_data']) {
+        const cb = $(`input[name="${name}"]`).parent();
+        currentState[name] ? cb.checkbox('check') : cb.checkbox('uncheck');
+    }
+
+    // Gene region checkboxes
+    const regions = currentState.gene_regions ? currentState.gene_regions.split(',') : [];
+    for (const r of ['cds', 'promoter', 'utr', 'intron', 'exon', 'intergenic']) {
+        const cb = $(`input[name="gene_region_${r}"]`).parent();
+        regions.includes(r) ? cb.checkbox('check') : cb.checkbox('uncheck');
+    }
+
+    // Exclude gene region checkboxes
+    const exRegions = currentState.exclude_gene_regions
+        ? currentState.exclude_gene_regions.split(',') : [];
+    for (const r of ['cds', 'promoter', 'utr', 'intron', 'exon', 'intergenic']) {
+        const cb = $(`input[name="exclude_gene_region_${r}"]`).parent();
+        exRegions.includes(r) ? cb.checkbox('check') : cb.checkbox('uncheck');
+    }
+
+    // Tag dropdown
+    if (currentState.tag) {
+        $('#tag-filter').dropdown('set selected', currentState.tag);
+    } else {
+        $('#tag-filter').dropdown('clear');
+    }
+
+    // Text/number inputs
+    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_pli', 'min_sigma_percentile',
+                        'motif_size', 'motif',
+                        'phenotype_keyword', 'sample_id_like',
+                        'gene_symbol', 'gene_id', 'locus_id']) {
+        $(`input[name="${name}"]`).val(currentState[name]);
+    }
+
+    // Sample ID dropdown
+    if (currentState.sample_id_keyword) {
+        const ids = currentState.sample_id_keyword.split(',').map(s => s.trim()).filter(Boolean);
+        $('#sample-id-filter').dropdown('set exactly', ids);
+    } else {
+        $('#sample-id-filter').dropdown('clear');
+    }
+
+}
+
+// 6.5 Read State from UI
+function readStateFromUI() {
+    // Radio buttons
+    currentState.outlier_type = $('input[name="outlier_type"]:checked').val() || 'all';
+    currentState.require_above_unaffected = $('input[name="require_above_unaffected"]:checked').val() || '';
+    currentState.require_families_above_unaffected = $('input[name="require_families_above_unaffected"]:checked').val() || '';
+    currentState.require_above_population = $('input[name="require_above_population"]:checked').val() || '';
+    currentState.population_metric = $('input[name="population_metric"]:checked').val() || '99th';
+    currentState.include_loci_without_population_data = $('input[name="include_loci_without_population_data"]').parent().checkbox('is checked');
+    currentState.source = $('input[name="source"]:checked').val() || DEFAULT_STATE.source;
+
+    // Boolean checkboxes
+    currentState.apply_pathogenic_threshold = $('input[name="apply_pathogenic_threshold"]').parent().checkbox('is checked');
+    currentState.known_loci_only = $('input[name="known_loci_only"]').parent().checkbox('is checked');
+    currentState.known_motifs_only = $('input[name="known_motifs_only"]').parent().checkbox('is checked');
+    currentState.mendelian_genes_only = $('input[name="mendelian_genes_only"]').parent().checkbox('is checked');
+
+    // Gene regions
+    const geneRegions = [];
+    for (const r of ['cds', 'promoter', 'utr', 'intron', 'exon', 'intergenic']) {
+        if ($(`input[name="gene_region_${r}"]`).parent().checkbox('is checked')) {
+            geneRegions.push(r);
+        }
+    }
+    currentState.gene_regions = geneRegions.join(',');
+
+    // Exclude gene regions
+    const exGeneRegions = [];
+    for (const r of ['cds', 'promoter', 'utr', 'intron', 'exon', 'intergenic']) {
+        if ($(`input[name="exclude_gene_region_${r}"]`).parent().checkbox('is checked')) {
+            exGeneRegions.push(r);
+        }
+    }
+    currentState.exclude_gene_regions = exGeneRegions.join(',');
+
+    // Sort: currentState.sort_by is maintained directly by the pill/checkbox/header
+    // handlers (it is an ordered, comma-separated list), so it is NOT re-read here.
+
+    // Tag dropdown
+    currentState.tag = $('#tag-filter').dropdown('get value') || '';
+
+    // Text/number inputs
+    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_pli', 'min_sigma_percentile',
+                        'motif_size', 'motif',
+                        'phenotype_keyword', 'sample_id_like',
+                        'gene_symbol', 'gene_id', 'locus_id']) {
+        currentState[name] = $(`input[name="${name}"]`).val().trim();
+    }
+
+    // Sample ID dropdown
+    const selectedIds = $('#sample-id-filter').dropdown('get value');
+    currentState.sample_id_keyword = Array.isArray(selectedIds)
+        ? selectedIds.join(',')
+        : (selectedIds || '');
+
+    // Reset page to 1 when filters change
+    currentState.page = 1;
+}
+
+// 6.6 Browser Navigation
+window.addEventListener('popstate', function() {
+    readStateFromUrl();
+    performSearch();
+});
+
+// =========================================================================
+// Task 7: API Fetch and Search Logic
+// =========================================================================
+
+// 7.1 Build API URL
+function buildApiUrl() {
+    const params = new URLSearchParams();
+    params.set('outlier_type', currentState.outlier_type);
+    params.set('source', currentState.source);
+    params.set('page', currentState.page);
+    params.set('page_size', currentState.page_size);
+
+    const optionalStringParams = [
+        'require_above_unaffected', 'require_families_above_unaffected',
+        'require_above_population', 'motif', 'phenotype_keyword',
+        'sample_id_keyword', 'sample_id_like', 'gene_symbol', 'gene_id', 'locus_id',
+        'gene_regions', 'exclude_gene_regions', 'sort_by', 'tag',
+    ];
+    for (const name of optionalStringParams) {
+        if (currentState[name]) params.set(name, currentState[name]);
+    }
+    // Only relevant when require_above_population is set; omit the default ('99th') to keep URLs clean.
+    if (currentState.require_above_population && currentState.population_metric === 'max') {
+        params.set('population_metric', 'max');
+    }
+
+    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_pli', 'min_sigma_percentile']) {
+        if (currentState[name] !== '' && currentState[name] !== undefined) {
+            params.set(name, currentState[name]);
+        }
+    }
+    if (currentState.motif_size) params.set('motif_size', currentState.motif_size);
+
+    if (currentState.apply_pathogenic_threshold) params.set('apply_pathogenic_threshold', 'true');
+    if (currentState.known_loci_only) params.set('known_loci_only', 'true');
+    if (currentState.known_motifs_only) params.set('known_motifs_only', 'true');
+    if (currentState.mendelian_genes_only) params.set('mendelian_genes_only', 'true');
+    if (currentState.include_loci_without_population_data) params.set('include_loci_without_population_data', 'true');
+
+    return `${API_BASE_URL}/loci?${params.toString()}`;
+}
+
+// 7.2 Fetch with timeout utility
+// Aborts with an explicit TimeoutError reason so a timeout is distinguishable from a
+// genuine connection failure (and never surfaces the browser's cryptic default
+// "signal is aborted without reason"). See the performSearch() catch for the mapping.
+function fetchWithTimeout(url, timeoutMs = 120000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+        () => controller.abort(new DOMException(`Request timed out after ${Math.round(timeoutMs / 1000)}s`, 'TimeoutError')),
+        timeoutMs);
+    return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timeoutId));
+}
+
+// Map a fetch rejection to a clear, user-facing message.
+function describeFetchError(error) {
+    if (error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+        return 'The search took too long and was cancelled. Complex multi-column sorts on the full dataset can be slow — try fewer sort columns, a smaller page size, or narrower filters, then search again.';
+    }
+    // fetch() rejects with a TypeError when the request can't be made at all (offline,
+    // server down, DNS/connection refused).
+    if (error instanceof TypeError) {
+        return 'Could not reach the server — check your internet connection and try again.';
+    }
+    return (error && error.message) || 'Search failed.';
+}
+
+// 7.3 Perform Search
+// Sync the column-header sort indicator with the active sort. Header clicks, the
+// Sort-By radios, clear-all, and chip removal all funnel through performSearch(), so
+// updating the indicator here keeps the highlighted header consistent with the order
+// actually applied. Radio-only sorts (which have no header column) correctly clear it.
+function syncSortHeaderIndicator() {
+    $('#results-table thead th').removeClass('sorted-asc sorted-desc');
+    for (const field of getSortList()) {
+        $(`#results-table thead th[data-sort="${field}"]`).addClass('sorted-desc');
+    }
+}
+
+// =========================================================================
+// Multi-key sort: priority pills + checkboxes
+// =========================================================================
+// currentState.sort_by is an ordered, comma-separated list of sort fields. The pills
+// visualize that order (drag to re-prioritize, leftmost = primary key; × to remove);
+// the checkboxes toggle membership; header-column clicks toggle a field in/out of the
+// same list. SORT_LABELS maps each field value to its label HTML (built once from the
+// checkboxes so pill text never drifts from the option labels).
+let SORT_LABELS = {};
+let _suppressSortCheckboxSync = false;
+let _draggedSortValue = null;
+
+function getSortList() {
+    return currentState.sort_by ? currentState.sort_by.split(',').filter(Boolean) : [];
+}
+
+function buildSortLabels() {
+    $('#sort-checkboxes input[name="sort_by"]').each(function() {
+        SORT_LABELS[this.value] = $(this).siblings('label').html();
+    });
+}
+
+function renderSortPills() {
+    const list = getSortList();
+    const $c = $('#sort-pills');
+    if (!list.length) {
+        $c.html('<span class="sort-pills-empty">default (Affected Sample Count)</span>');
+        return;
+    }
+    $c.html(list.map((v, i) =>
+        `<span class="sort-pill" draggable="true" data-value="${escapeHtml(v)}">` +
+        `<span class="pill-order">${i + 1}.</span>` +
+        `<span class="pill-text">${SORT_LABELS[v] || escapeHtml(v)}</span>` +
+        `<span class="pill-remove" title="Remove">&times;</span></span>`
+    ).join(''));
+}
+
+function syncSortCheckboxes() {
+    const set = new Set(getSortList());
+    _suppressSortCheckboxSync = true;
+    $('#sort-checkboxes input[name="sort_by"]').each(function() {
+        const cb = $(this).parent();
+        set.has(this.value) ? cb.checkbox('set checked') : cb.checkbox('set unchecked');
+    });
+    _suppressSortCheckboxSync = false;
+}
+
+// Apply a new ordered sort list everywhere: state, pills, checkboxes, URL, header
+// indicator, and results. Mirrors the header-click flow (does NOT re-read other filter
+// inputs), so unsubmitted text-filter edits aren't applied until the next Search.
+//
+// Pill reorders are animated with the FLIP technique: capture each pill's position
+// before the re-render (First), let renderSortPills() rebuild them in the new order
+// (Last), then invert each surviving pill to its old spot and transition the offset
+// back to zero so it slides into place instead of snapping.
+function applySortChange(list) {
+    const first = {};
+    $('#sort-pills .sort-pill').each(function() {
+        first[String($(this).data('value'))] = this.getBoundingClientRect();
+    });
+
+    currentState.sort_by = list.join(',');
+    currentState.page = 1;
+    renderSortPills();
+    syncSortCheckboxes();
+    writeStateToUrl();
+    performSearch();   // also refreshes column-header indicator + active filters bar
+
+    $('#sort-pills .sort-pill').each(function() {
+        const f = first[String($(this).data('value'))];
+        if (!f) return;  // newly added pill — nothing to slide from
+        const last = this.getBoundingClientRect();
+        const dx = f.left - last.left, dy = f.top - last.top;
+        if (!dx && !dy) return;
+        this.style.transition = 'none';
+        this.style.transform = `translate(${dx}px, ${dy}px)`;
+        this.getBoundingClientRect();  // force reflow so the invert is the starting frame
+        this.style.transition = 'transform 200ms ease';
+        this.style.transform = '';
+    });
+}
+
+// Monotonic search id: a slow earlier request must not overwrite the UI for a
+// newer search the user has since started (e.g. by changing a filter or sort).
+let searchRequestSeq = 0;
+
+async function performSearch() {
+    const requestId = ++searchRequestSeq;
+    syncSortHeaderIndicator();
+    $('#loading-container').show();
+    $('#error-message').hide();
+    $('#results-container').addClass('loading');
+
+    try {
+        const response = await fetchWithTimeout(buildApiUrl());
+        if (requestId !== searchRequestSeq) return;  // superseded by a newer search
+        if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.detail || `HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        if (requestId !== searchRequestSeq) return;  // superseded while parsing the response
+        window.searchResults = data;
+        renderResults(data);
+        renderSummaryCharts(data);
+        updatePaginationControls(data);
+        writeStateToUrl();
+        updateActiveFiltersBar();
+    } catch (error) {
+        if (requestId !== searchRequestSeq) return;  // stale failure - don't clobber the newer search's UI
+        console.error('Search error:', error);
+        $('#error-text').text(describeFetchError(error));
+        $('#error-message').show();
+        $('#results-tbody').html('<tr><td colspan="17" style="color: #888; padding: 20px; text-align: center;">Search failed</td></tr>');
+        $('.pagination-container').hide();
+        $('#summary-charts-container').hide();
+    } finally {
+        if (requestId === searchRequestSeq) {
+            $('#loading-container').hide();
+            $('#results-container').removeClass('loading');
+        }
+    }
+}
+
+// 7.3 Button Handlers
+$('#search-button').on('click', function() {
+    readStateFromUI();
+    currentState.page = 1;
+    performSearch();
+});
+
+// Enter key in text/number inputs triggers search
+$('#filter-panel input[type="text"], #filter-panel input[type="number"]').on('keypress', function(e) {
+    if (e.which === 13) {
+        readStateFromUI();
+        currentState.page = 1;
+        performSearch();
+    }
+});
+
+// 7.4 Export function (D5) - triggers server-side export
+async function performExport(format) {
+    // readStateFromUI() resets currentState.page to 1 as a side effect. Export does not
+    // paginate and does not re-render the results table, so letting that reset stand would
+    // desync the visible page from currentState.page (Prev/Next would then jump to the
+    // wrong page). Preserve and restore the page the user is currently viewing.
+    const savedPage = currentState.page;
+    readStateFromUI();
+    currentState.page = savedPage;
+    $('.export-dropdown').addClass('loading disabled');
+
+    try {
+        const params = new URLSearchParams();
+        params.set('source', currentState.source);
+        params.set('outlier_type', currentState.outlier_type);
+        params.set('format', format);
+
+        // Add all filter params from currentState (same params as buildApiUrl but without pagination)
+        if (currentState.require_above_unaffected) params.set('require_above_unaffected', currentState.require_above_unaffected);
+        if (currentState.require_families_above_unaffected) params.set('require_families_above_unaffected', currentState.require_families_above_unaffected);
+        if (currentState.require_above_population) params.set('require_above_population', currentState.require_above_population);
+        if (currentState.require_above_population && currentState.population_metric === 'max') params.set('population_metric', 'max');
+        if (currentState.include_loci_without_population_data) params.set('include_loci_without_population_data', '1');
+        if (currentState.apply_pathogenic_threshold) params.set('apply_pathogenic_threshold', '1');
+        if (currentState.known_loci_only) params.set('known_loci_only', '1');
+        if (currentState.known_motifs_only) params.set('known_motifs_only', '1');
+        if (currentState.mendelian_genes_only) params.set('mendelian_genes_only', '1');
+        if (currentState.gene_regions) params.set('gene_regions', currentState.gene_regions);
+        if (currentState.exclude_gene_regions) params.set('exclude_gene_regions', currentState.exclude_gene_regions);
+        if (currentState.min_expansion) params.set('min_expansion', currentState.min_expansion);
+        if (currentState.min_repeats_threshold) params.set('min_repeats_threshold', currentState.min_repeats_threshold);
+        if (currentState.min_pli) params.set('min_pli', currentState.min_pli);
+        if (currentState.min_sigma_percentile) params.set('min_sigma_percentile', currentState.min_sigma_percentile);
+        if (currentState.motif_size) params.set('motif_size', currentState.motif_size);
+        if (currentState.motif) params.set('motif', currentState.motif);
+        if (currentState.phenotype_keyword) params.set('phenotype_keyword', currentState.phenotype_keyword);
+        if (currentState.sample_id_keyword) params.set('sample_id_keyword', currentState.sample_id_keyword);
+        if (currentState.sample_id_like) params.set('sample_id_like', currentState.sample_id_like);
+        if (currentState.gene_symbol) params.set('gene_symbol', currentState.gene_symbol);
+        if (currentState.gene_id) params.set('gene_id', currentState.gene_id);
+        if (currentState.locus_id) params.set('locus_id', currentState.locus_id);
+        if (currentState.tag) params.set('tag', currentState.tag);
+        if (currentState.sort_by && currentState.sort_by !== 'count') params.set('sort_by', currentState.sort_by);
+
+        // Download via a hidden iframe instead of navigating the top-level page. A direct
+        // window.location.href would, on a 400/500 (non-attachment) error response, replace the
+        // whole page with the raw API error and lose the user's filters/results. The iframe streams
+        // the download straight to disk on success (no large in-memory blob); an error response
+        // loads harmlessly inside the iframe, which we surface via alert() without touching the page.
+        const url = `${API_BASE_URL}/export?${params.toString()}`;
+        let iframe = document.getElementById('export-iframe');
+        if (!iframe) {
+            iframe = document.createElement('iframe');
+            iframe.id = 'export-iframe';
+            iframe.style.display = 'none';
+            document.body.appendChild(iframe);
+        }
+        // A successful attachment download does not fire the iframe load event; an error
+        // response rendered in-frame does — use that to detect and report failures.
+        iframe.onload = () => {
+            try {
+                const text = iframe.contentDocument?.body?.innerText || '';
+                if (text.trim()) alert('Export failed: ' + text.trim().slice(0, 500));
+            } catch (_) { /* cross-origin response body not readable — ignore */ }
+        };
+        iframe.src = url;
+    } catch (e) {
+        alert('Export failed: ' + e.message);
+    } finally {
+        setTimeout(() => $('.export-dropdown').removeClass('loading disabled'), 1000);
+    }
+}
+
+// 7.5 Active Filters Bar (D3)
+function updateActiveFiltersBar() {
+    const chips = [];
+    const labels = {
+        outlier_type: 'Outlier', require_above_unaffected: 'Aff > Unaff',
+        require_families_above_unaffected: 'Fam > Unaff', require_above_population: 'Above Pop', population_metric: 'Pop Metric',
+        include_loci_without_population_data: 'Include without pop.',
+        source: 'Source', apply_pathogenic_threshold: 'Path. Threshold', known_loci_only: 'Known Loci', known_motifs_only: 'Known Motifs', mendelian_genes_only: 'Mendelian Genes',
+        gene_regions: 'Regions', exclude_gene_regions: 'Excl Regions',
+        min_expansion: 'Min Exp', min_repeats_threshold: 'Min Repeats', min_pli: 'Min pLI', min_sigma_percentile: 'σ Percentile',
+        motif_size: 'Motif Size',
+        motif: 'Motif', phenotype_keyword: 'Phenotype', sample_id_keyword: 'Sample ID',
+        sample_id_like: 'Sample Keyword', gene_symbol: 'Gene', gene_id: 'Gene ID', locus_id: 'Locus ID', tag: 'Tag',
+    };
+    for (const [key, value] of Object.entries(currentState)) {
+        if (key === 'page' || key === 'page_size') continue;
+        if (key === 'sort_by') continue;  // shown as dedicated priority pills, not a chip
+        // population_metric is only meaningful (and only sent to the API) when require_above_population is set
+        if (key === 'population_metric' && !currentState.require_above_population) continue;
+        if (value === DEFAULT_STATE[key] || value === '' || value === false) continue;
+        const display = value === true ? labels[key] : `${escapeHtml(labels[key] || key)}: ${escapeHtml(value)}`;
+        chips.push(`<a class="ui small label filter-chip" data-filter="${escapeHtml(key)}">${display}<i class="delete icon"></i></a>`);
+    }
+    if (chips.length > 0) {
+        $('#active-filter-chips').html(chips.join(''));
+        $('#active-filters-bar').show();
+    } else {
+        $('#active-filters-bar').hide();
+    }
+}
+
+// Click handler: remove individual filter chip
+$(document).on('click', '.filter-chip .delete', function() {
+    const key = $(this).closest('.filter-chip').data('filter');
+    currentState[key] = DEFAULT_STATE[key];
+    applyStateToUI();
+    currentState.page = 1;
+    performSearch();
+});
+
+// Click handler: clear all filters
+$('#clear-all-filters').on('click', function() {
+    currentState = JSON.parse(JSON.stringify(DEFAULT_STATE));
+    applyStateToUI();
+    performSearch();
+});
+
+// 7.6 HTML Escaping Helper (Security)
+function escapeHtml(str) {
+    if (str == null) return '';
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+// =========================================================================
+// Summary Charts (Motifs and Gene Regions)
+// =========================================================================
+
+// Chart instances (for cleanup on re-render)
+let motifChartInstance = null;
+let geneRegionChartInstance = null;
+
+// Gene region colors matching the badge background colors (lighter/pastel)
+const geneRegionColors = {
+    'CDS': '#ef9a9a',
+    'promoter': '#90caf9',
+    "5' UTR": '#ffcc80',
+    "3' UTR": '#ffcc80',
+    'intron': '#ce93d8',
+    'exon': '#a5d6a7',
+    'intergenic': '#e0e0e0'
+};
+
+function renderMotifChart(motifCounts) {
+    const ctx = document.getElementById('motif-chart');
+    if (!ctx) return;
+
+    // Destroy existing chart
+    if (motifChartInstance) {
+        motifChartInstance.destroy();
+        motifChartInstance = null;
+    }
+
+    // Sort by count descending
+    const sorted = Object.entries(motifCounts).sort((a, b) => b[1] - a[1]);
+
+    let labels = [];
+    let data = [];
+
+    if (sorted.length <= 50) {
+        // Show all motifs
+        labels = sorted.map(([motif, _]) => motif);
+        data = sorted.map(([_, count]) => count);
+    } else {
+        // Top 50 + "Other"
+        const top50 = sorted.slice(0, 50);
+        const rest = sorted.slice(50);
+        const otherCount = rest.reduce((sum, [_, count]) => sum + count, 0);
+
+        labels = top50.map(([motif, _]) => motif);
+        data = top50.map(([_, count]) => count);
+
+        labels.push(`Other (${rest.length.toLocaleString()} motifs)`);
+        data.push(otherCount);
+    }
+
+    // Set container height based on number of bars (35px per bar + padding for axis)
+    const container = document.getElementById('motif-chart-container');
+    container.style.height = (labels.length * 35 + 50) + 'px';
+
+    motifChartInstance = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Loci count',
+                data: data,
+                backgroundColor: '#90caf9',
+                borderColor: '#64b5f6',
+                borderWidth: 1,
+                barThickness: 20
+            }]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false }
+            },
+            scales: {
+                x: {
+                    beginAtZero: true,
+                    title: { display: true, text: 'Number of loci' }
+                },
+                y: {
+                    ticks: { font: { family: 'monospace' } }
+                }
+            }
+        }
+    });
+}
+
+function renderGeneRegionChart(regionCounts) {
+    const ctx = document.getElementById('gene-region-chart');
+    if (!ctx) return;
+
+    // Destroy existing chart
+    if (geneRegionChartInstance) {
+        geneRegionChartInstance.destroy();
+        geneRegionChartInstance = null;
+    }
+
+    // Define order for gene regions
+    const regionOrder = ['CDS', 'exon', 'intron', "5' UTR", "3' UTR", 'promoter', 'intergenic'];
+
+    // Build labels and data in order (include all regions even if count is 0)
+    const labels = [];
+    const data = [];
+    const colors = [];
+
+    for (const region of regionOrder) {
+        if (regionCounts.hasOwnProperty(region)) {
+            labels.push(region);
+            data.push(regionCounts[region]);
+            colors.push(geneRegionColors[region] || '#999999');
+        }
+    }
+
+    // Add any regions not in our predefined order
+    for (const [region, count] of Object.entries(regionCounts)) {
+        if (!regionOrder.includes(region)) {
+            labels.push(region);
+            data.push(count);
+            colors.push('#999999');
+        }
+    }
+
+    // Set container height based on number of bars (35px per bar + padding for axis)
+    const container = document.getElementById('gene-region-chart-container');
+    container.style.height = (labels.length * 35 + 50) + 'px';
+
+    geneRegionChartInstance = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Loci count',
+                data: data,
+                backgroundColor: colors,
+                borderColor: colors.map(c => c),
+                borderWidth: 1,
+                barThickness: 20
+            }]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false }
+            },
+            scales: {
+                x: {
+                    beginAtZero: true,
+                    title: { display: true, text: 'Number of loci' }
+                }
+            }
+        }
+    });
+}
+
+function renderSummaryCharts(data) {
+    const container = document.getElementById('summary-charts-container');
+    if (!container) return;
+
+    // Hide if fewer than 5 results
+    if (!data.total || data.total < 5) {
+        container.style.display = 'none';
+        return;
+    }
+
+    // Show container
+    container.style.display = '';
+
+    // Render charts
+    if (data.motif_counts) {
+        renderMotifChart(data.motif_counts);
+    }
+    if (data.gene_region_counts) {
+        renderGeneRegionChart(data.gene_region_counts);
+    }
+}
+
+// =========================================================================
+// Task 8: Results Table Rendering
+// =========================================================================
+
+// 8.1 Main Render Function
+function renderResults(data) {
+    const tbody = $('#results-tbody');
+    if (!data.results || data.results.length === 0) {
+        tbody.html('<tr><td colspan="17" style="color: #888; padding: 20px; text-align: center;">No matching results found</td></tr>');
+        return;
+    }
+
+    const startIndex = (data.page - 1) * data.page_size;
+    let html = '';
+    data.results.forEach((locus, i) => {
+        html += renderLocusRow(locus, startIndex + i);
+    });
+    tbody.html(html);
+}
+
+// 8.2 Region Badge Helper
+function getRegionBadge(region) {
+    const badgeMap = {
+        'CDS': 'badge-cds', 'cds': 'badge-cds',
+        'promoter': 'badge-promoter',
+        "5' UTR": 'badge-utr', "3' UTR": 'badge-utr',
+        'utr': 'badge-utr',
+        'intron': 'badge-intron',
+        'exon': 'badge-exon',
+        'intergenic': 'badge-intergenic',
+    };
+    const cls = badgeMap[region] || 'badge-intergenic';
+    return `<span class="badge ${cls}">${escapeHtml(region) || 'unknown'}</span>`;
+}
+
+// 8.3 Value Color Helper
+function getValueColorClass(alleleSize, popMax, pathogenicMin) {
+    if (pathogenicMin != null && alleleSize >= pathogenicMin) return 'val-high';
+    if (popMax != null && alleleSize > popMax) return 'val-medium';
+    return 'val-neutral';
+}
+
+// 8.4 Row Rendering Function
+function renderLocusRow(locus, rowIndex) {
+    const motifSize = locus.MotifSize || (locus.Motif ? locus.Motif.length : '?');
+    const allele = locus.FirstAffectedAlleleSize;
+    const refRepeats = locus.NumRepeatsInReference;
+    const deltaRef = (allele != null && refRepeats != null) ? allele - refRepeats : null;
+    const popMaxVal = Math.max(
+        ...[locus.HPRC256_99thPercentile, locus.AoU1027_99thPercentile, locus.AoUPhase2HighCov_99thPercentile, locus.AoUPhase2MidCov_99thPercentile].filter(v => v != null), -Infinity
+    );
+    const popMax = popMaxVal === -Infinity ? null : popMaxVal;
+    const deltaPop = (allele != null && popMax != null) ? allele - popMax : null;
+    const nAffUnsolved = locus.NumAffectedUnsolvedSamplesAboveUnaffected || 0;
+
+    // Gene display
+    const geneName = locus.GeneTableGeneSymbol || '';
+    const geneId = locus.gene_id || '';
+    // The gene name (or gene id, when no name is available) links to the Broad gene lookup
+    const geneLookupUrl = q => `https://genelookup.broadinstitute.org/#showRs=1&q=${encodeURIComponent(q)}`;
+    const geneNameHtml = geneName ? `<a href="${geneLookupUrl(geneName)}" target="_blank" style="color: #2185d0;">${escapeHtml(geneName)}</a>` : '';
+    // gene id links to the gene lookup only when there is no gene name to link instead
+    const geneIdHtml = geneId ? (geneName ? escapeHtml(geneId) : `<a href="${geneLookupUrl(geneId)}" target="_blank">${escapeHtml(geneId)}</a>`) : '';
+    // Gene external links (using ENSG ID)
+    const geneLinks = geneId ? [
+        `<a href="http://www.genecards.org/cgi-bin/carddisp.pl?gene=${encodeURIComponent(geneId)}" target="_blank" title="GeneCards" style="color: #999; font-size: 0.8em;">GeneCards</a>`,
+        `<a href="https://gnomad.broadinstitute.org/gene/${encodeURIComponent(geneId)}?dataset=gnomad_r4" target="_blank" title="gnomAD" style="color: #999; font-size: 0.8em;">gnomAD</a>`,
+        `<a href="http://www.ncbi.nlm.nih.gov/gene/?term=${encodeURIComponent(geneId)}" target="_blank" title="NCBI Gene" style="color: #999; font-size: 0.8em;">NCBI</a>`,
+        `<a href="http://www.proteinatlas.org/${encodeURIComponent(geneId)}/tissue" target="_blank" title="Protein Atlas" style="color: #999; font-size: 0.8em;">ProteinAtlas</a>`,
+        `<a href="https://www.deciphergenomics.org/gene/${encodeURIComponent(geneId)}/overview/protein-genomic-info" target="_blank" title="Decipher" style="color: #999; font-size: 0.8em;">Decipher</a>`
+    ].join(' &middot; ') : '';
+    const geneCell = geneNameHtml
+        ? `<div class="cell-main">${geneNameHtml}</div>${geneIdHtml ? `<div class="cell-sub">${geneIdHtml}</div>` : ''}${geneLinks ? `<div class="cell-sub">${geneLinks}</div>` : ''}`
+        : (geneIdHtml ? `<div class="cell-sub">${geneIdHtml}</div>${geneLinks ? `<div class="cell-sub">${geneLinks}</div>` : ''}` : '');
+
+    // Motif display (truncate at 12bp with click-to-popup for long motifs)
+    const canonicalMotif = locus.CanonicalMotif || '';
+    const motifMain = locus.Motif || '';
+    const motifTruncLen = 12;
+    let motifMainHtml;
+    if (motifMain.length > motifTruncLen) {
+        motifMainHtml = `<span class="motif-truncated" title="Click to see full motif" data-full-motif="${escapeHtml(motifMain)}">${escapeHtml(motifMain.substring(0, motifTruncLen))}... (${motifMain.length}bp)</span>`;
+    } else {
+        motifMainHtml = `${escapeHtml(motifMain)} (${escapeHtml(String(motifSize))})`;
+    }
+    let motifSubHtml = '';
+    if (canonicalMotif && canonicalMotif !== motifMain) {
+        if (canonicalMotif.length > motifTruncLen) {
+            motifSubHtml = `canon: <span class="motif-truncated" title="Click to see full motif" data-full-motif="${escapeHtml(canonicalMotif)}">${escapeHtml(canonicalMotif.substring(0, motifTruncLen))}... (${canonicalMotif.length}bp)</span>`;
+        } else {
+            motifSubHtml = `canon: ${escapeHtml(canonicalMotif)}`;
+        }
+    }
+    const motifCell = `<div class="cell-main">${motifMainHtml}</div>${motifSubHtml ? `<div class="cell-sub">${motifSubHtml}</div>` : ''}`;
+
+    // Locus cell: ID (truncate motif portion if long) + known motif badge + known locus badge
+    const knownBadge = locus.IsKnownMotif ? '<span class="badge badge-known-motif">known motif</span>' : '';
+    const knownLocusBadge = locus.KnownDiseaseLocus
+        ? `<span class="badge badge-known-locus" data-locus-id="${escapeHtml(locus.LocusId)}" title="Click for disease info">known locus</span>`
+        : '';
+    const locusIdRaw = locus.LocusId || '';
+    const locusIdParts = locusIdRaw.split('-');
+    let locusIdDisplay;
+    if (locusIdParts.length >= 4) {
+        const locusMotifPart = locusIdParts.slice(3).join('-');
+        if (locusMotifPart.length > motifTruncLen) {
+            const prefix = locusIdParts.slice(0, 3).join('-');
+            locusIdDisplay = `<span class="motif-truncated" title="Click to see full locus ID" data-full-motif="${escapeHtml(locusIdRaw)}">${escapeHtml(prefix)}-${escapeHtml(locusMotifPart.substring(0, motifTruncLen))}...</span>`;
+        } else {
+            locusIdDisplay = escapeHtml(locusIdRaw);
+        }
+    } else {
+        locusIdDisplay = escapeHtml(locusIdRaw);
+    }
+    // Tag badges (user tags only)
+    const userTagBadges = (locus.tags || []).map(t => `<span class="badge badge-tag">${escapeHtml(t)}</span>`).join(' ');
+    // System tags (e.g. readviz) are not produced by the single-DB server, so no system badges.
+    const systemTagBadges = '';
+    const noteIcon = locus.has_note ? '<span class="note-indicator" title="Has note"><i class="sticky note outline icon"></i></span>' : '';
+    // Combine badges: user tags + system tags + known motif + note icon (all on same row)
+    // Wrap user tags + note icon in span.annotation-badges for easy refresh
+    const dynamicBadges = (userTagBadges || noteIcon) ? `<span class="annotation-badges">${userTagBadges}${noteIcon}</span>` : '';
+    const badgesRow = (dynamicBadges || systemTagBadges || knownBadge || knownLocusBadge)
+        ? `<div class="cell-sub badges-row">${dynamicBadges}${systemTagBadges}${knownBadge}${knownLocusBadge}</div>`
+        : '';
+    // Edit Tags and Edit Notes buttons (always visible)
+    const addButtons = `<div class="cell-sub"><button class="ui mini basic button add-tag-btn" data-locus-id="${escapeHtml(locus.LocusId)}" style="padding: 2px 6px; font-size: 0.75em;"><i class="tag icon"></i>Edit Tags</button> <button class="ui mini basic button add-note-btn" data-locus-id="${escapeHtml(locus.LocusId)}" style="padding: 2px 6px; font-size: 0.75em;"><i class="pencil icon"></i>Edit Notes</button></div>`;
+
+    // Region badge
+    const regionBadge = getRegionBadge(locus.gene_region);
+
+    // Allele size with color coding
+    const alleleVal = allele != null ? Math.round(allele) : '';
+    const pathogenicMin = locus.PathogenicMin || null;
+    const alleleColor = allele != null ? getValueColorClass(allele, popMax, pathogenicMin) : '';
+
+    // Delta columns
+    const deltaRefStr = deltaRef != null ? (deltaRef > 0 ? '+' + Math.round(deltaRef) : Math.round(deltaRef)) : '';
+    const deltaRefColor = (deltaRef != null && deltaRef > 0) ? 'color: #c62828; font-weight: 600;' : 'color: #888;';
+    const deltaPopStr = deltaPop != null ? (deltaPop > 0 ? '+' + Math.round(deltaPop) : Math.round(deltaPop)) : '';
+    const deltaPopColor = (deltaPop != null && deltaPop > 0) ? 'color: #e65100; font-weight: 600;' : 'color: #2e7d32;';
+
+    // Aff unsolved with highlight
+    const affUnsolvedStyle = nAffUnsolved > 0 ? 'color: #c62828; font-weight: 600;' : 'color: #888;';
+
+    // Inheritance
+    const inheritance = locus.GeneTableInheritance || locus.inheritance || '';
+
+    // Gene phenotype summary (truncated with "more" link)
+    const genePhenoFull = locus.GeneTableLLMPhenotypeSummary || '';
+    const genePhenoTruncLen = 50;
+    let genePhenoHtml = '';
+    if (genePhenoFull) {
+        if (genePhenoFull.length > genePhenoTruncLen) {
+            genePhenoHtml = `<span class="phenotype-short">${escapeHtml(genePhenoFull.substring(0, genePhenoTruncLen))}... <a class="expand-phenotype" style="color: #2185d0; cursor: pointer;">more</a></span><span class="phenotype-full" style="display:none;">${escapeHtml(genePhenoFull)} <a class="collapse-phenotype" style="color: #2185d0; cursor: pointer;">less</a></span>`;
+        } else {
+            genePhenoHtml = escapeHtml(genePhenoFull);
+        }
+    }
+
+    // pLI
+    const pli = locus.pLI != null ? locus.pLI.toFixed(2) : '';
+    const pliStyle = (locus.pLI != null && locus.pLI >= 0.9) ? 'color: #e65100; font-weight: 600;' : '';
+
+    // Sigma columns with rank text
+    function getSigmaRankText(stdev, rankByMotif, rankTotal) {
+        if (stdev == null) return { value: '', rankText: '' };
+        const value = stdev.toFixed(2);
+        let rankText = '';
+        if (rankByMotif != null && rankTotal != null) {
+            const percentByMotif = rankTotal > 0 ? rankByMotif / rankTotal : 1;
+            if (rankTotal == 1) {
+                rankText = '(only)';
+            } else if (percentByMotif <= 0.001) {
+                rankText = '(top 0.1%)';
+            } else if (percentByMotif <= 0.01) {
+                rankText = '(top 1%)';
+            } else if (percentByMotif <= 0.05) {
+                rankText = '(top 5%)';
+            } else if (percentByMotif <= 0.1) {
+                rankText = '(top 10%)';
+            } else {
+                rankText = '(rank)';
+            }
+        }
+        return { value, rankText };
+    }
+    const sigmaHprc = getSigmaRankText(locus.HPRC256_Stdev, locus.HPRC256_StdevRankByMotif, locus.HPRC256_StdevRankTotalNumberByMotif);
+    const sigmaAou = getSigmaRankText(locus.AoU1027_Stdev, locus.AoU1027_StdevRankByMotif, locus.AoU1027_StdevRankTotalNumberByMotif);
+
+    // UCSC link
+    const ucscLink = (locus.Chrom && locus.Start0Based != null && locus.End1Based != null)
+        ? `<a href="https://genome.ucsc.edu/cgi-bin/hgTracks?db=hg38&position=${locus.Chrom}:${locus.Start0Based + 1}-${locus.End1Based}" target="_blank" title="UCSC Genome Browser" style="color: #999; font-size: 0.8em;">UCSC</a>`
+        : '';
+
+    // TRExplorer link
+    const trexLink = (locus.Chrom && locus.Start0Based != null && locus.End1Based != null)
+        ? (() => {
+            const chromNum = locus.Chrom.replace('chr', '');
+            const trexLocusId = locus.TRExplorerLocusId || `${chromNum}-${locus.Start0Based}-${locus.End1Based}-${locus.Motif || ''}`;
+            const igvLoc = encodeURIComponent(`${locus.Chrom}:${locus.Start0Based}-${locus.End1Based}`);
+            const q = encodeURIComponent(trexLocusId);
+            return `<a href="https://trexplorer.broadinstitute.org/#igvLoc=${igvLoc}&showRs=1&q=${q}&source=&igv_gencode=1&igv_segdups=1&igv_36k_map=1&igv_ncannot=1" target="_blank" title="TRExplorer" style="color: #999; font-size: 0.8em;">TRExplorer</a>`;
+        })()
+        : '';
+
+    // Combine external links
+    const externalLinks = [trexLink, ucscLink].filter(Boolean).join(' &middot; ');
+
+    // Build the locus cell
+    const locusCell = `<div class="cell-main">${locusIdDisplay}</div>${badgesRow}${externalLinks ? `<div class="cell-sub">${externalLinks}</div>` : ''}${addButtons}`;
+
+    return `<tr class="locus-row" data-locus-id="${escapeHtml(locus.LocusId)}" data-row-index="${rowIndex}">
+        <td class="col-expand"><span class="expand-toggle" title="Expand details"><i class="chevron right icon"></i></span></td>
+        <td class="col-row-num">${rowIndex + 1}</td>
+        <td class="col-locus">${locusCell}</td>
+        <td class="col-motif">${motifCell}</td>
+        <td class="col-region">${regionBadge}</td>
+        <td class="col-gene">${geneCell}</td>
+        <td class="col-allele col-numeric ${alleleColor}">${alleleVal}</td>
+        <td class="col-delta-ref col-numeric" style="${deltaRefColor}">${deltaRefStr}</td>
+        <td class="col-delta-pop col-numeric" style="${deltaPopColor}">${deltaPopStr}</td>
+        <td class="col-aff-unsolved col-numeric" style="${affUnsolvedStyle}">${nAffUnsolved}</td>
+        <td class="col-inheritance" style="font-size: 0.92em;">${escapeHtml(inheritance)}</td>
+        <td class="col-gene-pheno" style="font-size: 0.85em; color: #555;">${genePhenoHtml}</td>
+        <td class="col-pli col-numeric" style="${pliStyle}">${pli}</td>
+        <td class="col-sigma-hprc col-numeric">${sigmaHprc.value}${sigmaHprc.rankText ? ` <span style="color: #888; font-size: 0.9em;">${sigmaHprc.rankText}</span>` : ''}</td>
+        <td class="col-sigma-aou col-numeric">${sigmaAou.value}${sigmaAou.rankText ? ` <span style="color: #888; font-size: 0.9em;">${sigmaAou.rankText}</span>` : ''}</td>
+        <td class="col-gene-pheno-sim col-numeric" style="${locus.MaxGenePhenoSim >= 0.5 ? 'color: #e65100; font-weight: 600;' : ''}">${locus.MaxGenePhenoSim != null ? locus.MaxGenePhenoSim.toFixed(2) : ''}</td>
+        <td class="col-pairwise-sim col-numeric" style="${locus.SumPairwiseSim >= 1.0 ? 'color: #e65100; font-weight: 600;' : ''}">${locus.SumPairwiseSim != null ? locus.SumPairwiseSim.toFixed(2) : ''}</td>
+    </tr>`;
+}
+
+// 8.5 Column Header Sort Handling
+$('#results-table thead th[data-sort]').on('click', function() {
+    const field = String($(this).data('sort'));
+    // Toggle this column in/out of the multi-key sort (append to the end if not present).
+    const list = getSortList();
+    const i = list.indexOf(field);
+    if (i >= 0) list.splice(i, 1); else list.push(field);
+    applySortChange(list);  // updates pills, checkboxes, URL, indicator, and results
+});
+
+// =========================================================================
+// Task 9: Locus Detail Inline Expansion
+// =========================================================================
+
+// Motif truncation click handler — show full motif in a popup
+$(document).on('click', '.motif-truncated', function(e) {
+    e.stopPropagation();
+    const fullMotif = $(this).data('full-motif');
+    // Remove any existing popup
+    $('.motif-popup').remove();
+    const $popup = $(`<div class="motif-popup">${escapeHtml(fullMotif)}</div>`);
+    $('body').append($popup);
+    const rect = this.getBoundingClientRect();
+    $popup.css({ top: rect.bottom + window.scrollY + 4, left: rect.left + window.scrollX });
+    // Dismissal is handled by the single persistent document click listener below.
+});
+
+// Warning icon click handler — show violation rates and/or outlier info popup
+$(document).on('click', '.mendelian-warning-icon', function(e) {
+    e.stopPropagation();
+    const sampleId = $(this).data('sample-id');
+    const warning = $(this).data('warning');
+    if (!warning) return;
+
+    // Remove any existing popup
+    $('.mendelian-warning-popup').remove();
+
+    // Format percentage with color coding
+    const formatRate = (rate, threshold = 0.10) => {
+        const pct = (rate * 100).toFixed(1) + '%';
+        return rate > threshold ? `<span class="high-rate">${pct}</span>` : pct;
+    };
+
+    // Determine warning types
+    const hasMendelian = warning.autosome_rate !== undefined;
+    const hasOutlier = warning.outlier_bins !== undefined;
+
+    // Build popup HTML
+    let html = '<div class="mendelian-warning-popup">';
+    html += `<div style="font-size: 0.9em; color: #666; margin-bottom: 6px;">Sample: <b>${escapeHtml(sampleId)}</b></div>`;
+
+    // Mendelian violation section
+    if (hasMendelian) {
+        html += `<div class="popup-header">⚠️ High Mendelian Violation Rate</div>`;
+        html += '<table class="invisible-table">';
+        html += `<tr><td style="font-weight:600;color:#555;">Autosome</td><td style="text-align:right;">${formatRate(warning.autosome_rate)}</td><td style="color:#888;">(${warning.autosome_violations.toLocaleString()} / ${warning.autosome_total.toLocaleString()})</td></tr>`;
+        html += `<tr><td style="font-weight:600;color:#555;">chrX</td><td style="text-align:right;">${formatRate(warning.chrX_rate)}</td><td style="color:#888;">(${warning.chrX_violations.toLocaleString()} / ${warning.chrX_total.toLocaleString()})</td></tr>`;
+        html += `<tr><td style="font-weight:600;color:#555;">chrY</td><td style="text-align:right;">${formatRate(warning.chrY_rate, 1.0)}</td><td style="color:#888;">(${warning.chrY_violations.toLocaleString()} / ${warning.chrY_total.toLocaleString()})</td></tr>`;
+        html += '</table>';
+
+        // Motif size breakdown for Mendelian
+        if (warning.motif_rates && Object.keys(warning.motif_rates).length > 0) {
+            html += '<div class="motif-section">';
+            html += '<div class="motif-section-header">By Motif Size</div>';
+            html += '<div class="motif-grid">';
+            const motifLabels = {
+                '1bp': '1bp', '2bp': '2bp', '3bp': '3bp', '4bp': '4bp',
+                '5bp': '5bp', '6bp': '6bp', '7_24bp': '7-24bp', '25plusbp': '25+bp'
+            };
+            for (const [cat, data] of Object.entries(warning.motif_rates)) {
+                const label = motifLabels[cat] || cat;
+                html += `<div class="motif-item"><span>${label}:</span><span>${formatRate(data.rate, 1.0)}</span></div>`;
+            }
+            html += '</div></div>';
+        }
+    }
+
+    // Outlier section
+    if (hasOutlier) {
+        if (hasMendelian) html += '<hr style="margin: 10px 0; border: none; border-top: 1px solid #ddd;">';
+        html += `<div class="popup-header">⚠️ 99th Percentile TR Outlier</div>`;
+        html += '<table class="invisible-table">';
+        html += '<tr><th style="font-weight:600;color:#555;">Bin</th><th style="text-align:right;font-weight:600;color:#555;padding-right:8px;">Count</th><th style="text-align:left;color:#888;">Threshold</th></tr>';
+        const binOrder = ['1bp', '2bp', '3-6bp', '7-24bp', '25+bp'];
+        for (const bin of binOrder) {
+            if (warning.outlier_bins[bin]) {
+                const data = warning.outlier_bins[bin];
+                html += `<tr><td style="font-weight:600;color:#555;">${bin}</td><td style="text-align:right;padding-right:8px;"><span class="high-rate">${data.count}</span></td><td style="text-align:left;color:#888;">&ge; ${data.threshold}</td></tr>`;
+            }
+        }
+        html += '</table>';
+    }
+    html += '</div>';
+
+    const $popup = $(html);
+    $('body').append($popup);
+    const rect = this.getBoundingClientRect();
+    $popup.css({ top: rect.bottom + window.scrollY + 4, left: rect.left + window.scrollX });
+    // Dismissal is handled by the single persistent document click listener below.
+});
+
+// Dismiss popups on any click that lands outside the popup and outside its trigger. A
+// single persistent listener (instead of a per-popup $(document).one(...)) avoids the bug
+// where opening a second popup immediately re-fired the previous popup's dismiss handler
+// and removed the just-opened popup. Clicks inside a popup (or on its trigger) are ignored
+// so its text stays selectable, mirroring the shared handler in qc_shared_js.html.
+$(document).on('click', function(e) {
+    const $t = $(e.target);
+    if (!$t.closest('.motif-truncated, .motif-popup').length) {
+        $('.motif-popup').remove();
+    }
+    if (!$t.closest('.mendelian-warning-icon, .mendelian-warning-popup').length) {
+        $('.mendelian-warning-popup').remove();
+    }
+});
+
+// 9.1 Click Handler
+// Bind to the whole expand cell (not just the inner toggle icon) so the entire
+// pointer-cursor cell area is clickable, not only the narrow chevron.
+$(document).on('click', '.col-expand', async function() {
+    const $row = $(this).closest('.locus-row');
+    const locusId = $row.data('locus-id');
+    const $toggle = $(this).find('.expand-toggle');
+    const $existingDetail = $row.next('.locus-detail-row');
+
+    // Toggle off (with slide animation)
+    if ($existingDetail.length) {
+        const $td = $existingDetail.find('td');
+        $td.wrapInner('<div class="slide-wrapper"></div>');
+        $td.find('.slide-wrapper').slideUp(200, function() {
+            $existingDetail.remove();
+        });
+        $toggle.removeClass('expanded').html('<i class="chevron right icon"></i>');
+        return;
+    }
+
+    // Show loading
+    $toggle.addClass('expanded').html('<i class="chevron down icon"></i>');
+    const $loadingRow = $(`<tr class="locus-detail-row"><td colspan="17" style="padding: 12px 14px; background: #fafafa; border-top: 1px solid #ccc; border-bottom: 2px solid #2185d0;"><div class="ui tiny active inline loader"></div> Loading...</td></tr>`);
+    $row.after($loadingRow);
+
+    try {
+        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${currentState.source}`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const detail = await response.json();
+        const html = renderLocusDetail(detail, currentState.outlier_type);
+        $loadingRow.find('td').html(html);
+    } catch (error) {
+        // Keep the chevron expanded so it stays consistent with the error detail row left in
+        // the DOM; otherwise the next click "collapses" the error row instead of retrying.
+        $loadingRow.find('td').html(`<span style="color: red;">Error: ${escapeHtml(error.message)}</span>`);
+    }
+});
+
+// 9.2 Detail Rendering
+function renderLocusDetail(detail, outlierType) {
+    const otMap = {all: 'AllAlleles', short: 'ShortAlleles', hemi: 'HemizygousAlleles'};
+    const ot = otMap[outlierType];
+    const samples = (detail.outlier_samples[ot] || []).slice();
+    const annotations = detail.annotations || {};
+    const popThresholds = annotations.population_thresholds || {};
+    const knownDisease = annotations.known_disease_locus;
+    const omimOverlaps = annotations.omim_overlaps || [];
+    const locus = detail.locus;
+
+    // Sort samples by allele_size descending
+    samples.sort((a, b) => b.allele_size - a.allele_size);
+
+    // Threshold values
+    const firstUnaffected = locus[`FirstUnaffectedAlleleSize_${ot}`];
+    // [display name, population_thresholds key prefix]. 90thPercentile is absent
+    // for HPRC256/TenK10K (no source data) and renders as "p90=?".
+    const popEntries = [
+        ['HPRC256', 'HPRC256'],
+        ['AoU1027', 'AoU1027'],
+        ['TenK10K', 'TenK10K'],
+        ['AoU2High', 'AoUPhase2HighCov'],
+        ['AoU2Mid',  'AoUPhase2MidCov'],
+    ].map(([name, k]) => ({
+        name,
+        max:    popThresholds[`${k}_MaxAllele`],
+        p99:    popThresholds[`${k}_99thPercentile`],
+        p90:    popThresholds[`${k}_90thPercentile`],
+        median: popThresholds[`${k}_Median`],
+        mode:   popThresholds[`${k}_Mode`],
+        stdev:  popThresholds[`${k}_Stdev`],
+    })).filter(e => e.max != null);
+    const pathogenicMin = knownDisease ? knownDisease.pathogenic_min : null;
+
+    let html = '';
+
+    // Known disease info block
+    if (knownDisease) {
+        html += `<div style="margin-bottom: 8px; padding: 6px 10px; background: #fff3e0;
+                    border-left: 4px solid #f57f17; border-radius: 3px; font-size: 0.9em;">
+            <b>Known Disease Locus:</b> ${escapeHtml(knownDisease.locus_id || '')}
+            ${(knownDisease.diseases || []).map(d =>
+                `<br/>&nbsp;&nbsp;${escapeHtml(d.name || '')} (${escapeHtml(d.inheritance || '')}, pathogenic &ge; ${d.pathogenic_min || '?'})`
+            ).join('')}
+        </div>`;
+    }
+
+    // User note (if exists)
+    const userNote = detail.user_annotations?.note;
+    if (userNote && userNote.note_text) {
+        html += `<div style="margin-bottom: 8px; padding: 8px 12px; background: #e8f4fd; border-left: 4px solid #2185d0; border-radius: 3px;">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                <div style="flex: 1;">
+                    <div style="font-weight: 600; font-size: 0.92em; color: #1565c0; margin-bottom: 4px;"><i class="sticky note outline icon"></i> Note</div>
+                    <div style="font-size: 0.92em; white-space: pre-wrap;">${escapeHtml(userNote.note_text)}</div>
+                </div>
+                <div style="font-size: 0.8em; color: #888; margin-left: 12px; white-space: nowrap;">${escapeHtml(userNote.updated_at || '')}</div>
+            </div>
+        </div>`;
+    }
+
+    // C1: TRExplorer locus ID cross-reference
+    if (locus.TRExplorerLocusId && locus.TRExplorerLocusId !== locus.LocusId) {
+        const jaccard = locus.TRExplorerLocusJaccardSimilarity;
+        const jStr = jaccard != null ? ` (Jaccard: ${jaccard.toFixed(3)})` : '';
+        html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">TRExplorer LocusId: ${escapeHtml(locus.TRExplorerLocusId)}${jStr}</div>`;
+    }
+
+    // C2: RepeatMasker intervals
+    if (locus.RepeatMaskerIntervals && !locus.RepeatMaskerIntervals.startsWith('Simple_repeat')) {
+        html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">RepeatMasker: ${escapeHtml(locus.RepeatMaskerIntervals)}</div>`;
+    }
+
+    // C3: Variation cluster size diff
+    if (locus.VariationClusterSizeDiff != null) {
+        const vcsSign = locus.VariationClusterSizeDiff >= 0 ? '+' : '';
+        html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">Variation Cluster: ${vcsSign}${locus.VariationClusterSizeDiff}</div>`;
+    }
+
+    // C4: Allele histogram
+    const histKey = {AllAlleles: 'AllAlleleHistogram', ShortAlleles: 'ShortAlleleHistogram', HemizygousAlleles: 'HemizygousAlleleHistogram'}[ot];
+    const histVal = locus[histKey];
+    if (histVal) {
+        const histDisplay = histVal.length > 200 ? histVal.substring(0, 200) + '...' : histVal;
+        html += `<div style="font-size: 0.88em; color: #888; margin-bottom: 4px; word-break: break-all;">${escapeHtml(histKey)}: ${escapeHtml(histDisplay)}</div>`;
+    }
+
+    // Outlier sample IDs raw string
+    const outlierKey = `OutlierSampleIds_${ot}`;
+    const outlierVal = locus[outlierKey];
+    if (outlierVal) {
+        const outlierDisplay = outlierVal.length > 200 ? outlierVal.substring(0, 200) + '...' : outlierVal;
+        html += `<div style="font-size: 0.88em; color: #888; margin-bottom: 4px; word-break: break-all;">${escapeHtml(outlierKey)}: ${escapeHtml(outlierDisplay)}</div>`;
+    }
+
+
+    // D4: Quick-filter toggle buttons for the per-sample table
+    html += `<div style="margin-bottom: 8px; display: flex; gap: 6px; flex-wrap: wrap;">
+        <button class="ui mini button detail-filter-btn active" data-filter="all">All</button>
+        <button class="ui mini button detail-filter-btn" data-filter="affected">Affected</button>
+        <button class="ui mini button detail-filter-btn" data-filter="affected-unsolved">Aff Unsolved</button>
+        <button class="ui mini button detail-filter-btn" data-filter="unaffected">Unaffected</button>
+        <button class="ui mini button detail-filter-btn" data-filter="above-pop">Above Pop Max</button>
+    </div>`;
+
+    // Per-sample table
+    const hasPurity = samples.some(s => s.purity != null);
+    const hasMethylation = samples.some(s => s.methylation != null);
+    const hasSex = samples.some(s => s.sex);
+    let colCount = 7;
+    if (hasSex) colCount++;
+    if (hasPurity) colCount++;
+    if (hasMethylation) colCount++;
+
+    html += '<table class="sample-subtable"><thead><tr>';
+    html += '<th>Allele</th><th>Motif</th>';
+    if (hasSex) html += '<th>Sex</th>';
+    html += '<th>Sample ID</th><th>Family</th><th>Status</th><th>Analysis</th><th>Phenotype</th>';
+    if (hasPurity) html += '<th>Purity</th>';
+    if (hasMethylation) html += '<th>Methyl</th>';
+    html += '</tr></thead><tbody>';
+
+    // Build threshold list sorted by value descending so markers appear in the
+    // correct position as we walk samples from largest to smallest allele.
+    const thresholds = [];
+    if (firstUnaffected != null) {
+        thresholds.push({ value: firstUnaffected, fired: false,
+            html: `<tr><td colspan="${colCount}" class="threshold-marker threshold-unaffected">&#9472; first unaffected: ${Math.round(firstUnaffected)}</td></tr>` });
+    }
+    const rPop = v => (v != null ? Math.round(v) : '?');
+    for (const pe of popEntries) {
+        const stdevStr = pe.stdev != null ? pe.stdev.toFixed(1) : '?';
+        const popStats = `p99=${rPop(pe.p99)}, max=${rPop(pe.max)}, mode=${rPop(pe.mode)}, median=${rPop(pe.median)}, stdev=${stdevStr}, p90=${rPop(pe.p90)}`;
+        thresholds.push({ value: pe.max, fired: false,
+            html: `<tr><td colspan="${colCount}" class="threshold-marker threshold-population">&#9472; population max (${escapeHtml(pe.name)}): ${popStats}</td></tr>` });
+    }
+    if (pathogenicMin != null) {
+        thresholds.push({ value: pathogenicMin, fired: false,
+            html: `<tr><td colspan="${colCount}" class="threshold-marker threshold-pathogenic">&#9472; pathogenic threshold: ${Math.round(pathogenicMin)}</td></tr>` });
+    }
+    thresholds.sort((a, b) => b.value - a.value);
+
+    for (const s of samples) {
+        // Insert threshold markers before first sample at or below each threshold
+        for (const t of thresholds) {
+            if (!t.fired && s.allele_size <= t.value) {
+                html += t.html;
+                t.fired = true;
+            }
+        }
+
+        // Row CSS class by status
+        let rowClass = 'sample-unknown';
+        if (s.affected_status === 'Affected' && s.analysis_status === 'Unsolved') rowClass = 'sample-affected-unsolved';
+        else if (s.affected_status === 'Affected') rowClass = 'sample-affected-solved';
+        else if (s.affected_status === 'Unaffected') rowClass = 'sample-unaffected';
+
+        // D10: Expandable phenotype text in detail panel
+        let phenTrunc = '';
+        if (s.phenotype_description) {
+            if (s.phenotype_description.length > 150) {
+                phenTrunc = `<span class="phenotype-short">${escapeHtml(s.phenotype_description.substring(0, 150))}... <a class="expand-phenotype" style="color: #2185d0; cursor: pointer;">more</a></span><span class="phenotype-full" style="display:none;">${escapeHtml(s.phenotype_description)} <a class="collapse-phenotype" style="color: #2185d0; cursor: pointer;">less</a></span>`;
+            } else {
+                phenTrunc = escapeHtml(s.phenotype_description);
+            }
+        }
+
+        html += `<tr class="${rowClass}">`;
+
+        html += `<td style="text-align: right; font-weight: 600;">${s.allele_size}</td>`;
+        html += `<td>${escapeHtml(locus.Motif || '')}</td>`;
+        if (hasSex) html += `<td>${escapeHtml(s.sex || '')}</td>`;
+        html += `<td>${renderMendelianWarning(s.sample_id, currentState.source)}${escapeHtml(s.sample_id || '')}</td>`;
+        html += `<td>${escapeHtml(s.family_id || '')}</td>`;
+        html += `<td>${escapeHtml(s.affected_status || '')}</td>`;
+        html += `<td>${escapeHtml(s.analysis_status || '')}</td>`;
+        html += `<td style="white-space: normal; max-width: 400px;">${phenTrunc}</td>`;
+        if (hasPurity) html += `<td>${s.purity != null ? s.purity.toFixed(2) : ''}</td>`;
+        if (hasMethylation) html += `<td>${s.methylation != null ? s.methylation.toFixed(2) : ''}</td>`;
+        html += '</tr>';
+    }
+
+    html += '</tbody></table>';
+
+    // Phenotype similarity scores section
+    const phenoScores = detail.phenotype_scores || {};
+    const perOutlierScores = phenoScores.per_outlier || {};
+    const perLocusScores = phenoScores.per_locus || {};
+    const outlierScoresForType = perOutlierScores[ot] || [];
+    const locusScoreForType = perLocusScores[ot];
+
+    if (outlierScoresForType.length > 0 || locusScoreForType) {
+        html += '<div style="margin-top: 10px; padding: 6px 10px; background: #e8f5e9; border-left: 4px solid #4caf50; border-radius: 3px;">';
+        html += '<div style="font-weight: 600; font-size: 0.92em; color: #2e7d32; margin-bottom: 6px;">Phenotype Similarity Scores</div>';
+
+        // Per-locus summary
+        if (locusScoreForType) {
+            const maxGeneSim = locusScoreForType.max_gene_phenotype_similarity;
+            const sumPairwise = locusScoreForType.sum_pairwise_similarity;
+            const numQualifying = locusScoreForType.num_qualifying_samples;
+            html += '<div style="font-size: 0.9em; margin-bottom: 6px;">';
+            html += `<b>Locus summary:</b> ${numQualifying || 0} qualifying samples`;
+            if (maxGeneSim != null) html += `, max gene-phenotype similarity: <b>${maxGeneSim.toFixed(3)}</b>`;
+            if (sumPairwise != null) html += `, sum pairwise: ${sumPairwise.toFixed(3)}`;
+            html += '</div>';
+        }
+
+        // Per-sample scores table
+        if (outlierScoresForType.length > 0) {
+            html += '<table style="width: 100%; font-size: 0.88em; border-collapse: collapse; margin-top: 4px;">';
+            html += '<thead><tr style="background: #c8e6c9;">';
+            html += '<th style="padding: 3px 6px; text-align: left;">Sample</th>';
+            html += '<th style="padding: 3px 6px; text-align: right;">Allele</th>';
+            html += '<th style="padding: 3px 6px; text-align: right;" title="Semantic similarity between patient HPO terms and gene-associated phenotypes">Gene-Pheno Sim</th>';
+            html += '<th style="padding: 3px 6px; text-align: right;" title="Number of HPO term overlaps">Overlap</th>';
+            html += '<th style="padding: 3px 6px; text-align: left;" title="Best matching disease from gene">Best Disease</th>';
+            html += '<th style="padding: 3px 6px; text-align: right;" title="Semantic similarity to next sample in list">Pairwise Sim</th>';
+            html += '</tr></thead><tbody>';
+
+            for (const score of outlierScoresForType) {
+                const geneSimStr = score.gene_phenotype_similarity != null ? score.gene_phenotype_similarity.toFixed(3) : '-';
+                const overlapStr = score.gene_phenotype_overlap_count != null ? score.gene_phenotype_overlap_count : '-';
+                const pairwiseStr = score.pairwise_similarity_to_next != null ? score.pairwise_similarity_to_next.toFixed(3) : '-';
+                const bestDisease = score.best_matching_disease || '-';
+                const bestInh = score.best_disease_inheritance ? ` (${score.best_disease_inheritance})` : '';
+
+                // Highlight rows with high gene-phenotype similarity
+                const rowStyle = score.gene_phenotype_similarity >= 0.5 ? 'background: #a5d6a7;' : '';
+
+                html += `<tr style="${rowStyle}">`;
+                html += `<td style="padding: 3px 6px;">${renderMendelianWarning(score.sample_id, currentState.source)}${escapeHtml(score.sample_id || '')}</td>`;
+                html += `<td style="padding: 3px 6px; text-align: right;">${score.allele_size || ''}</td>`;
+                html += `<td style="padding: 3px 6px; text-align: right; font-weight: ${score.gene_phenotype_similarity >= 0.5 ? 'bold' : 'normal'};">${geneSimStr}</td>`;
+                html += `<td style="padding: 3px 6px; text-align: right;">${overlapStr}</td>`;
+                html += `<td style="padding: 3px 6px; font-size: 0.9em;">${escapeHtml(bestDisease)}${escapeHtml(bestInh)}</td>`;
+                html += `<td style="padding: 3px 6px; text-align: right;">${pairwiseStr}</td>`;
+                html += '</tr>';
+            }
+            html += '</tbody></table>';
+        }
+        html += '</div>';
+    }
+
+    // OMIM overlaps
+    if (omimOverlaps.length > 0) {
+        html += '<div style="margin-top: 10px;">';
+        html += '<table class="invisible-table omim-table"><tbody>';
+        for (const o of omimOverlaps) {
+            const linkageText = `OMIM ${o.region_size_mb}Mb linkage${o.region_coords ? ' [' + escapeHtml(o.region_coords) + ']' : ''}:`;
+            const mimText = o.phenotype_mim_number ? `(MIM#${o.phenotype_mim_number})` : '';
+            html += `<tr class="omim-line"><td class="omim-linkage">${linkageText}</td><td class="omim-phenotype">${escapeHtml(o.phenotype_description)}</td><td class="omim-mim">${mimText}</td></tr>`;
+        }
+        html += '</tbody></table>';
+        html += '</div>';
+    }
+
+    // C6: Affected-unsolved summary
+    const affUnsolved = samples.filter(s => s.affected_status === 'Affected' && s.analysis_status === 'Unsolved');
+    if (affUnsolved.length > 0) {
+        html += '<div style="margin-top: 8px; padding: 6px 10px; background: #fff5f5; border-left: 4px solid #c62828; border-radius: 3px;">';
+        html += '<div style="font-weight: 600; font-size: 0.92em; color: #c62828; margin-bottom: 4px;">Affected Unsolved Summary:</div>';
+        html += '<table class="invisible-table affected-unsolved-table"><tbody>';
+        for (const s of affUnsolved) {
+            html += `<tr style="font-size: 0.92em; color: #c62828;"><td class="aff-allele">${s.allele_size} x ${escapeHtml(locus.Motif || '')}</td><td class="aff-sample">${escapeHtml(s.sample_id)}</td><td class="aff-phenotype">${escapeHtml(s.phenotype_description ? s.phenotype_description.substring(0, 120) : '')}</td></tr>`;
+        }
+        html += '</tbody></table>';
+        html += '</div>';
+    }
+
+    // C7: Copy-paste sample IDs + Collapse details button row
+    if (affUnsolved.length > 0) {
+        const copyText = affUnsolved.map(s => `("${locus.LocusId}", "${s.sample_id}")`).join(',\n');
+        if (!window._copyTextMap) window._copyTextMap = {};
+        window._copyTextMap[locus.LocusId] = copyText;
+    }
+    html += `<div style="margin-top: 10px; display: flex; justify-content: space-between; align-items: center;">
+        <button class="ui mini basic button collapse-detail-btn" data-locus-id="${escapeHtml(locus.LocusId)}">
+            <i class="chevron up icon"></i> Collapse details
+        </button>
+        ${affUnsolved.length > 0 ? `<button class="ui mini basic button copy-ids-btn" data-locus-id="${escapeHtml(locus.LocusId)}">
+            <i class="copy icon"></i> Copy affected IDs
+        </button>` : ''}
+    </div>`;
+
+    return html;
+}
+
+// 9.3 Detail Panel Event Handlers
+
+// C7: Copy affected sample IDs to clipboard
+$(document).on('click', '.copy-ids-btn', function() {
+    const text = window._copyTextMap[$(this).data('locus-id')] || '';
+    navigator.clipboard.writeText(text).then(() => {
+        $(this).html('<i class="check icon"></i> Copied!');
+        setTimeout(() => $(this).html('<i class="copy icon"></i> Copy affected IDs'), 2000);
+    });
+});
+
+// Collapse details button handler (with slide animation)
+$(document).on('click', '.collapse-detail-btn', function() {
+    const $detailRow = $(this).closest('.locus-detail-row');
+    const $locusRow = $detailRow.prev('.locus-row');
+    const $td = $detailRow.find('td');
+    $td.wrapInner('<div class="slide-wrapper"></div>');
+    $td.find('.slide-wrapper').slideUp(200, function() {
+        $detailRow.remove();
+    });
+    $locusRow.find('.expand-toggle').removeClass('expanded').html('<i class="chevron right icon"></i>');
+});
+
+// D4: Quick-filter toggles for the per-sample table in the detail panel.
+$(document).on('click', '.detail-filter-btn', function() {
+    const $panel = $(this).closest('.locus-detail-row');
+    $panel.find('.detail-filter-btn').removeClass('active');
+    $(this).addClass('active');
+    const filter = $(this).data('filter');
+    $panel.find('.sample-subtable tbody tr').each(function() {
+        const $row = $(this);
+        if ($row.find('.threshold-marker').length > 0) { $row.show(); return; }
+        if (filter === 'all') { $row.show(); return; }
+        const status = $row.attr('class') || '';
+        if (filter === 'affected') $row.toggle(status.includes('sample-affected'));
+        else if (filter === 'affected-unsolved') $row.toggle(status === 'sample-affected-unsolved');
+        else if (filter === 'unaffected') $row.toggle(status === 'sample-unaffected');
+        else if (filter === 'above-pop') {
+            const $popMarker = $panel.find('.threshold-population');
+            if ($popMarker.length === 0) {
+                $row.show();
+            } else {
+                $row.toggle($row.prevAll('tr:has(.threshold-population)').length === 0);
+            }
+        }
+    });
+});
+
+// D10: Expandable phenotype text
+$(document).on('click', '.expand-phenotype', function() {
+    $(this).closest('td').find('.phenotype-short').hide();
+    $(this).closest('td').find('.phenotype-full').show();
+});
+$(document).on('click', '.collapse-phenotype', function() {
+    $(this).closest('td').find('.phenotype-full').hide();
+    $(this).closest('td').find('.phenotype-short').show();
+});
+
+// =========================================================================
+// Task 10: Pagination Controls
+// =========================================================================
+
+// 10.1 Update Pagination
+function updatePaginationControls(data) {
+    const $top = $('.top-pagination');
+    const $bottom = $('.bottom-pagination');
+
+    if (data.total === 0) { $top.hide(); $bottom.hide(); return; }
+    $top.show(); $bottom.show();
+
+    const page = data.page;
+    const pageSize = data.page_size;
+    const total = data.total;
+    const totalPages = data.total_pages;
+    const nFirst = (page - 1) * pageSize + 1;
+    const nLast = Math.min(nFirst + pageSize - 1, total);
+
+    const paginationHtml = `
+        <div class="total-results">
+            Showing ${nFirst.toLocaleString()}&ndash;${nLast.toLocaleString()} of ${total.toLocaleString()}
+        </div>
+        <div class="export-selector">
+            <span class="export-label"><b>Export to:</b></span>
+            <div class="ui selection dropdown export-dropdown" style="min-width: 160px">
+                <input type="hidden" name="export-format">
+                <i class="dropdown icon"></i>
+                <div class="default text">Select format</div>
+                <div class="menu">
+                    <div class="item" data-value="bed">BED</div>
+                    <div class="item" data-value="tsv">TSV</div>
+                    <div class="item" data-value="json">JSON</div>
+                    <div class="divider"></div>
+                    <div class="header">Tool input formats:</div>
+                    <div class="item" data-value="expansion_hunter">ExpansionHunter</div>
+                </div>
+            </div>
+        </div>
+        <div class="page-size-selector">
+            <span>Per page:</span>
+            <div class="ui selection dropdown page-size-select" style="min-width: 80px;">
+                <input type="hidden" name="page-size">
+                <i class="dropdown icon"></i>
+                <div class="text">${pageSize}</div>
+                <div class="menu">
+                    <div class="item" data-value="10">10</div>
+                    <div class="item" data-value="25">25</div>
+                    <div class="item" data-value="50">50</div>
+                    <div class="item" data-value="100">100</div>
+                    <div class="item" data-value="200">200</div>
+                </div>
+            </div>
+        </div>
+        <div class="pagination-controls">
+            <button class="ui icon button first-page ${page === 1 ? 'disabled' : ''}" title="First">
+                <i class="angle double left icon"></i>
+            </button>
+            <button class="ui icon button prev-page ${page === 1 ? 'disabled' : ''}" title="Previous">
+                <i class="angle left icon"></i>
+            </button>
+            <div style="display: inline-flex; align-items: center; gap: 4px;">
+                <input type="text" class="page-input" value="${page}">
+                <span style="color: #888;">/ ${totalPages}</span>
+            </div>
+            <button class="ui icon button next-page ${page >= totalPages ? 'disabled' : ''}" title="Next">
+                <i class="angle right icon"></i>
+            </button>
+            <button class="ui icon button last-page ${page >= totalPages ? 'disabled' : ''}" title="Last">
+                <i class="angle double right icon"></i>
+            </button>
+        </div>`;
+
+    $top.html(paginationHtml);
+    $bottom.html(paginationHtml);
+
+    // Initialize page size dropdowns
+    let _pageSizeChanging = false;
+    $('.page-size-select').dropdown({
+        onChange: function(value) {
+            if (_pageSizeChanging) return;
+            _pageSizeChanging = true;
+            currentState.page_size = parseInt(value);
+            currentState.page = 1;
+            $('.page-size-select').dropdown('set selected', value);
+            writeStateToUrl();
+            performSearch();
+            _pageSizeChanging = false;
+        }
+    });
+
+    // Initialize export dropdowns
+    $('.export-dropdown').dropdown({
+        onChange: async function(value) {
+            if (!value) return;
+            $('.export-dropdown').dropdown('clear');
+            await performExport(value);
+        }
+    });
+
+    bindPaginationEvents($top, totalPages);
+    bindPaginationEvents($bottom, totalPages);
+}
+
+// 10.2 Pagination Event Binding
+function bindPaginationEvents($container, totalPages) {
+    $container.find('.first-page').off('click').on('click', function() {
+        if (!$(this).hasClass('disabled')) goToPage(1);
+    });
+    $container.find('.prev-page').off('click').on('click', function() {
+        if (!$(this).hasClass('disabled')) goToPage(currentState.page - 1);
+    });
+    $container.find('.next-page').off('click').on('click', function() {
+        if (!$(this).hasClass('disabled')) goToPage(currentState.page + 1);
+    });
+    $container.find('.last-page').off('click').on('click', function() {
+        if (!$(this).hasClass('disabled')) goToPage(totalPages);
+    });
+    $container.find('.page-input').off('keypress').on('keypress', function(e) {
+        if (e.which === 13) {
+            const p = parseInt($(this).val());
+            if (p >= 1 && p <= totalPages) goToPage(p);
+            else $(this).val(currentState.page);
+        }
+    });
+}
+
+function goToPage(page) {
+    currentState.page = page;
+    writeStateToUrl();
+    performSearch();
+    document.getElementById('results-area').scrollIntoView({ behavior: 'smooth' });
+}
+
+// =========================================================================
+// Annotation CRUD Functions
+// =========================================================================
+
+async function saveNote(locusId, noteText) {
+    const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}/note`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({note_text: noteText}),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+}
+
+async function deleteNote(locusId) {
+    const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}/note`, {
+        method: 'DELETE',
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+}
+
+async function addTag(locusId, tag) {
+    const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}/tags`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tag: tag}),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+}
+
+async function removeTag(locusId, tag) {
+    const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}/tags/${encodeURIComponent(tag)}`, {
+        method: 'DELETE',
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+}
+
+async function refreshDetailPanel(locusId) {
+    const $row = $(`tr.locus-row[data-locus-id="${locusId}"]`);
+    const $detailRow = $row.next('.locus-detail-row');
+    if ($detailRow.length === 0) return;
+
+    try {
+        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${currentState.source}`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const detail = await response.json();
+        const html = renderLocusDetail(detail, currentState.outlier_type);
+        $detailRow.find('td').html(html);
+    } catch (error) {
+        console.error('Refresh detail error:', error);
+    }
+
+    // Also refresh the table row's tag/note badges
+    refreshRowAnnotations(locusId);
+}
+
+async function refreshRowAnnotations(locusId) {
+    try {
+        const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}`);
+        if (!response.ok) return;
+        const ann = await response.json();
+        const $row = $(`tr.locus-row[data-locus-id="${locusId}"]`);
+        const $locusCell = $row.find('.col-locus');
+        const $badgesRow = $locusCell.find('.badges-row');
+
+        // Build new tag badges and note icon
+        const tags = ann.tags || [];
+        const hasNote = ann.note != null;
+        const tagBadges = tags.map(t => `<span class="badge badge-tag">${escapeHtml(t)}</span>`).join(' ');
+        const noteIcon = hasNote ? '<span class="note-indicator" title="Has note"><i class="sticky note outline icon"></i></span>' : '';
+        const newContent = (tagBadges || noteIcon) ? `<span class="annotation-badges">${tagBadges}${noteIcon}</span>` : '';
+
+        // Update or create the badges row
+        if ($badgesRow.length) {
+            // Remove old annotation-badges span and prepend new one (user tags come first)
+            $badgesRow.find('.annotation-badges').remove();
+            if (newContent) {
+                $badgesRow.prepend(newContent);
+            }
+        } else if (newContent) {
+            // No badges row exists yet, create one after cell-main
+            $locusCell.find('.cell-main').after(`<div class="cell-sub badges-row">${newContent}</div>`);
+        }
+    } catch (e) {
+        console.error('Refresh row annotations error:', e);
+    }
+}
+
+// Populate tag dropdown from API
+async function populateTagDropdown() {
+    try {
+        const response = await fetch(`${API_BASE_URL}/annotations/tags`);
+        if (!response.ok) return;
+        const data = await response.json();
+        const $dropdown = $('#tag-filter');
+        const currentVal = $dropdown.dropdown('get value');
+
+        // Build menu items for div-based dropdown
+        const values = [];
+
+        // Add system tags first with special prefix
+        (data.system_tags || []).forEach(tag => {
+            values.push({ name: `[System] ${tag}`, value: tag });
+        });
+
+        // Add user tags
+        (data.tags || []).forEach(tag => {
+            values.push({ name: tag, value: tag });
+        });
+
+        $dropdown.dropdown('setup menu', { values: values });
+        if (currentVal) $dropdown.dropdown('set selected', currentVal);
+    } catch (e) {
+        console.error('Populate tags error:', e);
+    }
+}
+
+// Populate sample ID dropdown from schema API
+async function populateSampleIdDropdown() {
+    try {
+        const response = await fetch(`${API_BASE_URL}/schema`);
+        if (!response.ok) return;
+        const data = await response.json();
+        const values = (data.sample_ids || []).map(id => ({
+            name: id,
+            value: id,
+        }));
+        $('#sample-id-filter').dropdown('setup menu', { values: values });
+    } catch (e) {
+        console.error('Populate sample IDs error:', e);
+    }
+}
+
+// Click handler for Edit Notes button and note icon
+$(document).on('click', '.add-note-btn, .note-indicator', async function() {
+    const locusId = $(this).data('locus-id') || $(this).closest('tr.locus-row').data('locus-id');
+    const $modal = $('#edit-note-modal');
+    const $textarea = $('#note-textarea');
+    const $existingSection = $('#existing-note-section');
+    const $updatedAt = $('#note-updated-at');
+
+    // Store locusId on modal for save handler
+    $modal.data('locus-id', locusId);
+
+    // Fetch existing note for this locus
+    try {
+        const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}`);
+        const data = response.ok ? await response.json() : {};
+
+        if (data.note && data.note.note_text) {
+            $textarea.val(data.note.note_text);
+            $updatedAt.text(data.note.updated_at || '');
+            $existingSection.show();
+        } else {
+            $textarea.val('');
+            $existingSection.hide();
+        }
+    } catch (e) {
+        $textarea.val('');
+        $existingSection.hide();
+    }
+
+    // Show the modal
+    $modal
+        .modal({
+            onApprove: async function() {
+                const noteText = $textarea.val().trim();
+                const currentLocusId = $modal.data('locus-id');
+
+                if (!noteText) {
+                    // If empty, just close (don't save empty note)
+                    return true;
+                }
+
+                try {
+                    await saveNote(currentLocusId, noteText);
+                    refreshRowAnnotations(currentLocusId);
+                    // Refresh detail panel if open
+                    const $detailRow = $(`tr.locus-row[data-locus-id="${currentLocusId}"]`).next('.locus-detail-row');
+                    if ($detailRow.length) {
+                        refreshDetailPanel(currentLocusId);
+                    }
+                } catch (e) {
+                    alert('Failed to save note: ' + e.message);
+                    return false; // prevent close on error
+                }
+                return true;
+            },
+            onHidden: function() {
+                $textarea.val('');
+                $existingSection.hide();
+            }
+        })
+        .modal('show');
+});
+
+// Delete note button inside the modal
+$(document).on('click', '#delete-note-btn', async function() {
+    const $modal = $('#edit-note-modal');
+    const locusId = $modal.data('locus-id');
+
+    if (!confirm('Delete this note?')) return;
+
+    try {
+        await deleteNote(locusId);
+
+        // Clear the modal UI
+        $('#note-textarea').val('');
+        $('#existing-note-section').hide();
+
+        // Update row badges immediately
+        refreshRowAnnotations(locusId);
+
+        // Refresh detail panel if open
+        const $detailRow = $(`tr.locus-row[data-locus-id="${locusId}"]`).next('.locus-detail-row');
+        if ($detailRow.length) {
+            refreshDetailPanel(locusId);
+        }
+    } catch (e) {
+        alert('Failed to delete note: ' + e.message);
+    }
+});
+
+$(document).on('click', '.add-tag-btn', async function() {
+    const locusId = $(this).data('locus-id');
+    const allTags = window._allTagsList || [];
+    const $addTagDropdown = $('#add-tag-dropdown');
+    const $modal = $('#add-tag-modal');
+
+    // Store locusId on modal for delete handlers
+    $modal.data('locus-id', locusId);
+
+    // Helper to fully reset dropdown state
+    function resetDropdown() {
+        $addTagDropdown.dropdown('clear');
+        $addTagDropdown.dropdown('restore defaults');
+        $addTagDropdown.find('input.search').val('');
+        $addTagDropdown.find('.default.text').show();
+    }
+
+    // Fetch existing tags for this locus and display them
+    const existingTags = await fetchLocusTags(locusId);
+    renderExistingTagsInModal(existingTags, locusId);
+
+    // Populate the dropdown with existing tags
+    const values = allTags.map(tag => ({ name: tag, value: tag }));
+    $addTagDropdown.dropdown('setup menu', { values: values });
+    resetDropdown();
+
+    // Add Enter key handler for the search input
+    $addTagDropdown.find('input.search').off('keydown.addtag').on('keydown.addtag', function(e) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            $modal.find('.ok.button').click();
+        }
+    });
+
+    // Show the modal
+    $modal
+        .modal({
+            onApprove: function() {
+                const dropdownValue = $addTagDropdown.dropdown('get value');
+                const searchValue = $addTagDropdown.find('input.search').val();
+                const tag = (dropdownValue || searchValue || '').trim();
+                if (!tag) return false; // prevent close if empty
+
+                // Prevent modal from closing - we'll close it manually after async operation
+                addTag(locusId, tag).then(function() {
+                    refreshRowAnnotations(locusId);
+                    refreshDetailPanel(locusId);
+                    populateTagDropdown();
+                    // Update cached tags list if new tag
+                    if (!allTags.includes(tag)) {
+                        window._allTagsList = [...allTags, tag].sort();
+                    }
+                    resetDropdown();
+                    $modal.modal('hide');
+                }).catch(function(e) {
+                    alert('Failed to add tag: ' + e.message);
+                });
+                return false; // prevent auto-close, we close manually on success
+            },
+            onHidden: function() {
+                resetDropdown();
+                // Hide existing tags section when modal closes
+                $('#existing-tags-section').hide();
+            }
+        })
+        .modal('show');
+});
+
+// Helper function to fetch tags for a locus
+async function fetchLocusTags(locusId) {
+    try {
+        const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}`);
+        if (!response.ok) return [];
+        const data = await response.json();
+        return data.tags || [];
+    } catch (e) {
+        return [];
+    }
+}
+
+// Helper function to render existing tags in the modal
+function renderExistingTagsInModal(tags, locusId) {
+    const $section = $('#existing-tags-section');
+    const $container = $('#existing-tags-container');
+
+    if (tags.length === 0) {
+        $section.hide();
+        return;
+    }
+
+    const html = tags.map(tag =>
+        `<span class="modal-tag-badge">
+            ${escapeHtml(tag)}
+            <span class="delete-modal-tag" data-locus-id="${escapeHtml(locusId)}" data-tag="${escapeHtml(tag)}">&times;</span>
+        </span>`
+    ).join('');
+
+    $container.html(html);
+    $section.show();
+}
+
+// Delete handler for modal tags
+$(document).on('click', '.delete-modal-tag', async function() {
+    const locusId = $(this).data('locus-id');
+    const tag = $(this).data('tag');
+
+    try {
+        await removeTag(locusId, tag);
+
+        // Remove badge from modal immediately
+        $(this).parent('.modal-tag-badge').remove();
+
+        // Hide section if no tags left
+        if ($('#existing-tags-container .modal-tag-badge').length === 0) {
+            $('#existing-tags-section').hide();
+        }
+
+        // Update row badges immediately
+        refreshRowAnnotations(locusId);
+
+        // Update tag filter dropdown (in case tag is now unused)
+        populateTagDropdown();
+
+    } catch (e) {
+        alert('Failed to remove tag: ' + e.message);
+    }
+});
+
+// Click handler for Known Locus badge popup
+// Lightweight transient toast. Self-contained so it does not depend on the
+// Semantic UI toast module being bundled (it is not on this page).
+function showToast(message, type) {
+    const colors = { error: '#db2828', warning: '#f2c037', success: '#21ba45', info: '#2185d0' };
+    const $toast = $('<div></div>').text(message).css({
+        position: 'fixed', top: '1em', right: '1em', zIndex: 9999,
+        background: colors[type] || colors.info, color: '#fff',
+        padding: '0.8em 1.2em', borderRadius: '4px',
+        boxShadow: '0 2px 8px rgba(0,0,0,0.2)', fontSize: '0.95em',
+    });
+    $('body').append($toast);
+    setTimeout(() => $toast.fadeOut(300, () => $toast.remove()), 3000);
+}
+
+$(document).on('click', '.badge-known-locus', async function(e) {
+    e.stopPropagation();
+    const locusId = $(this).data('locus-id');
+
+    try {
+        const response = await fetch(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${currentState.source}`);
+        if (!response.ok) throw new Error('Failed to fetch locus details');
+        const data = await response.json();
+        const knownDisease = data.annotations?.known_disease_locus;
+
+        if (!knownDisease) {
+            showToast('No disease info available', 'warning');
+            return;
+        }
+
+        // Build popup content
+        let html = `<div class="header">Known Disease Locus</div>
+            <div class="content">
+                <p><b>Locus ID:</b> ${escapeHtml(knownDisease.locus_id || '')}</p>
+                ${knownDisease.source ? `<p><b>Source:</b> ${escapeHtml(knownDisease.source)}</p>` : ''}
+                <table class="ui compact table">
+                    <thead><tr><th>Disease</th><th>Inheritance</th><th>Pathogenic ≥</th></tr></thead>
+                    <tbody>
+                        ${(knownDisease.diseases || []).map(d => `
+                            <tr>
+                                <td>${escapeHtml(d.name || 'Unknown')}</td>
+                                <td>${escapeHtml(d.inheritance || '-')}</td>
+                                <td>${d.pathogenic_min != null ? d.pathogenic_min : '-'}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+            <div class="actions"><div class="ui ok button">Close</div></div>`;
+
+        // Show modal
+        let $modal = $('#disease-info-modal');
+        if (!$modal.length) {
+            $modal = $('<div id="disease-info-modal" class="ui small modal"></div>');
+            $('body').append($modal);
+        }
+        $modal.html(html).modal('show');
+    } catch (error) {
+        console.error('Error fetching disease info:', error);
+        showToast('Failed to load disease info', 'error');
+    }
+});
+</script>
+</body>
+</html>

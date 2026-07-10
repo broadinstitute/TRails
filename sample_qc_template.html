@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html>
+{% include "header_template.html" %}
+
+<style>
+/* === Sample QC Page Styles === */
+.qc-section {
+    margin-bottom: 50px;
+}
+.qc-section-title {
+    font-size: 1.2em;
+    font-weight: 600;
+    color: #333;
+    margin-bottom: 15px;
+    margin-top: 20px;
+}
+.qc-charts-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 15px;
+    justify-content: flex-start;
+}
+.qc-chart-container {
+    flex: 1 1 180px;
+    min-width: 160px;
+    max-width: 220px;
+    position: relative;
+}
+.qc-chart-canvas-wrapper {
+    height: 250px;
+    position: relative;
+}
+.qc-chart-canvas-wrapper canvas {
+    width: 100% !important;
+    height: 100% !important;
+}
+.qc-bin-label {
+    text-align: center;
+    font-weight: 600;
+    color: #555;
+    margin-bottom: 5px;
+    font-size: 0.95em;
+}
+#qc-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 60px;
+    color: #888;
+    font-size: 1.1em;
+}
+#qc-loading .ui.loader {
+    margin-right: 15px;
+}
+#qc-error {
+    display: none;
+    color: #c62828;
+    padding: 20px;
+    text-align: center;
+}
+.qc-top-table {
+    margin-top: 10px;
+    font-size: 0.75em;
+    width: 100%;
+    border-collapse: collapse;
+}
+.qc-top-table th {
+    background: #f5f5f5;
+    padding: 3px 5px;
+    text-align: left;
+    font-weight: 600;
+    border-bottom: 1px solid #ddd;
+}
+.qc-top-table td {
+    padding: 2px 5px;
+    border-bottom: 1px solid #eee;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 120px;
+}
+.qc-top-table tr:hover {
+    background: #f9f9f9;
+}
+.qc-table-title {
+    font-size: 0.8em;
+    color: #666;
+    margin-top: 8px;
+    margin-bottom: 4px;
+    font-weight: 500;
+}
+</style>
+
+<div class="ui grid">
+    <div class="ui row">
+        <div class="one wide column"></div>
+        <div class="fourteen wide column">
+
+            <h2 style="margin-top: 20px; margin-bottom: 10px; color: #333;">Sample QC: Outlier Counts</h2>
+            <p style="color: #666; margin-bottom: 20px;">
+                Distribution of loci where each sample is an outlier, grouped by motif size.
+                Each dot represents one sample; the y-value is the count of loci where that sample is the largest outlier (rank 1) or in the top 10 outliers.
+                Each bin has its own y-axis scale.
+            </p>
+
+            {% if db_labels|length > 1 %}
+            <!-- Database source selector (only shown when more than one source is loaded) -->
+            <div style="margin-bottom: 18px;">
+                <label for="qc-source-select" style="font-weight: 600; color: #555; margin-right: 8px;">Database source:</label>
+                <select id="qc-source-select">
+                    {% for label in db_labels %}
+                    <option value="{{ label }}"{% if label == default_source %} selected{% endif %}>{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            {% endif %}
+
+            <!-- Loading indicator -->
+            <div id="qc-loading">
+                <div class="ui small active inline loader"></div>
+                <span>Loading sample QC data...</span>
+            </div>
+
+            <!-- Error message -->
+            <div id="qc-error"></div>
+
+            <!-- Section 1: Rank 1 -->
+            <div id="section-rank1" class="qc-section" style="display: none;">
+                <div class="qc-section-title">Loci where sample is largest outlier (by motif size)</div>
+                <div class="qc-charts-row" id="rank1-charts-row">
+                    <!-- Charts will be inserted here -->
+                </div>
+            </div>
+
+            <!-- Section 2: Top 10 -->
+            <div id="section-top10" class="qc-section" style="display: none;">
+                <div class="qc-section-title">Loci where sample is in top 10 outliers (by motif size)</div>
+                <div class="qc-charts-row" id="top10-charts-row">
+                    <!-- Charts will be inserted here -->
+                </div>
+            </div>
+
+        </div>
+        <div class="one wide column"></div>
+    </div>
+
+</div><!-- close .ui.grid -->
+
+{% include "qc_shared_js.html" %}
+
+<script>
+// =========================================================================
+// Sample QC Page - Separate plots per motif bin
+// =========================================================================
+
+const QC_API_BASE = window.location.origin + '/api/v1';
+const DEFAULT_SOURCE = {{ default_source | tojson }};
+
+// Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
+const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
+// Per-source 99th-percentile outlier warnings; renderMendelianWarning() is passed the
+// currently-selected source so it only shows outlier warnings for the source being viewed.
+const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
+
+
+// Category order for bins
+const MOTIF_BINS = ['1bp', '2bp', '3-6bp', '7-24bp', '25+bp'];
+
+
+// Create a single bin chart (box plot with scatter overlay)
+function createSingleBinChart(canvasId, binData, binLabel) {
+    const ctx = document.getElementById(canvasId).getContext('2d');
+
+    // Extract counts for this bin
+    const values = binData.map(d => d.count);
+    const stats = computeBoxStats(values);
+
+    // Create scatter points with jitter around x=0
+    const scatterPoints = binData.map(item => ({
+        x: (Math.random() - 0.5) * 0.6,  // jitter between -0.3 and 0.3
+        y: item.count,
+        sample_id: item.sample_id
+    }));
+
+    const chart = new Chart(ctx, {
+        type: 'scatter',
+        data: {
+            datasets: [{
+                label: 'Samples',
+                data: scatterPoints,
+                backgroundColor: 'rgba(33, 133, 208, 0.5)',
+                borderColor: 'rgba(33, 133, 208, 0.8)',
+                pointRadius: 3,
+                pointHoverRadius: 5
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: {
+                    type: 'linear',
+                    min: -0.8,
+                    max: 0.8,
+                    display: false,  // Hide x-axis since it's just jitter
+                    grid: { display: false }
+                },
+                y: {
+                    title: {
+                        display: true,
+                        text: 'Loci count',
+                        font: { size: 11 }
+                    },
+                    beginAtZero: true,
+                    ticks: {
+                        font: { size: 10 },
+                        maxTicksLimit: 6
+                    }
+                }
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            const point = context.raw;
+                            return [
+                                'Sample: ' + (point.sample_id || ''),
+                                'Loci count: ' + point.y
+                            ];
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Store box stats for the custom plugin
+    chart.config._boxStats = stats;
+
+    // Compute and store percentiles for the custom plugin
+    const sortedValues = values.slice().sort((a, b) => a - b);
+    chart.config._percentiles = {
+        p95: computePercentile(sortedValues, 95),
+        p99: computePercentile(sortedValues, 99)
+    };
+
+    return chart;
+}
+
+// Charts created per section, kept so they can be destroyed before re-rendering. Chart.js
+// holds a strong reference to every chart in its registry until destroy() is called, so
+// without this the prior charts leak on every DB-source switch.
+const sectionCharts = {};
+
+// Create all charts for a section (rank1 or top10)
+function createChartsForSection(containerId, data) {
+    const container = document.getElementById(containerId);
+    // Destroy the previous render's charts before detaching their canvases (see sectionCharts).
+    (sectionCharts[containerId] || []).forEach(c => c.destroy());
+    sectionCharts[containerId] = [];
+    container.innerHTML = '';  // Clear any existing content
+
+    // Group data by bin
+    const binData = {};
+    MOTIF_BINS.forEach(bin => { binData[bin] = []; });
+    data.forEach(item => {
+        if (binData[item.bin] !== undefined) {
+            binData[item.bin].push({ sample_id: item.sample_id, count: item.count });
+        }
+    });
+
+    // Create a chart for each bin
+    MOTIF_BINS.forEach((bin, idx) => {
+        const chartWrapper = document.createElement('div');
+        chartWrapper.className = 'qc-chart-container';
+
+        const label = document.createElement('div');
+        label.className = 'qc-bin-label';
+        label.textContent = bin;
+
+        // Canvas wrapper for fixed height
+        const canvasWrapper = document.createElement('div');
+        canvasWrapper.className = 'qc-chart-canvas-wrapper';
+
+        const canvas = document.createElement('canvas');
+        const canvasId = `${containerId}-chart-${idx}`;
+        canvas.id = canvasId;
+
+        canvasWrapper.appendChild(canvas);
+        chartWrapper.appendChild(label);
+        chartWrapper.appendChild(canvasWrapper);
+
+        // Create top 20 table
+        const currentBinData = binData[bin];
+        const top20 = currentBinData
+            .slice()
+            .sort((a, b) => b.count - a.count)
+            .slice(0, 20);
+
+        if (top20.length > 0) {
+            const tableTitle = document.createElement('div');
+            tableTitle.className = 'qc-table-title';
+            tableTitle.textContent = 'Top 20 samples';
+
+            const table = document.createElement('table');
+            table.className = 'qc-top-table';
+
+            const thead = document.createElement('thead');
+            thead.innerHTML = '<tr><th>Sample ID</th><th>Count</th></tr>';
+            table.appendChild(thead);
+
+            const tbody = document.createElement('tbody');
+            top20.forEach(item => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td title="${escapeHtml(item.sample_id)}">${renderMendelianWarning(item.sample_id, (document.getElementById('qc-source-select')?.value || DEFAULT_SOURCE))}${escapeHtml(item.sample_id)}</td><td>${item.count}</td>`;
+                tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+
+            chartWrapper.appendChild(tableTitle);
+            chartWrapper.appendChild(table);
+        }
+
+        container.appendChild(chartWrapper);
+
+        // Create the chart after adding to DOM, tracking it for destruction on re-render
+        const chart = createSingleBinChart(canvasId, binData[bin], bin);
+        if (chart) sectionCharts[containerId].push(chart);
+    });
+}
+
+// Monotonic request id so a slower earlier fetch can't overwrite the charts after the user
+// has already switched to a different source (the change handler fires a fresh load each time).
+let qcRequestSeq = 0;
+
+// Fetch data and render charts
+async function loadSampleQCData() {
+    const requestId = ++qcRequestSeq;
+    try {
+        const sourceSelect = document.getElementById('qc-source-select');
+        const source = sourceSelect ? sourceSelect.value : DEFAULT_SOURCE;
+        const response = await fetch(`${QC_API_BASE}/sample_qc_data?source=${encodeURIComponent(source)}`);
+        if (requestId !== qcRequestSeq) return;  // superseded by a newer source selection
+        if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.detail || `HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        if (requestId !== qcRequestSeq) return;  // superseded while parsing the response
+
+        // Hide loading, show sections
+        document.getElementById('qc-loading').style.display = 'none';
+        document.getElementById('section-rank1').style.display = 'block';
+        document.getElementById('section-top10').style.display = 'block';
+
+        // Create charts
+        createChartsForSection('rank1-charts-row', data.rank1 || []);
+        createChartsForSection('top10-charts-row', data.top10 || []);
+
+    } catch (err) {
+        if (requestId !== qcRequestSeq) return;  // stale failure - don't clobber the current source's UI
+        console.error('Sample QC load error:', err);
+        document.getElementById('qc-loading').style.display = 'none';
+        document.getElementById('qc-error').style.display = 'block';
+        document.getElementById('qc-error').textContent = 'Failed to load sample QC data: ' + err.message;
+    }
+}
+
+
+// Initialize on page load
+document.addEventListener('DOMContentLoaded', function() {
+    const sourceSelect = document.getElementById('qc-source-select');
+    if (sourceSelect) {
+        sourceSelect.addEventListener('change', function() {
+            // Reset to the loading state and reload charts for the newly selected source
+            document.getElementById('qc-error').style.display = 'none';
+            document.getElementById('section-rank1').style.display = 'none';
+            document.getElementById('section-top10').style.display = 'none';
+            document.getElementById('qc-loading').style.display = 'block';
+            loadSampleQCData();
+        });
+    }
+    loadSampleQCData();
+});
+</script>
+
+</body>
+</html>

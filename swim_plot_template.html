@@ -1,0 +1,1315 @@
+<!DOCTYPE html>
+<html>
+{% include "header_template.html" %}
+
+<style>
+/* === Swim Plot Controls === */
+#swim-control-panel {
+    background: #f9fafb;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 20px;
+    margin: 20px 0;
+}
+#swim-control-panel .field { margin-bottom: 12px; }
+#swim-control-panel label { font-weight: 700; font-size: 0.93em; }
+
+/* === Chart Container === */
+#swim-chart-container {
+    width: 100%;
+    height: 800px;
+    position: relative;
+    margin-bottom: 30px;
+}
+#swim-chart-container canvas {
+    width: 100% !important;
+    height: 100% !important;
+}
+
+/* === Detail Modal === */
+#dot-detail-modal .detail-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.93em;
+}
+#dot-detail-modal .detail-table td {
+    padding: 4px 10px;
+    vertical-align: top;
+    border-bottom: 1px solid #f0f0f0;
+}
+#dot-detail-modal .detail-table td:first-child {
+    font-weight: 600;
+    color: #555;
+    white-space: nowrap;
+    width: 180px;
+}
+#dot-detail-modal .detail-section-header {
+    font-weight: 700;
+    font-size: 1em;
+    color: #333;
+    padding: 10px 0 4px 0;
+    border-bottom: 2px solid #ddd;
+    margin-top: 10px;
+}
+</style>
+
+<div class="ui grid">
+    <div class="ui row">
+        <div class="one wide column"></div>
+        <div class="fourteen wide column">
+
+            <!-- Control Panel -->
+            <div id="swim-control-panel">
+                <div class="ui form">
+
+                    <!-- Two-column grid (radios left, checkboxes right) -->
+                    <div class="ui stackable grid" style="margin: 0;">
+                    <!-- Left column: radio button groups -->
+                    <div class="six wide column">
+
+                    <!-- Outlier Type + Source -->
+                    <div class="field">
+                        <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+                            <label style="margin: 0;">Outlier Type:</label>
+                            <div class="ui radio checkbox">
+                                <input type="radio" name="swim_outlier_type" value="all" checked>
+                                <label>Long Allele</label>
+                            </div>
+                            <div class="ui radio checkbox">
+                                <input type="radio" name="swim_outlier_type" value="short">
+                                <label>Biallelic</label>
+                            </div>
+                            <div class="ui radio checkbox">
+                                <input type="radio" name="swim_outlier_type" value="hemi">
+                                <label>Hemizygous</label>
+                            </div>
+
+                            {% if db_labels | length > 1 %}
+                            <span style="margin-left: 10px; border-left: 1px solid #ccc; padding-left: 15px;">
+                                <label style="margin-right: 10px;">Source</label>
+                                {% for label in db_labels %}
+                                <div class="ui radio checkbox" style="margin-right: 10px;">
+                                    <input type="radio" name="swim_source" value="{{ label }}" {{ 'checked' if loop.first else '' }}>
+                                    <label>{{ label }}</label>
+                                </div>
+                                {% endfor %}
+                            </span>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    <!-- Require Allele Size Affected > Unaffected (per-sample) -->
+                    <div class="field">
+                        <div class="ui checkbox">
+                            <input type="checkbox" id="swim_require_affected_above_unaffected">
+                            <label>Require Allele Size Affected > Unaffected (per-sample)</label>
+                        </div>
+                    </div>
+
+                    <!-- Require Affected Allele > Population Alleles -->
+                    <div class="field">
+                        <label style="display: inline;">Require Affected Allele &gt; Population Allele</label><span style="display:inline-block; margin-bottom:10px; margin-left: 4px; font-weight: normal;">( <label style="font-weight: normal; cursor: pointer;"><input type="radio" name="swim_population_metric" value="99th" checked style="vertical-align: middle;"> 99th % </label> <label style="font-weight: normal; cursor: pointer; margin-left: 5px;"><input type="radio" name="swim_population_metric" value="max" style="vertical-align: middle;"> max</label> <i class="question circle outline icon help-popup" style="color: #999; cursor: pointer;" data-variation="wide" data-position="top center" data-html="<b>99th %:</b> require the affected allele to exceed each population dataset's 99th-percentile allele size at a given locus. <br /><br /><b>max:</b> require it to exceed each dataset's largest observed allele at a given locus. This is a more stringent filter, but also more susceptible to noise if the max allele in one of the population datasets was overestimated."></i>)</span>
+                        <div class="radio-group">
+                            <div class="ui radio checkbox">
+                                <input type="radio" name="swim_require_above_population" value="" checked>
+                                <label>No</label>
+                            </div>
+                            <div class="ui radio checkbox">
+                                <input type="radio" name="swim_require_above_population" value="long-read">
+                                <label>Long-read (HPRC256, AoU1027, AoU2High, AoU2Mid)</label>
+                            </div>
+                            <div class="ui radio checkbox">
+                                <input type="radio" name="swim_require_above_population" value="short-read">
+                                <label>Short-read (TenK10K)</label>
+                            </div>
+                        </div>
+                        <div class="ui checkbox" style="margin-top: 0.5em; margin-left: 1em;">
+                            <input type="checkbox" id="swim_include_loci_without_population_data">
+                            <label>Also show loci without population data</label>
+                        </div>
+                    </div>
+
+                    </div>
+                    <!-- Right column: checkboxes -->
+                    <div class="ten wide column">
+
+                    <!-- Boolean flags -->
+                    <div class="field">
+                        <div class="checkbox-group">
+                            <div class="ui checkbox">
+                                <input type="checkbox" id="swim_apply_pathogenic_threshold">
+                                <label>Apply pathogenic thresholds</label>
+                            </div>
+                            <div class="ui checkbox">
+                                <input type="checkbox" id="swim_known_loci_only">
+                                <label>Known disease loci only</label>
+                            </div>
+                            <div class="ui checkbox">
+                                <input type="checkbox" id="swim_known_motifs_only">
+                                <label>Known disease motifs only</label>
+                            </div>
+                            <div class="ui checkbox">
+                                <input type="checkbox" id="swim_mendelian_only">
+                                <label>Mendelian disease genes only</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Include Gene Regions -->
+                    <div class="field">
+                        <label>Include Gene Regions</label>
+                        <div class="checkbox-group">
+                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_cds"><label>CDS</label></div>
+                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_promoter"><label>Promoter</label></div>
+                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_utr"><label>UTR</label></div>
+                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_intron"><label>Intron</label></div>
+                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_exon"><label>Exon</label></div>
+                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_intergenic"><label>Intergenic</label></div>
+                        </div>
+                    </div>
+
+                    <!-- Exclude Gene Regions -->
+                    <div class="field">
+                        <label>Exclude Gene Regions</label>
+                        <div class="checkbox-group">
+                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_cds"><label>CDS</label></div>
+                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_promoter"><label>Promoter</label></div>
+                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_utr"><label>UTR</label></div>
+                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_intron"><label>Intron</label></div>
+                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_exon"><label>Exon</label></div>
+                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_intergenic"><label>Intergenic</label></div>
+                        </div>
+                    </div>
+
+                    <!-- Sigma Percentile and Tag Filters -->
+                    <div style="display: flex; align-items: flex-end; gap: 2em; margin-top: 8px;">
+                        <div class="field">
+                            <label>σ Percentile ≥</label>
+                            <input type="text" name="swim_min_sigma_percentile"
+                                   placeholder="e.g., 0.95"
+                                   style="width: 100px;"
+                                   title="Filter for loci where HPRC or AoU stdev is in the top X%. Enter 0.95 for top 5%.">
+                        </div>
+                        <div class="field">
+                            <label>Tag</label>
+                            <div id="swim-tag-filter" class="ui clearable search selection dropdown" style="max-width: 250px;">
+                                <input type="hidden" name="swim_tag">
+                                <i class="dropdown icon"></i>
+                                <div class="default text">All (no tag filter)</div>
+                                <div class="menu"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    </div>
+                    </div>
+
+                    <!-- Row 3: Four-column grid (text/number inputs) -->
+                    <div class="ui stackable four column grid" style="margin: 0;">
+                    <div class="column">
+                        <div class="field">
+                            <label>Motif Size (bp)</label>
+                            <input type="text" name="swim_motif_size" placeholder="e.g., 3, 5-10, 15-" style="width: 160px;" title="Examples: 3 (exact), 3-6 (range), 5- (5 and above), -10 (up to 10). Comma-separate for OR.">
+                        </div>
+                        <div class="field">
+                            <label>Motif(s)</label>
+                            <input type="text" name="swim_motif" placeholder="e.g., CCG, CAG">
+                        </div>
+                        <div class="field">
+                            <label>Locus Id(s)</label>
+                            <input type="text" name="swim_locus_id" placeholder="e.g., 2-89831737-89831752-CCATT">
+                        </div>
+                    </div>
+                    <div class="column">
+                        <div class="field">
+                            <label>Gene Symbol(s)</label>
+                            <input type="text" name="swim_gene_symbol" placeholder="e.g., FMR1, HTT">
+                        </div>
+                        <div class="field">
+                            <label>Gene ID</label>
+                            <input type="text" name="swim_gene_id" placeholder="e.g., ENSG00000102081">
+                        </div>
+                        <div class="field">
+                            <label>Min pLI</label>
+                            <input type="text" name="swim_min_pli" placeholder="e.g., 0.9">
+                        </div>
+                    </div>
+                    <div class="column">
+                        <div class="field">
+                            <label>Phenotype Keyword(s)</label>
+                            <input type="text" name="swim_phenotype_keyword" placeholder="e.g., ataxia, seizure">
+                        </div>
+                        <div class="field">
+                            <label>Sample Id(s)</label>
+                            <div id="swim-sample-id-filter" class="ui fluid multiple search selection dropdown">
+                                <input type="hidden" name="swim_sample_id_keyword">
+                                <i class="dropdown icon"></i>
+                                <div class="default text">Search sample IDs...</div>
+                                <div class="menu"></div>
+                            </div>
+                        </div>
+                        <div class="field">
+                            <label>Sample Id Keyword(s)</label>
+                            <input type="text" name="swim_sample_id_like" placeholder="e.g., BCM, UDN">
+                        </div>
+                    </div>
+                    <div class="column">
+                        <div class="field">
+                            <label>Min Expansion (above ref, in repeat units)</label>
+                            <input type="text" name="swim_min_expansion" placeholder="e.g., 5">
+                        </div>
+                    </div>
+                    </div>
+
+                    <!-- Load Data button -->
+                    <button id="swim-load-btn" class="ui primary button" type="button" style="margin-top: 10px;">
+                        <i class="chart bar icon"></i> Load Data
+                    </button>
+                    <span id="swim-loading" style="display: none;">
+                        <div class="ui small active inline loader"></div>
+                        <span style="color: #888; margin-left: 8px;">Loading...</span>
+                    </span>
+                </div>
+            </div>
+
+            <!-- Legend -->
+            <div id="swim-legend" style="display: none; margin-bottom: 10px; font-size: 0.9em; color: #555;">
+                <span id="swim-legend-swatch-affected" style="display: inline-block; width: 14px; height: 14px; border-radius: 50%; vertical-align: middle; margin-right: 4px;"></span> Affected
+                <span id="swim-legend-swatch-unaffected" style="margin-left: 16px; display: inline-block; width: 14px; height: 14px; border-radius: 50%; vertical-align: middle; margin-right: 4px;"></span> Unaffected
+                <span id="swim-legend-swatch-unknown" style="margin-left: 16px; display: inline-block; width: 14px; height: 14px; border-radius: 50%; vertical-align: middle; margin-right: 4px;"></span> Unknown
+                <span style="margin-left: 20px; border-left: 1px solid #ccc; padding-left: 12px;">Shapes:</span>
+                <span style="margin-left: 8px;">&#9733;</span> True/Candidate
+                <span style="margin-left: 12px;">&#9632;</span> Intergenic
+                <span style="margin-left: 12px;">&#9679;</span> Other
+                <span id="swim-legend-counts" style="margin-left: 20px; color: #888;"></span>
+            </div>
+
+            <!-- X-Axis toggle (shown after data loads) -->
+            <div id="swim-xaxis-toggle" style="display: none; text-align: right; margin-bottom: 6px; font-size: 0.9em;">
+                <label style="font-weight: 700; margin-right: 10px;">X-Axis:</label>
+                <div class="ui radio checkbox" style="margin-right: 10px;">
+                    <input type="radio" name="swim_xaxis_mode" value="absolute" checked>
+                    <label># of Repeats</label>
+                </div>
+                <div class="ui radio checkbox" style="margin-right: 10px;">
+                    <input type="radio" name="swim_xaxis_mode" value="bp">
+                    <label>Size in bp</label>
+                </div>
+                <div class="ui radio checkbox">
+                    <input type="radio" name="swim_xaxis_mode" value="percent">
+                    <label>% of Max</label>
+                </div>
+            </div>
+
+            <!-- Chart Container -->
+            <div id="swim-chart-container">
+                <canvas id="swim-chart-canvas"></canvas>
+            </div>
+
+        </div>
+        <div class="one wide column"></div>
+    </div>
+
+<!-- Detail Modal -->
+<div class="ui modal" id="dot-detail-modal">
+    <i class="close icon"></i>
+    <div class="header" id="dot-detail-header"></div>
+    <div class="scrolling content" id="dot-detail-content"></div>
+    <div class="actions">
+        <button class="ui basic button swim-edit-note-btn" style="float: left;"><i class="edit icon"></i>Edit Note</button>
+        <button class="ui basic button swim-add-tag-btn" style="float: left; margin-left: 6px;"><i class="tag icon"></i>Add Tag</button>
+        <div class="ui cancel button">Close</div>
+    </div>
+</div>
+
+</div><!-- close .ui.grid -->
+
+<!-- Shared helpers (escapeHtml, renderMendelianWarning, box-plot stats, and the persistent
+     Mendelian-warning popup handler) — included so this page can't drift from the QC pages. -->
+{% include "qc_shared_js.html" %}
+
+<script>
+// =========================================================================
+// Swim Plot Page
+// =========================================================================
+
+const SWIM_API_BASE = window.location.origin + '/api/v1';
+const SWIM_DEFAULT_SOURCE = {{ default_source | tojson }};
+
+// Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
+const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
+// Per-source 99th-percentile outlier warnings (keyed by source, then sample_id).
+const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
+
+// Chart instance and raw data storage
+let swimChart = null;
+let swimRawData = [];
+let swimLoadedParams = null;  // params (incl. source / outlier_type) the rendered chart was loaded with
+let swimLoadSeq = 0;  // monotonic load id; a stale response must not overwrite a newer one
+
+// Category helpers
+function categoryToY(cat) {
+    if (cat === '25+bp') return 25;
+    return parseInt(cat, 10);
+}
+
+function yToLabel(y) {
+    if (y === 25) return '25+bp';
+    return y + 'bp';
+}
+
+// Get current control values
+function getSwimParams() {
+    const outlierType = $('input[name="swim_outlier_type"]:checked').val() || 'all';
+    const source = $('input[name="swim_source"]:checked').val() || SWIM_DEFAULT_SOURCE;
+    const params = { outlier_type: outlierType, source: source };
+
+    // Boolean checkboxes
+    if ($('#swim_require_affected_above_unaffected').is(':checked')) params.require_affected_above_unaffected = '1';
+    if ($('#swim_apply_pathogenic_threshold').is(':checked')) params.apply_pathogenic_threshold = '1';
+    if ($('#swim_known_loci_only').is(':checked')) params.known_loci_only = '1';
+    if ($('#swim_known_motifs_only').is(':checked')) params.known_motifs_only = '1';
+    if ($('#swim_mendelian_only').is(':checked')) params.mendelian_only = '1';
+
+    // Require above population
+    const rap = $('input[name="swim_require_above_population"]:checked').val();
+    if (rap) {
+        params.require_above_population = rap;
+        // Only send when 'max' is chosen; '99th' is the server default.
+        if ($('input[name="swim_population_metric"]:checked').val() === 'max') params.population_metric = 'max';
+    }
+    if ($('#swim_include_loci_without_population_data').is(':checked')) params.include_loci_without_population_data = '1';
+
+    // Gene regions (include)
+    const regions = [];
+    ['cds','promoter','utr','intron','exon','intergenic'].forEach(r => {
+        if ($(`input[name="swim_gene_region_${r}"]`).parent().checkbox('is checked')) regions.push(r);
+    });
+    if (regions.length) params.gene_regions = regions.join(',');
+
+    // Gene regions (exclude)
+    const exRegions = [];
+    ['cds','promoter','utr','intron','exon','intergenic'].forEach(r => {
+        if ($(`input[name="swim_exclude_gene_region_${r}"]`).parent().checkbox('is checked')) exRegions.push(r);
+    });
+    if (exRegions.length) params.exclude_gene_regions = exRegions.join(',');
+
+    // Text/number inputs (only include if non-empty)
+    const textFields = [
+        'motif_size', 'motif', 'locus_id',
+        'gene_symbol', 'gene_id', 'min_pli', 'phenotype_keyword',
+        'min_expansion', 'sample_id_like', 'min_sigma_percentile'
+    ];
+    textFields.forEach(field => {
+        const val = $(`[name="swim_${field}"]`).val();
+        if (val && val.trim()) params[field] = val.trim();
+    });
+
+    // Sample ID dropdown
+    const selectedIds = $('#swim-sample-id-filter').dropdown('get value');
+    const idStr = Array.isArray(selectedIds) ? selectedIds.join(',') : (selectedIds || '');
+    if (idStr) params.sample_id_keyword = idStr;
+
+    // Tag dropdown
+    const tagVal = $('#swim-tag-filter').dropdown('get value');
+    if (tagVal) params.tag = tagVal;
+
+    return params;
+}
+
+// Fetch data and render chart
+async function loadSwimPlot() {
+    const requestId = ++swimLoadSeq;
+    const params = getSwimParams();
+    const qs = new URLSearchParams(params).toString();
+    const url = `${SWIM_API_BASE}/swim_plot_data?${qs}`;
+
+    $('#swim-loading').show();
+    $('#swim-load-btn').addClass('disabled');
+
+    try {
+        const response = await fetch(url);
+        if (requestId !== swimLoadSeq) return;  // superseded by a newer load
+        if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.detail || `HTTP ${response.status}`);
+        }
+        const result = await response.json();
+        if (requestId !== swimLoadSeq) return;  // superseded while parsing the response
+        swimRawData = result.data || [];
+        swimLoadedParams = params;  // remember the source/outlier_type this chart was loaded with (used by showDotDetail)
+        renderSwimChart(swimRawData);
+    } catch (err) {
+        if (requestId !== swimLoadSeq) return;  // stale failure - don't clear the newer load's chart
+        console.error('Swim plot load error:', err);
+        // Clear the stale chart so the previous result set isn't shown under the new (failed) filters.
+        swimRawData = [];
+        swimLoadedParams = null;
+        if (swimChart) { swimChart.destroy(); swimChart = null; }
+        $('#swim-legend').hide();
+        alert('Failed to load swim plot data: ' + err.message);
+    } finally {
+        if (requestId === swimLoadSeq) {
+            $('#swim-loading').hide();
+            $('#swim-load-btn').removeClass('disabled');
+        }
+    }
+}
+
+// Color mapping for affected status
+const STATUS_COLORS = {
+    'Affected':   { bg: 'rgba(30, 100, 220, 0.85)',  border: 'rgba(20, 80, 190, 1)' },
+    'Unaffected': { bg: 'rgba(40, 160, 50, 0.85)',    border: 'rgba(30, 130, 40, 1)' },
+    'Unknown':    { bg: 'rgba(140, 140, 140, 0.7)',    border: 'rgba(110, 110, 110, 0.9)' },
+};
+
+function statusColor(status) {
+    if (status === 'Affected') return STATUS_COLORS['Affected'];
+    if (status === 'Unaffected') return STATUS_COLORS['Unaffected'];
+    return STATUS_COLORS['Unknown'];
+}
+
+// Render the scatter chart
+function renderSwimChart(data) {
+    // Destroy existing chart
+    if (swimChart) {
+        swimChart.destroy();
+        swimChart = null;
+    }
+
+    const xAxisMode = $('input[name="swim_xaxis_mode"]:checked').val() || 'absolute';
+
+    // Read motif size filter for dynamic y-axis range
+    // Parse the new motif_size format to extract min/max for y-axis display.
+    // Use the motif_size that produced the loaded data (swimLoadedParams), NOT
+    // the live input, so re-renders (e.g. x-axis toggle) don't apply a filter
+    // the user typed but hasn't loaded yet.
+    const motifSizeInput = (swimLoadedParams && swimLoadedParams.motif_size) || '';
+    let yMin = 1, yMax = 25;
+    if (motifSizeInput.trim()) {
+        const parts = motifSizeInput.split(',').map(s => s.trim()).filter(Boolean);
+        let parsedMin = Infinity, parsedMax = -Infinity;
+        parts.forEach(part => {
+            if (part.includes('-')) {
+                const [a, b] = part.split('-');
+                if (a && b) { // range like "3-6"
+                    const valA = parseInt(a, 10);
+                    const valB = parseInt(b, 10);
+                    if (!isNaN(valA)) parsedMin = Math.min(parsedMin, valA);
+                    if (!isNaN(valB)) parsedMax = Math.max(parsedMax, valB);
+                } else if (a && !b) { // open-ended like "5-"
+                    const valA = parseInt(a, 10);
+                    if (!isNaN(valA)) parsedMin = Math.min(parsedMin, valA);
+                    parsedMax = 25;
+                } else if (!a && b) { // open-ended like "-10"
+                    parsedMin = 1;
+                    const valB = parseInt(b, 10);
+                    if (!isNaN(valB)) parsedMax = Math.max(parsedMax, valB);
+                }
+            } else { // exact like "3"
+                const val = parseInt(part, 10);
+                if (!isNaN(val)) {
+                    parsedMin = Math.min(parsedMin, val);
+                    parsedMax = Math.max(parsedMax, val);
+                }
+            }
+        });
+        // Clamp both bounds to [1, 25]: the server buckets all motifs >=25bp into the
+        // single "25+bp" category at y=25, so a lower bound above 25 would otherwise make
+        // yMin > yMax and collapse the axis, hiding the real 25+bp points.
+        if (parsedMin !== Infinity) yMin = Math.max(1, Math.min(parsedMin, 25));
+        if (parsedMax !== -Infinity) yMax = Math.min(parsedMax, 25);
+    }
+
+    const ctx = document.getElementById('swim-chart-canvas').getContext('2d');
+
+    // Compute max allele size per motif category (needed for percent mode)
+    const maxPerCategory = {};
+    data.forEach(item => {
+        const cat = item.motif_category;
+        if (!(cat in maxPerCategory) || item.allele_size > maxPerCategory[cat]) {
+            maxPerCategory[cat] = item.allele_size;
+        }
+    });
+
+    // Build data points with per-point colors based on affected status
+    const points = [];
+    const plottedItems = [];
+    const bgColors = [];
+    const borderColors = [];
+    const pointStyles = [];
+    data.forEach((item, idx) => {
+        let xVal;
+        if (xAxisMode === 'percent') {
+            const maxSize = maxPerCategory[item.motif_category] || 1;
+            const fraction = item.allele_size / maxSize;
+            if (fraction <= 0.5) return;
+            xVal = fraction;
+        } else if (xAxisMode === 'bp') {
+            const motifLen = (item.Motif || '').length || 1;
+            xVal = item.allele_size * motifLen;
+        } else {
+            xVal = item.allele_size;
+        }
+        points.push({
+            x: xVal,
+            y: categoryToY(item.motif_category) + (Math.random() - 0.5) * 0.6,
+            _index: idx
+        });
+        plottedItems.push(item);
+        const colors = statusColor(item.affected_status);
+        bgColors.push(colors.bg);
+        borderColors.push(colors.border);
+        // Determine point style: star for a "true"/"candidate" tag, rect for intergenic, circle otherwise
+        let style = 'circle';
+        const tags = (item.tags || '').toString().toLowerCase();
+        if (tags.includes('true') || tags.includes('candidate')) {
+            style = 'star';
+        } else if (item.gene_region === 'intergenic') {
+            style = 'rect';
+        }
+        pointStyles.push(style);
+    });
+
+    // X-axis config depends on mode
+    let xScaleConfig;
+    if (xAxisMode === 'percent') {
+        xScaleConfig = {
+            type: 'linear',
+            min: 0.475,
+            max: 1.025,
+            title: {
+                display: true,
+                text: 'Fraction of Max Allele Size',
+                font: { size: 14, weight: 'bold' }
+            },
+            afterBuildTicks: function(axis) {
+                axis.ticks = [];
+                for (var v = 5; v <= 10; v++) {
+                    axis.ticks.push({value: v / 10});
+                }
+            },
+            ticks: {
+                font: { size: 12 },
+                callback: function(value) {
+                    return Math.round(value * 100) + '%';
+                }
+            }
+        };
+    } else if (xAxisMode === 'bp') {
+        xScaleConfig = {
+            type: 'linear',
+            title: {
+                display: true,
+                text: 'Allele Size (bp)',
+                font: { size: 14, weight: 'bold' }
+            },
+            ticks: { font: { size: 12 } }
+        };
+    } else {
+        xScaleConfig = {
+            type: 'linear',
+            title: {
+                display: true,
+                text: 'Allele Size (repeat units)',
+                font: { size: 14, weight: 'bold' }
+            },
+            ticks: { font: { size: 12 } }
+        };
+    }
+
+    swimChart = new Chart(ctx, {
+        type: 'scatter',
+        data: {
+            datasets: [{
+                label: 'Outlier Alleles',
+                data: points,
+                backgroundColor: bgColors,
+                borderColor: borderColors,
+                pointStyle: pointStyles,
+                pointRadius: 3.0,
+                pointHoverRadius: 4.5,
+                borderWidth: 0.5
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: xScaleConfig,
+                y: {
+                    type: 'linear',
+                    reverse: true,
+                    min: yMin - 0.5,
+                    max: yMax + 0.5,
+                    title: {
+                        display: true,
+                        text: 'Motif Size',
+                        font: { size: 14, weight: 'bold' }
+                    },
+                    afterBuildTicks: function(axis) {
+                        axis.ticks = [];
+                        for (let i = yMin; i <= yMax; i++) {
+                            axis.ticks.push({ value: i });
+                        }
+                    },
+                    ticks: {
+                        callback: function(value) {
+                            if (value >= yMin && value <= yMax && Number.isInteger(value)) {
+                                return yToLabel(value);
+                            }
+                            return '';
+                        },
+                        font: { size: 11 }
+                    },
+                    grid: {
+                        color: function(context) {
+                            return 'rgba(0, 0, 0, 0.08)';
+                        }
+                    }
+                }
+            },
+            plugins: {
+                legend: {
+                    display: false
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            const idx = context.raw._index;
+                            if (idx == null || !swimRawData[idx]) return '';
+                            const item = swimRawData[idx];
+                            const parts = [
+                                'Locus: ' + (item.LocusId || ''),
+                                'Sample: ' + (item.sample_id || '') + ' (' + (item.affected_status || 'Unknown') + ')',
+                                'Allele: ' + item.allele_size,
+                                'Motif: ' + (item.Motif || ''),
+                                'Region: ' + (item.gene_region || ''),
+                            ];
+                            if (item.GeneTableGeneSymbol) {
+                                parts.push('Gene: ' + item.GeneTableGeneSymbol);
+                            }
+                            return parts;
+                        }
+                    }
+                }
+            },
+            onClick: function(event, elements) {
+                if (elements.length === 0) return;
+                const element = elements[0];
+                const idx = swimChart.data.datasets[element.datasetIndex].data[element.index]._index;
+                if (idx == null || !swimRawData[idx]) return;
+                showDotDetail(swimRawData[idx]);
+            }
+        }
+    });
+
+    // Show x-axis toggle and update legend (count only the dots actually plotted;
+    // percent mode skips alleles <= 50% of their category max)
+    $('#swim-xaxis-toggle').show();
+    updateSwimLegend(plottedItems);
+}
+
+// Update legend with counts
+function updateSwimLegend(data) {
+    let affected = 0, unaffected = 0, unknown = 0;
+    data.forEach(item => {
+        if (item.affected_status === 'Affected') affected++;
+        else if (item.affected_status === 'Unaffected') unaffected++;
+        else unknown++;
+    });
+    const total = data.length;
+    $('#swim-legend-counts').text(
+        total + ' dots: ' + affected + ' affected, ' + unaffected + ' unaffected, ' + unknown + ' unknown'
+    );
+    // Color the legend swatches from STATUS_COLORS so they always match the plotted points.
+    $('#swim-legend-swatch-affected').css('background', STATUS_COLORS['Affected'].bg);
+    $('#swim-legend-swatch-unaffected').css('background', STATUS_COLORS['Unaffected'].bg);
+    $('#swim-legend-swatch-unknown').css('background', STATUS_COLORS['Unknown'].bg);
+    $('#swim-legend').show();
+}
+
+// Show detail modal for a clicked point (fetches full detail from API)
+function showDotDetail(item) {
+    const locusId = escapeHtml(item.LocusId || '');
+    const geneSymbol = escapeHtml(item.GeneTableGeneSymbol || '');
+    const headerText = geneSymbol ? locusId + ' &mdash; ' + geneSymbol : locusId;
+    $('#dot-detail-header').html(headerText);
+    $('#dot-detail-content').html('<div class="ui active centered inline loader" style="margin: 30px auto;"></div>');
+    $('#dot-detail-modal').modal('show');
+
+    // Use the params the chart was actually loaded with, not the live controls — the user may
+    // have changed source / outlier_type radios without reloading, which would otherwise fetch
+    // detail from a different source than the plotted dot belongs to (wrong details or 404).
+    const params = swimLoadedParams || getSwimParams();
+    const detailUrl = `${SWIM_API_BASE}/loci/${encodeURIComponent(item.LocusId)}?source=${encodeURIComponent(params.source)}`;
+    const statsUrl = `${SWIM_API_BASE}/sample_outlier_stats?sample_id=${encodeURIComponent(item.sample_id)}&locus_id=${encodeURIComponent(item.LocusId)}&outlier_type=${encodeURIComponent(params.outlier_type)}&source=${encodeURIComponent(params.source)}`;
+
+    const detailPromise = fetch(detailUrl).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+    const statsPromise = fetch(statsUrl).then(r => r.ok ? r.json() : null).catch(() => null);
+
+    Promise.all([detailPromise, statsPromise])
+        .then(([detail, stats]) => {
+            renderDotDetailContent(item, detail, stats, params);
+        })
+        .catch(err => {
+            console.error('Detail load error:', err);
+            $('#dot-detail-content').html('<p style="color: red;">Failed to load details: ' + escapeHtml(err.message) + '</p>');
+        });
+}
+
+// Render detail modal content from sample item and locus detail API response
+function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
+    const locus = locusDetail.locus;
+    const annotations = locusDetail.annotations;
+    const outlierSamples = locusDetail.outlier_samples;
+
+    // Derive source / outlier_type from the params the chart was loaded with (passed in by
+    // showDotDetail), NOT the live radios: the user may have changed the radios without
+    // reloading, which would otherwise render Mendelian warnings and phenotype-similarity
+    // scores for a different source / outlier type than the plotted dot belongs to.
+    const swimSource = (params && params.source) || SWIM_DEFAULT_SOURCE;
+    const swimOutlierType = (params && params.outlier_type) || 'all';
+
+    // Build UCSC link
+    let ucscLink = '';
+    if (locus.Chrom && locus.Start0Based != null && locus.End1Based != null) {
+        const ucscUrl = 'https://genome.ucsc.edu/cgi-bin/hgTracks?db=hg38&position='
+            + encodeURIComponent(locus.Chrom + ':' + (locus.Start0Based + 1) + '-' + locus.End1Based);
+        ucscLink = '<a href="' + escapeHtml(ucscUrl) + '" target="_blank" style="color: #2185d0;">UCSC Genome Browser</a>';
+    }
+
+    // Build TRExplorer link
+    let trexLink = '';
+    if (locus.TRExplorerLocusId) {
+        const igvLoc = encodeURIComponent((locus.Chrom || '') + ':' + (locus.Start0Based || 0) + '-' + (locus.End1Based || 0));
+        const q = encodeURIComponent(locus.TRExplorerLocusId);
+        const trexUrl = 'https://trexplorer.broadinstitute.org/#showIGV=1&igvLoc=' + igvLoc
+            + '&showRs=1&q=' + q + '&source=&igv_gencode=1&igv_segdups=1&igv_36k_map=1&igv_ncannot=1';
+        trexLink = '<a href="' + escapeHtml(trexUrl) + '" target="_blank" style="color: #2185d0;">TRExplorer</a>';
+    }
+
+    const externalLinks = [ucscLink, trexLink].filter(Boolean).join(' &nbsp;|&nbsp; ');
+
+    let html = '';
+
+    // Section 1: Genotype (from sampleItem)
+    html += '<div class="detail-section-header">Genotype</div>';
+    html += '<table class="detail-table">';
+    html += '<tr><td>Allele Size</td><td><strong>' + escapeHtml(String(sampleItem.allele_size != null ? sampleItem.allele_size : '')) + '</strong> repeat units</td></tr>';
+    if (sampleItem.purity != null) {
+        html += '<tr><td>Purity</td><td>' + escapeHtml(String(sampleItem.purity)) + '</td></tr>';
+    }
+    if (sampleItem.methylation != null) {
+        html += '<tr><td>Methylation</td><td>' + escapeHtml(String(sampleItem.methylation)) + '</td></tr>';
+    }
+    html += '</table>';
+
+    // Section 2: Sample (from sampleItem)
+    html += '<div class="detail-section-header">Sample</div>';
+    html += '<table class="detail-table">';
+    html += '<tr><td>Sample ID</td><td>' + renderMendelianWarning(sampleItem.sample_id, swimSource) + escapeHtml(sampleItem.sample_id || '') + '</td></tr>';
+    html += '<tr><td>Family ID</td><td>' + escapeHtml(sampleItem.family_id || '') + '</td></tr>';
+    html += '<tr><td>Affected Status</td><td>' + escapeHtml(sampleItem.affected_status || '') + '</td></tr>';
+    html += '<tr><td>Analysis Status</td><td>' + escapeHtml(sampleItem.analysis_status || '') + '</td></tr>';
+    html += '<tr><td>Sex</td><td>' + escapeHtml(sampleItem.sex || '') + '</td></tr>';
+    html += '</table>';
+
+    // Section 3: Phenotype (from sampleItem)
+    html += '<div class="detail-section-header">Phenotype</div>';
+    html += '<table class="detail-table">';
+    html += '<tr><td>Phenotype</td><td style="white-space: normal;">' + escapeHtml(sampleItem.phenotype_description || '') + '</td></tr>';
+    html += '</table>';
+
+    // User Annotations section (notes/tags)
+    const userAnn = locusDetail.user_annotations || {};
+    html += '<div class="detail-section-header">User Annotations</div>';
+    html += '<div class="annotation-section" data-locus-id="' + escapeHtml(locus.LocusId) + '">';
+
+    // Note
+    if (userAnn.note) {
+        html += '<div style="margin-bottom: 6px;"><strong>Note:</strong> <span class="note-text">' + escapeHtml(userAnn.note.note_text) + '</span>';
+        html += ' <button class="ui mini basic button swim-inline-edit-note" data-locus-id="' + escapeHtml(locus.LocusId) + '" style="padding:3px 8px;"><i class="edit icon"></i>Edit</button>';
+        html += ' <button class="ui mini basic red button swim-inline-delete-note" data-locus-id="' + escapeHtml(locus.LocusId) + '" style="padding:3px 8px;"><i class="trash icon"></i>Delete</button>';
+        html += '</div>';
+    } else {
+        html += '<div style="margin-bottom: 6px;"><button class="ui mini basic button swim-inline-add-note" data-locus-id="' + escapeHtml(locus.LocusId) + '" style="padding:3px 8px;"><i class="plus icon"></i>Add Note</button></div>';
+    }
+
+    // Tags
+    html += '<div>';
+    (userAnn.tags || []).forEach(function(t) {
+        html += '<span class="badge badge-tag">' + escapeHtml(t) + '<span class="swim-remove-tag-btn" data-locus-id="' + escapeHtml(locus.LocusId) + '" data-tag="' + escapeHtml(t) + '" style="cursor:pointer;margin-left:2px;opacity:0.6;font-weight:bold;">&times;</span></span>';
+    });
+    html += ' <button class="ui mini basic button swim-inline-add-tag" data-locus-id="' + escapeHtml(locus.LocusId) + '" style="padding:3px 8px;"><i class="tag icon"></i>Add Tag</button>';
+    html += '</div></div>';
+
+    // Section 3b: Sample outlier stats (from sampleStats)
+    if (sampleStats) {
+        html += '<div class="detail-section-header">Sample is outlier at loci</div>';
+        html += '<table class="detail-table">';
+        html += '<tr><td>All loci</td><td>' + escapeHtml(String(sampleStats.total_loci_above_unaffected != null ? sampleStats.total_loci_above_unaffected : '')) + '</td></tr>';
+        html += '<tr><td>Same motif size</td><td>' + escapeHtml(String(sampleStats.same_motif_size_loci != null ? sampleStats.same_motif_size_loci : ''));
+        if (sampleStats.motif_size != null) html += ' (' + escapeHtml(String(sampleStats.motif_size)) + ' bp)';
+        html += '</td></tr>';
+        html += '<tr><td>Same canonical motif</td><td>' + escapeHtml(String(sampleStats.same_canonical_motif_loci != null ? sampleStats.same_canonical_motif_loci : ''));
+        if (sampleStats.canonical_motif) html += ' (' + escapeHtml(sampleStats.canonical_motif) + ')';
+        html += '</td></tr>';
+        html += '</table>';
+    }
+
+    // Section 3c: Phenotype similarity scores (from locusDetail.phenotype_scores)
+    const phenoScores = locusDetail.phenotype_scores || {};
+    const perOutlierScores = phenoScores.per_outlier || {};
+    const perLocusScores = phenoScores.per_locus || {};
+    // swimOutlierType is derived above from the loaded params (not the live radio).
+    const otMap = {all: 'AllAlleles', short: 'ShortAlleles', hemi: 'HemizygousAlleles'};
+    const currentOt = otMap[swimOutlierType];
+    const outlierScoresForType = perOutlierScores[currentOt] || [];
+    const locusScoreForType = perLocusScores[currentOt];
+
+    // Find the phenotype score for the current sample
+    const samplePhenoScore = outlierScoresForType.find(s => s.sample_id === sampleItem.sample_id);
+
+    if (samplePhenoScore || locusScoreForType) {
+        html += '<div class="detail-section-header">Phenotype Similarity Scores</div>';
+        html += '<table class="detail-table">';
+
+        // Per-locus summary
+        if (locusScoreForType) {
+            const maxGeneSim = locusScoreForType.max_gene_phenotype_similarity;
+            const sumPairwise = locusScoreForType.sum_pairwise_similarity;
+            const numQualifying = locusScoreForType.num_qualifying_samples;
+            html += '<tr><td>Qualifying Samples</td><td>' + escapeHtml(String(numQualifying || 0)) + '</td></tr>';
+            if (maxGeneSim != null) {
+                html += '<tr><td>Max Gene-Phenotype Sim (locus)</td><td><strong>' + maxGeneSim.toFixed(3) + '</strong></td></tr>';
+            }
+            if (sumPairwise != null) {
+                html += '<tr><td>Sum Pairwise Sim (locus)</td><td>' + sumPairwise.toFixed(3) + '</td></tr>';
+            }
+        }
+
+        // Per-sample scores for this sample
+        if (samplePhenoScore) {
+            if (samplePhenoScore.gene_phenotype_similarity != null) {
+                const simStyle = samplePhenoScore.gene_phenotype_similarity >= 0.5 ? 'color: #2e7d32; font-weight: bold;' : '';
+                html += '<tr><td>Gene-Phenotype Sim (this sample)</td><td style="' + simStyle + '">' + samplePhenoScore.gene_phenotype_similarity.toFixed(3) + '</td></tr>';
+            }
+            if (samplePhenoScore.gene_phenotype_overlap_count != null) {
+                html += '<tr><td>HPO Overlap Count</td><td>' + samplePhenoScore.gene_phenotype_overlap_count + '</td></tr>';
+            }
+            if (samplePhenoScore.best_matching_disease) {
+                const inhStr = samplePhenoScore.best_disease_inheritance ? ' (' + escapeHtml(samplePhenoScore.best_disease_inheritance) + ')' : '';
+                html += '<tr><td>Best Matching Disease</td><td>' + escapeHtml(samplePhenoScore.best_matching_disease) + inhStr + '</td></tr>';
+            }
+            if (samplePhenoScore.pairwise_similarity_to_next != null) {
+                html += '<tr><td>Pairwise Sim to Next Sample</td><td>' + samplePhenoScore.pairwise_similarity_to_next.toFixed(3) + '</td></tr>';
+            }
+        }
+        html += '</table>';
+    }
+
+    // Section 4: Locus (from locusDetail.locus)
+    const coords = (locus.Chrom && locus.Start0Based != null && locus.End1Based != null)
+        ? escapeHtml(locus.Chrom + ':' + locus.Start0Based + '-' + locus.End1Based)
+        : '';
+
+    html += '<div class="detail-section-header">Locus</div>';
+    html += '<table class="detail-table">';
+    html += '<tr><td>Locus ID</td><td>' + escapeHtml(locus.LocusId || '') + '</td></tr>';
+    html += '<tr><td>Coordinates</td><td>' + coords + '</td></tr>';
+    html += '<tr><td>Motif</td><td>' + escapeHtml(locus.Motif || '') + ' (' + escapeHtml(String(locus.MotifSize || '')) + ' bp)</td></tr>';
+    html += '<tr><td>Repeats in Reference</td><td>' + escapeHtml(String(locus.NumRepeatsInReference != null ? locus.NumRepeatsInReference : '')) + '</td></tr>';
+    html += '<tr><td>Gene Region</td><td>' + escapeHtml(locus.gene_region || '') + '</td></tr>';
+    html += '<tr><td>Source</td><td>' + escapeHtml(locus.Source || '') + '</td></tr>';
+    if (externalLinks) {
+        html += '<tr><td>Links</td><td>' + externalLinks + '</td></tr>';
+    }
+    html += '</table>';
+
+    // Section 5: Gene (from locusDetail.locus)
+    const pliDisplay = (locus.pLI != null) ? Number(locus.pLI).toFixed(3) : '';
+    const loeufDisplay = (locus.GeneTableLoeuf != null) ? Number(locus.GeneTableLoeuf).toFixed(3) : '';
+
+    html += '<div class="detail-section-header">Gene</div>';
+    html += '<table class="detail-table">';
+    html += '<tr><td>Gene Symbol</td><td>' + escapeHtml(locus.GeneTableGeneSymbol || '') + '</td></tr>';
+    html += '<tr><td>Gene ID</td><td>' + escapeHtml(locus.gene_id || '') + '</td></tr>';
+    html += '<tr><td>Inheritance</td><td>' + escapeHtml(locus.GeneTableInheritance || '') + '</td></tr>';
+    html += '<tr><td>pLI</td><td>' + escapeHtml(pliDisplay) + '</td></tr>';
+    html += '<tr><td>LOEUF</td><td>' + escapeHtml(loeufDisplay) + '</td></tr>';
+    if (locus.GeneTableDiseaseCategory) {
+        html += '<tr><td>Disease Category</td><td>' + escapeHtml(locus.GeneTableDiseaseCategory) + '</td></tr>';
+    }
+    if (locus.GeneTableLLMPhenotypeSummary) {
+        html += '<tr><td>Gene Phenotype Summary</td><td style="white-space: normal;">' + escapeHtml(locus.GeneTableLLMPhenotypeSummary) + '</td></tr>';
+    }
+    html += '</table>';
+
+    // Section 6: Population (from annotations.population_thresholds and locus stdev)
+    const popThresh = annotations.population_thresholds || {};
+    html += '<div class="detail-section-header">Population</div>';
+    html += '<table class="detail-table">';
+    html += '<tr><td></td>'
+        + '<td style="font-weight:600; color:#555;">99th Pctl</td>'
+        + '<td style="font-weight:600; color:#555;">Max</td>'
+        + '<td style="font-weight:600; color:#555;">Mode</td>'
+        + '<td style="font-weight:600; color:#555;">Median</td>'
+        + '<td style="font-weight:600; color:#555;">Stdev</td>'
+        + '<td style="font-weight:600; color:#555;">90th Pctl</td></tr>';
+
+    // [display label, population_thresholds key prefix]. Only cohorts with data
+    // (max != null) are shown; HPRC256/TenK10K have no 90th percentile -> '?'.
+    const rPop = v => (v != null ? Math.round(v) : '?');
+    [
+        ['HPRC256', 'HPRC256'],
+        ['AoU1027', 'AoU1027'],
+        ['TenK10K', 'TenK10K'],
+        ['AoU2High', 'AoUPhase2HighCov'],
+        ['AoU2Mid',  'AoUPhase2MidCov'],
+    ].filter(([, k]) => popThresh[k + '_MaxAllele'] != null).forEach(([label, k]) => {
+        const stdev = popThresh[k + '_Stdev'];
+        html += '<tr><td>' + escapeHtml(label) + '</td>'
+            + '<td>' + rPop(popThresh[k + '_99thPercentile']) + '</td>'
+            + '<td>' + rPop(popThresh[k + '_MaxAllele']) + '</td>'
+            + '<td>' + rPop(popThresh[k + '_Mode']) + '</td>'
+            + '<td>' + rPop(popThresh[k + '_Median']) + '</td>'
+            + '<td>' + (stdev != null ? Number(stdev).toFixed(2) : '?') + '</td>'
+            + '<td>' + rPop(popThresh[k + '_90thPercentile']) + '</td></tr>';
+    });
+    html += '</table>';
+
+    // Section 7: Allele Distributions (from locusDetail.locus)
+    const histRows = [
+        { label: 'Long Allele', value: locus.AllAlleleHistogram },
+        { label: 'Biallelic', value: locus.ShortAlleleHistogram },
+        { label: 'Hemizygous', value: locus.HemizygousAlleleHistogram },
+    ].filter(row => row.value);
+
+    if (histRows.length > 0) {
+        html += '<div class="detail-section-header">Allele Distributions</div>';
+        html += '<table class="detail-table">';
+        histRows.forEach(row => {
+            html += '<tr><td>' + escapeHtml(row.label) + '</td><td style="white-space: normal; word-break: break-all;">' + escapeHtml(row.value) + '</td></tr>';
+        });
+        html += '</table>';
+    }
+
+    // Section 8: Outlier Samples (from locusDetail.outlier_samples)
+    const outlierTypes = [
+        { key: 'AllAlleles', label: 'Long Allele' },
+        { key: 'ShortAlleles', label: 'Biallelic' },
+        { key: 'HemizygousAlleles', label: 'Hemizygous' },
+    ];
+    const hasAnyOutliers = outlierTypes.some(t => outlierSamples[t.key] && outlierSamples[t.key].length > 0);
+
+    if (hasAnyOutliers) {
+        html += '<div class="detail-section-header">Outlier Samples</div>';
+        const isSexChrom = /^(chr)?(X|Y)$/i.test(locus.Chrom || '');
+        const allEntries = outlierTypes.flatMap(t => outlierSamples[t.key] || []);
+        const hasAncestry = allEntries.some(s => s.ancestry);
+        outlierTypes.forEach(t => {
+            const entries = outlierSamples[t.key];
+            if (!entries || entries.length === 0) return;
+
+            // Sort by allele_size descending
+            const sorted = entries.slice().sort((a, b) => (b.allele_size || 0) - (a.allele_size || 0));
+
+            const hdr = (k) => '<td style="font-weight:600; color:#555;">' + k + '</td>';
+            html += '<div style="font-weight: 600; color: #555; margin-top: 8px; margin-bottom: 4px;">' + escapeHtml(t.label) + '</div>';
+            html += '<table class="detail-table">';
+            html += '<tr>' + hdr('Sample ID') + hdr('Allele Size') + hdr('Affected') + hdr('Analysis') + hdr('Family ID');
+            if (isSexChrom) html += hdr('Sex');
+            if (hasAncestry) html += hdr('Ancestry');
+            html += hdr('Phenotype') + '</tr>';
+            sorted.forEach(sample => {
+                const isCurrentSample = sample.sample_id === sampleItem.sample_id;
+                const rowStyle = isCurrentSample ? ' style="background-color: #fffde7;"' : '';
+                const sampleIdHtml = isCurrentSample
+                    ? '<strong>' + escapeHtml(sample.sample_id || '') + '</strong>'
+                    : escapeHtml(sample.sample_id || '');
+                html += '<tr' + rowStyle + '>';
+                html += '<td>' + renderMendelianWarning(sample.sample_id, swimSource) + sampleIdHtml + '</td>';
+                html += '<td>' + escapeHtml(String(sample.allele_size != null ? sample.allele_size : '')) + '</td>';
+                html += '<td>' + escapeHtml(sample.affected_status || '') + '</td>';
+                html += '<td>' + escapeHtml(sample.analysis_status || '') + '</td>';
+                html += '<td>' + escapeHtml(sample.family_id || '') + '</td>';
+                if (isSexChrom) html += '<td>' + escapeHtml(sample.sex || '') + '</td>';
+                if (hasAncestry) html += '<td>' + escapeHtml(sample.ancestry || '') + '</td>';
+                const phenDesc = sample.phenotype_description || '';
+                const phenTrunc = phenDesc.length > 80 ? phenDesc.substring(0, 80) + '...' : phenDesc;
+                html += '<td style="font-size:0.9em; max-width:300px;" title="' + escapeHtml(phenDesc) + '">' + escapeHtml(phenTrunc) + '</td>';
+                html += '</tr>';
+            });
+            html += '</table>';
+        });
+    }
+
+    // Section 9: Annotations (from locusDetail.locus and locusDetail.annotations)
+    html += '<div class="detail-section-header">Annotations</div>';
+    html += '<table class="detail-table">';
+    if (locus.KnownDiseaseLocus) {
+        html += '<tr><td>Known Disease Locus</td><td>' + escapeHtml(locus.KnownDiseaseLocus) + '</td></tr>';
+    }
+    html += '<tr><td>Known Disease Motif</td><td>' + (locus.IsKnownMotif ? 'Yes' : 'No') + '</td></tr>';
+    html += '</table>';
+
+    if (annotations.omim_overlaps && annotations.omim_overlaps.length > 0) {
+        html += '<div style="font-weight: 600; color: #555; margin-top: 8px; margin-bottom: 4px;">Overlapping OMIM Linkage Regions</div>';
+        html += '<table class="detail-table">';
+        html += '<tr><td style="font-weight:600; color:#555;">Phenotype</td><td style="font-weight:600; color:#555;">MIM#</td><td style="font-weight:600; color:#555;">Region</td><td style="font-weight:600; color:#555;">Size (Mb)</td></tr>';
+        annotations.omim_overlaps.forEach(omim => {
+            html += '<tr>';
+            html += '<td style="white-space: normal;">' + escapeHtml(omim.phenotype_description || '') + '</td>';
+            html += '<td>' + escapeHtml(String(omim.phenotype_mim_number || '')) + '</td>';
+            html += '<td>' + escapeHtml(omim.region_coords || '') + '</td>';
+            html += '<td>' + escapeHtml(String(omim.region_size_mb != null ? omim.region_size_mb : '')) + '</td>';
+            html += '</tr>';
+        });
+        html += '</table>';
+    }
+
+    // Section 10: TRExplorer (from locusDetail.locus)
+    if (locus.TRExplorerLocusId) {
+        const jaccardDisplay = (locus.TRExplorerLocusJaccardSimilarity != null) ? Number(locus.TRExplorerLocusJaccardSimilarity).toFixed(3) : '';
+
+        html += '<div class="detail-section-header">TRExplorer</div>';
+        html += '<table class="detail-table">';
+        html += '<tr><td>TRExplorer Locus ID</td><td>' + escapeHtml(locus.TRExplorerLocusId) + '</td></tr>';
+        html += '<tr><td>TRExplorer Motif</td><td>' + escapeHtml(locus.TRExplorerMotif || '') + '</td></tr>';
+        html += '<tr><td>TRExplorer Reference Region</td><td>' + escapeHtml(locus.TRExplorerReferenceRegion || '') + '</td></tr>';
+        html += '<tr><td>TRExplorer Jaccard Similarity</td><td>' + escapeHtml(jaccardDisplay) + '</td></tr>';
+        html += '</table>';
+    }
+
+    $('#dot-detail-content').html(html);
+}
+
+// =========================================================================
+// Initialization
+// =========================================================================
+
+$(document).ready(function() {
+    // Initialize Semantic UI components
+    $('.ui.checkbox').checkbox();
+    $('.ui.radio.checkbox').checkbox();
+
+    // Help-text popups open on click of the (?) icon
+    $('.help-popup').popup({ on: 'click' });
+
+    // X-axis toggle: use Semantic UI onChange callback so checked state is current
+    $('#swim-xaxis-toggle .ui.radio.checkbox').checkbox({
+        onChange: function() {
+            if (swimRawData.length > 0) {
+                renderSwimChart(swimRawData);
+            }
+        }
+    });
+
+    // Gene region mutual exclusivity: include unchecks exclude (and vice versa)
+    $('#swim-control-panel input[name^="swim_gene_region_"]').on('change', function() {
+        const region = this.name.replace('swim_gene_region_', '');
+        if ($(this).parent().checkbox('is checked')) {
+            $(`input[name="swim_exclude_gene_region_${region}"]`).parent().checkbox('uncheck');
+        }
+    });
+    $('#swim-control-panel input[name^="swim_exclude_gene_region_"]').on('change', function() {
+        const region = this.name.replace('swim_exclude_gene_region_', '');
+        if ($(this).parent().checkbox('is checked')) {
+            $(`input[name="swim_gene_region_${region}"]`).parent().checkbox('uncheck');
+        }
+    });
+
+    // Initialize sample ID dropdown
+    $('#swim-sample-id-filter').dropdown({
+        allowAdditions: true,
+        clearable: true,
+        fullTextSearch: true,
+        forceSelection: false,
+    });
+    fetch(SWIM_API_BASE + '/schema')
+        .then(r => r.json())
+        .then(data => {
+            const values = (data.sample_ids || []).map(id => ({ name: id, value: id }));
+            $('#swim-sample-id-filter').dropdown('setup menu', { values: values });
+        })
+        .catch(e => console.error('Populate sample IDs error:', e));
+
+    // Initialize tag dropdown
+    $('#swim-tag-filter').dropdown({
+        allowAdditions: false,
+        clearable: true,
+        fullTextSearch: true,
+        maxResults: 10,
+    });
+    fetch(SWIM_API_BASE + '/annotations/tags')
+        .then(r => r.json())
+        .then(data => {
+            // Use all_tags (user tags + system tags like "readviz"/"readviz pending") so the
+            // supported system-tag filters are selectable, not just user-defined tags.
+            const values = (data.all_tags || []).map(t => ({ name: t, value: t }));
+            $('#swim-tag-filter').dropdown('setup menu', { values: values });
+        })
+        .catch(e => console.error('Populate tags error:', e));
+
+    $('#dot-detail-modal').modal();
+
+    // Load data on button click
+    $('#swim-load-btn').on('click', function() {
+        loadSwimPlot();
+    });
+
+    // Trigger load on Enter key in text/number inputs
+    $('#swim-control-panel').on('keydown', 'input[type="text"], input[type="number"]', function(e) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            loadSwimPlot();
+        }
+    });
+
+    // Auto-load on page load
+    loadSwimPlot();
+
+    // Cache all tags for prompt hints
+    fetch(SWIM_API_BASE + '/annotations/tags')
+        .then(function(r) { return r.json(); })
+        .then(function(data) { window._allTagsList = data.tags || []; })
+        .catch(function() {});
+});
+
+// =========================================================================
+// Swim Plot Annotation CRUD
+// =========================================================================
+
+// Track current item shown in modal for refresh
+let _currentModalItem = null;
+
+// Override showDotDetail to track current item
+const _originalShowDotDetail = showDotDetail;
+showDotDetail = function(item) {
+    _currentModalItem = item;
+    _originalShowDotDetail(item);
+};
+
+async function swimSaveNote(locusId, noteText) {
+    const response = await fetch(SWIM_API_BASE + '/annotations/' + encodeURIComponent(locusId) + '/note', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({note_text: noteText}),
+    });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return response.json();
+}
+
+async function swimDeleteNote(locusId) {
+    const response = await fetch(SWIM_API_BASE + '/annotations/' + encodeURIComponent(locusId) + '/note', {
+        method: 'DELETE',
+    });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return response.json();
+}
+
+async function swimAddTag(locusId, tag) {
+    const response = await fetch(SWIM_API_BASE + '/annotations/' + encodeURIComponent(locusId) + '/tags', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tag: tag}),
+    });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return response.json();
+}
+
+async function swimRemoveTag(locusId, tag) {
+    const response = await fetch(SWIM_API_BASE + '/annotations/' + encodeURIComponent(locusId) + '/tags/' + encodeURIComponent(tag), {
+        method: 'DELETE',
+    });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return response.json();
+}
+
+function refreshSwimModal() {
+    if (_currentModalItem) showDotDetail(_currentModalItem);
+}
+
+// Modal action button handlers
+$(document).on('click', '.swim-edit-note-btn', function() {
+    if (!_currentModalItem) return;
+    var locusId = _currentModalItem.LocusId;
+    var existing = $('#dot-detail-content .note-text').text() || '';
+    var noteText = prompt('Enter note:', existing);
+    if (noteText === null || !noteText.trim()) return;
+    swimSaveNote(locusId, noteText.trim()).then(refreshSwimModal).catch(function(e) { alert('Failed: ' + e.message); });
+});
+
+// Refresh the cached tag list AND the #swim-tag-filter dropdown menu so a tag added (or
+// removed) from the modal is immediately selectable in the filter, instead of only after a
+// page reload. Preserves the current filter selection.
+function refreshSwimTags() {
+    return fetch(SWIM_API_BASE + '/annotations/tags')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            window._allTagsList = d.tags || [];  // user tags only — used for the add-tag hint
+            var selected = $('#swim-tag-filter').dropdown('get value');
+            // Include system tags (e.g. "readviz") in the filter dropdown, not just user tags.
+            var values = (d.all_tags || []).map(function(t) {
+                return { name: t, value: t, selected: t === selected };
+            });
+            $('#swim-tag-filter').dropdown('setup menu', { values: values });
+            if (selected) $('#swim-tag-filter').dropdown('set selected', selected);
+        })
+        .catch(function(e) { console.error('Refresh tags error:', e); });
+}
+
+$(document).on('click', '.swim-add-tag-btn', function() {
+    if (!_currentModalItem) return;
+    var locusId = _currentModalItem.LocusId;
+    var allTags = window._allTagsList || [];
+    var hint = allTags.length > 0 ? 'Existing tags: ' + allTags.join(', ') + '\n\nEnter tag:' : 'Enter tag:';
+    var tag = prompt(hint);
+    if (tag === null || !tag.trim()) return;
+    swimAddTag(locusId, tag.trim()).then(function() {
+        // Refresh tag cache
+        refreshSwimTags();
+        refreshSwimModal();
+    }).catch(function(e) { alert('Failed: ' + e.message); });
+});
+
+// Inline CRUD handlers inside modal content
+$(document).on('click', '.swim-inline-add-note, .swim-inline-edit-note', function() {
+    var locusId = $(this).data('locus-id');
+    var existing = $(this).closest('.annotation-section').find('.note-text').text() || '';
+    var noteText = prompt('Enter note:', existing);
+    if (noteText === null || !noteText.trim()) return;
+    swimSaveNote(locusId, noteText.trim()).then(refreshSwimModal).catch(function(e) { alert('Failed: ' + e.message); });
+});
+
+$(document).on('click', '.swim-inline-delete-note', function() {
+    var locusId = $(this).data('locus-id');
+    if (!confirm('Delete this note?')) return;
+    swimDeleteNote(locusId).then(refreshSwimModal).catch(function(e) { alert('Failed: ' + e.message); });
+});
+
+$(document).on('click', '.swim-inline-add-tag', function() {
+    var locusId = $(this).data('locus-id');
+    var allTags = window._allTagsList || [];
+    var hint = allTags.length > 0 ? 'Existing tags: ' + allTags.join(', ') + '\n\nEnter tag:' : 'Enter tag:';
+    var tag = prompt(hint);
+    if (tag === null || !tag.trim()) return;
+    swimAddTag(locusId, tag.trim()).then(function() {
+        refreshSwimTags();
+        refreshSwimModal();
+    }).catch(function(e) { alert('Failed: ' + e.message); });
+});
+
+$(document).on('click', '.swim-remove-tag-btn', function() {
+    var locusId = $(this).data('locus-id');
+    var tag = $(this).data('tag');
+    swimRemoveTag(locusId, tag).then(function() {
+        refreshSwimTags();
+        refreshSwimModal();
+    }).catch(function(e) { alert('Failed: ' + e.message); });
+});
+</script>
+
+</body>
+</html>

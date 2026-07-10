@@ -216,3 +216,25 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# TRails — never commit data (public-data-only release; keep the repo data-free)
+# ---------------------------------------------------------------------------
+# Downloaded public (class-A) reference data; tracked placeholder is kept.
+reference_data/*
+!reference_data/.gitkeep
+# Licensed / controlled-access (class-B) and user (class-C) data.
+*.db
+*.tsv.gz
+*.json.gz
+*.build_manifest.json
+omim_*.tsv
+annotations.db
+startup_cache.msgpack
+snapshot_pre_refactor/
+
+# IDE / local tooling artifacts
+.idea/
+.memory/
+.code_review_local/
+

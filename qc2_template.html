@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html>
+{% include "header_template.html" %}
+
+<style>
+/* === QC2 Page Styles === */
+.qc-section {
+    margin-bottom: 50px;
+}
+.qc-section-title {
+    font-size: 1.2em;
+    font-weight: 600;
+    color: #333;
+    margin-bottom: 15px;
+    margin-top: 20px;
+}
+.qc-charts-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 15px;
+    justify-content: flex-start;
+}
+.qc-chart-container {
+    flex: 1 1 180px;
+    min-width: 160px;
+    max-width: 220px;
+    position: relative;
+}
+.qc-chart-canvas-wrapper {
+    height: 250px;
+    position: relative;
+}
+.qc-chart-canvas-wrapper canvas {
+    width: 100% !important;
+    height: 100% !important;
+}
+.qc-bin-label {
+    text-align: center;
+    font-weight: 600;
+    color: #555;
+    margin-bottom: 5px;
+    font-size: 0.95em;
+}
+#qc-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 60px;
+    color: #888;
+    font-size: 1.1em;
+}
+#qc-loading .ui.loader {
+    margin-right: 15px;
+}
+#qc-error {
+    display: none;
+    color: #c62828;
+    padding: 20px;
+    text-align: center;
+}
+.qc-top-table {
+    margin-top: 10px;
+    font-size: 0.75em;
+    width: 100%;
+    border-collapse: collapse;
+}
+.qc-top-table th {
+    background: #f5f5f5;
+    padding: 3px 5px;
+    text-align: left;
+    font-weight: 600;
+    border-bottom: 1px solid #ddd;
+}
+.qc-top-table td {
+    padding: 2px 5px;
+    border-bottom: 1px solid #eee;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 120px;
+}
+.qc-top-table tr:hover {
+    background: #f9f9f9;
+}
+.qc-table-title {
+    font-size: 0.8em;
+    color: #666;
+    margin-top: 8px;
+    margin-bottom: 4px;
+    font-weight: 500;
+}
+</style>
+
+<div class="ui grid">
+    <div class="ui row">
+        <div class="one wide column"></div>
+        <div class="fourteen wide column">
+
+            <h2 style="margin-top: 20px; margin-bottom: 10px; color: #333;">Trio QC: Mendelian Violations</h2>
+            <p style="color: #666; margin-bottom: 20px;">
+                Distribution of Mendelian violation fractions, grouped by motif size and chromosome.
+                In the first two sections each dot represents one trio; in the "by sequencing center" sections each
+                dot represents one sequencing center (aggregated across its trios). The y-value is the fraction of
+                loci with Mendelian violations (violations / total loci). All bins in a section share a common y-axis scale.
+            </p>
+
+            <!-- Loading indicator -->
+            <div id="qc-loading">
+                <div class="ui small active inline loader"></div>
+                <span>Loading QC2 data...</span>
+            </div>
+
+            <!-- Error message -->
+            <div id="qc-error"></div>
+
+            <!-- Section 1: By Motif Size -->
+            <div id="section-motif" class="qc-section" style="display: none;">
+                <div class="qc-section-title">Mendelian violation fraction by motif size</div>
+                <div class="qc-charts-row" id="motif-charts-row">
+                    <!-- Charts will be inserted here -->
+                </div>
+            </div>
+
+            <!-- Section 2: By Chromosome -->
+            <div id="section-chrom" class="qc-section" style="display: none;">
+                <div class="qc-section-title">Mendelian violation fraction by chromosome</div>
+                <div class="qc-charts-row" id="chrom-charts-row">
+                    <!-- Charts will be inserted here -->
+                </div>
+            </div>
+
+            <!-- Section 3: By Sequencing Center (Motif) -->
+            <div id="section-center-motif" class="qc-section" style="display: none;">
+                <div class="qc-section-title">Mendelian violation fraction by sequencing center (grouped by motif size) — centers with ≥5 trios</div>
+                <div class="qc-charts-row" id="center-motif-charts-row">
+                    <!-- Charts will be inserted here -->
+                </div>
+            </div>
+
+            <!-- Section 4: By Sequencing Center (Chromosome) -->
+            <div id="section-center-chrom" class="qc-section" style="display: none;">
+                <div class="qc-section-title">Mendelian violation fraction by sequencing center (grouped by chromosome) — centers with ≥5 trios</div>
+                <div class="qc-charts-row" id="center-chrom-charts-row">
+                    <!-- Charts will be inserted here -->
+                </div>
+            </div>
+
+        </div>
+        <div class="one wide column"></div>
+    </div>
+
+</div><!-- close .ui.grid -->
+
+{% include "qc_shared_js.html" %}
+
+<script>
+// =========================================================================
+// QC2 Page - Mendelian Violations Box Plots
+// =========================================================================
+
+const QC2_API_BASE = window.location.origin + '/api/v1';
+
+// Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
+const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
+// Per-source 99th-percentile outlier warnings. This page has no source selector, so its
+// renderMendelianWarning() calls pass no source and show only the source-independent
+// Mendelian-violation part (an outlier warning is meaningless without a chosen source).
+const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
+
+
+// Category order for bins
+const MOTIF_BINS = ['1bp', '2bp', '3bp', '4bp', '5bp', '6bp', '7-24bp', '25+bp'];
+const CHROM_BINS = ['autosome', 'chrX', 'chrY'];
+
+
+// Create a single bin chart (box plot with scatter overlay)
+function createSingleBinChart(canvasId, binData, binLabel, yMax) {
+    const ctx = document.getElementById(canvasId).getContext('2d');
+
+    // Extract fractions for this bin
+    const values = binData.map(d => d.fraction);
+    const stats = computeBoxStats(values);
+
+    // Create scatter points with jitter around x=0
+    const scatterPoints = binData.map(item => ({
+        x: (Math.random() - 0.5) * 0.6,  // jitter between -0.3 and 0.3
+        y: item.fraction,
+        sample_id: item.sample_id,
+        violations: item.violations,
+        total: item.total
+    }));
+
+    const chart = new Chart(ctx, {
+        type: 'scatter',
+        data: {
+            datasets: [{
+                label: 'Samples',
+                data: scatterPoints,
+                backgroundColor: 'rgba(33, 133, 208, 0.5)',
+                borderColor: 'rgba(33, 133, 208, 0.8)',
+                pointRadius: 3,
+                pointHoverRadius: 5
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: {
+                    type: 'linear',
+                    min: -0.8,
+                    max: 0.8,
+                    display: false,  // Hide x-axis since it's just jitter
+                    grid: { display: false }
+                },
+                y: {
+                    title: {
+                        display: true,
+                        text: '% MV',
+                        font: { size: 11 }
+                    },
+                    min: 0,
+                    max: yMax,
+                    ticks: {
+                        font: { size: 10 },
+                        maxTicksLimit: 6,
+                        callback: function(value) {
+                            return (value * 100).toFixed(1) + '%';
+                        }
+                    }
+                }
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            const point = context.raw;
+                            return [
+                                'Sample: ' + (point.sample_id || ''),
+                                'Violations: ' + point.violations + ' / ' + point.total,
+                                '% MV: ' + (point.y * 100).toFixed(2) + '%'
+                            ];
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Store box stats for the custom plugin
+    chart.config._boxStats = stats;
+
+    // Compute and store percentiles for the custom plugin
+    const sortedValues = values.slice().sort((a, b) => a - b);
+    chart.config._percentiles = {
+        p95: computePercentile(sortedValues, 95),
+        p99: computePercentile(sortedValues, 99)
+    };
+
+    return chart;
+}
+
+// Create all charts for a section (per-sample data)
+function createChartsForSection(containerId, data, bins) {
+    const container = document.getElementById(containerId);
+    container.innerHTML = '';  // Clear any existing content
+
+    // Group data by bin
+    const binData = {};
+    bins.forEach(bin => { binData[bin] = []; });
+    data.forEach(item => {
+        if (binData[item.bin] !== undefined) {
+            binData[item.bin].push({
+                sample_id: item.sample_id,
+                fraction: item.fraction,
+                violations: item.violations,
+                total: item.total
+            });
+        }
+    });
+
+    // Compute global max across all bins for shared y-axis (round up to nearest 5%)
+    const allFractions = data.map(d => d.fraction);
+    const maxFraction = allFractions.length > 0 ? Math.max(...allFractions) : 0;
+    const globalMax = Math.ceil(maxFraction / 0.05) * 0.05 || 0.05;  // Round up to nearest 5%
+
+    // Create a chart for each bin
+    bins.forEach((bin, idx) => {
+        const chartWrapper = document.createElement('div');
+        chartWrapper.className = 'qc-chart-container';
+
+        const label = document.createElement('div');
+        label.className = 'qc-bin-label';
+        label.textContent = bin;
+
+        // Canvas wrapper for fixed height
+        const canvasWrapper = document.createElement('div');
+        canvasWrapper.className = 'qc-chart-canvas-wrapper';
+
+        const canvas = document.createElement('canvas');
+        const canvasId = `${containerId}-chart-${idx}`;
+        canvas.id = canvasId;
+
+        canvasWrapper.appendChild(canvas);
+        chartWrapper.appendChild(label);
+        chartWrapper.appendChild(canvasWrapper);
+
+        // Create top 20 table (sorted by fraction descending)
+        const currentBinData = binData[bin];
+        const top20 = currentBinData
+            .slice()
+            .sort((a, b) => b.fraction - a.fraction)
+            .slice(0, 20);
+
+        if (top20.length > 0) {
+            const tableTitle = document.createElement('div');
+            tableTitle.className = 'qc-table-title';
+            tableTitle.textContent = 'Top 20 samples';
+
+            const table = document.createElement('table');
+            table.className = 'qc-top-table';
+
+            const thead = document.createElement('thead');
+            thead.innerHTML = '<tr><th>Proband ID</th><th>% MV</th></tr>';
+            table.appendChild(thead);
+
+            const tbody = document.createElement('tbody');
+            top20.forEach(item => {
+                const tr = document.createElement('tr');
+                const pct = (item.fraction * 100).toFixed(2) + '%';
+                tr.innerHTML = `<td title="${escapeHtml(item.sample_id)}">${renderMendelianWarning(item.sample_id)}${escapeHtml(item.sample_id)}</td><td>${pct}</td>`;
+                tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+
+            chartWrapper.appendChild(tableTitle);
+            chartWrapper.appendChild(table);
+        }
+
+        container.appendChild(chartWrapper);
+
+        // Create the chart after adding to DOM
+        createSingleBinChart(canvasId, binData[bin], bin, globalMax);
+    });
+}
+
+// Create a single bin chart for center-aggregated data
+function createCenterBinChart(canvasId, binData, binLabel, yMax) {
+    const ctx = document.getElementById(canvasId).getContext('2d');
+
+    // Extract fractions for this bin
+    const values = binData.map(d => d.fraction);
+    const stats = computeBoxStats(values);
+
+    // Create scatter points with jitter around x=0
+    const scatterPoints = binData.map(item => ({
+        x: (Math.random() - 0.5) * 0.6,
+        y: item.fraction,
+        center: item.center,
+        violations: item.violations,
+        total: item.total,
+        trios: item.trios
+    }));
+
+    const chart = new Chart(ctx, {
+        type: 'scatter',
+        data: {
+            datasets: [{
+                label: 'Centers',
+                data: scatterPoints,
+                backgroundColor: 'rgba(156, 39, 176, 0.6)',  // Purple for centers
+                borderColor: 'rgba(156, 39, 176, 0.9)',
+                pointRadius: 6,  // Larger points for centers
+                pointHoverRadius: 8
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: {
+                    type: 'linear',
+                    min: -0.8,
+                    max: 0.8,
+                    display: false,
+                    grid: { display: false }
+                },
+                y: {
+                    title: {
+                        display: true,
+                        text: '% MV',
+                        font: { size: 11 }
+                    },
+                    min: 0,
+                    max: yMax,
+                    ticks: {
+                        font: { size: 10 },
+                        maxTicksLimit: 6,
+                        callback: function(value) {
+                            return (value * 100).toFixed(1) + '%';
+                        }
+                    }
+                }
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            const point = context.raw;
+                            return [
+                                'Center: ' + (point.center || ''),
+                                'Trios: ' + point.trios,
+                                'Violations: ' + point.violations.toLocaleString() + ' / ' + point.total.toLocaleString(),
+                                '% MV: ' + (point.y * 100).toFixed(2) + '%'
+                            ];
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Store box stats for the custom plugin
+    chart.config._boxStats = stats;
+
+    // Compute and store percentiles for the custom plugin
+    const sortedValues = values.slice().sort((a, b) => a - b);
+    chart.config._percentiles = {
+        p95: computePercentile(sortedValues, 95),
+        p99: computePercentile(sortedValues, 99)
+    };
+
+    return chart;
+}
+
+// Create all charts for center-aggregated data
+function createCenterChartsForSection(containerId, data, bins) {
+    const container = document.getElementById(containerId);
+    container.innerHTML = '';
+
+    // Group data by bin
+    const binData = {};
+    bins.forEach(bin => { binData[bin] = []; });
+    data.forEach(item => {
+        if (binData[item.bin] !== undefined) {
+            binData[item.bin].push({
+                center: item.center,
+                fraction: item.fraction,
+                violations: item.violations,
+                total: item.total,
+                trios: item.trios
+            });
+        }
+    });
+
+    // Compute global max across all bins for shared y-axis (round up to nearest 5%)
+    const allFractions = data.map(d => d.fraction);
+    const maxFraction = allFractions.length > 0 ? Math.max(...allFractions) : 0;
+    const globalMax = Math.ceil(maxFraction / 0.05) * 0.05 || 0.05;  // Round up to nearest 5%
+
+    // Create a chart for each bin
+    bins.forEach((bin, idx) => {
+        const chartWrapper = document.createElement('div');
+        chartWrapper.className = 'qc-chart-container';
+
+        const label = document.createElement('div');
+        label.className = 'qc-bin-label';
+        label.textContent = bin;
+
+        const canvasWrapper = document.createElement('div');
+        canvasWrapper.className = 'qc-chart-canvas-wrapper';
+
+        const canvas = document.createElement('canvas');
+        const canvasId = `${containerId}-chart-${idx}`;
+        canvas.id = canvasId;
+
+        canvasWrapper.appendChild(canvas);
+        chartWrapper.appendChild(label);
+        chartWrapper.appendChild(canvasWrapper);
+
+        // Create table showing all centers (sorted by fraction descending)
+        const currentBinData = binData[bin];
+        const sortedData = currentBinData
+            .slice()
+            .sort((a, b) => b.fraction - a.fraction);
+
+        if (sortedData.length > 0) {
+            const tableTitle = document.createElement('div');
+            tableTitle.className = 'qc-table-title';
+            tableTitle.textContent = 'All centers';
+
+            const table = document.createElement('table');
+            table.className = 'qc-top-table';
+
+            const thead = document.createElement('thead');
+            thead.innerHTML = '<tr><th>Center</th><th>Trios</th><th>% MV</th></tr>';
+            table.appendChild(thead);
+
+            const tbody = document.createElement('tbody');
+            sortedData.forEach(item => {
+                const tr = document.createElement('tr');
+                const pct = (item.fraction * 100).toFixed(2) + '%';
+                tr.innerHTML = `<td>${item.center}</td><td>${item.trios}</td><td>${pct}</td>`;
+                tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+
+            chartWrapper.appendChild(tableTitle);
+            chartWrapper.appendChild(table);
+        }
+
+        container.appendChild(chartWrapper);
+
+        // Create the chart after adding to DOM
+        createCenterBinChart(canvasId, binData[bin], bin, globalMax);
+    });
+}
+
+// Fetch data and render charts
+async function loadQC2Data() {
+    try {
+        const response = await fetch(`${QC2_API_BASE}/qc2_data`);
+        if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.detail || `HTTP ${response.status}`);
+        }
+        const data = await response.json();
+
+        // Hide loading, show sections
+        document.getElementById('qc-loading').style.display = 'none';
+        document.getElementById('section-motif').style.display = 'block';
+        document.getElementById('section-chrom').style.display = 'block';
+        document.getElementById('section-center-motif').style.display = 'block';
+        document.getElementById('section-center-chrom').style.display = 'block';
+
+        // Create per-sample charts
+        createChartsForSection('motif-charts-row', data.by_motif || [], MOTIF_BINS);
+        createChartsForSection('chrom-charts-row', data.by_chrom || [], CHROM_BINS);
+
+        // Create center-aggregated charts
+        createCenterChartsForSection('center-motif-charts-row', data.by_center_motif || [], MOTIF_BINS);
+        createCenterChartsForSection('center-chrom-charts-row', data.by_center_chrom || [], CHROM_BINS);
+
+    } catch (err) {
+        console.error('QC2 load error:', err);
+        document.getElementById('qc-loading').style.display = 'none';
+        document.getElementById('qc-error').style.display = 'block';
+        document.getElementById('qc-error').textContent = 'Failed to load QC2 data: ' + err.message;
+    }
+}
+
+
+// Initialize on page load
+document.addEventListener('DOMContentLoaded', function() {
+    loadQC2Data();
+});
+</script>
+
+</body>
+</html>

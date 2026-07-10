@@ -1,0 +1,460 @@
+<head>
+<title>TR Outlier Analysis</title>
+<link rel="stylesheet" type="text/css"
+      href="https://cdnjs.cloudflare.com/ajax/libs/semantic-ui/2.5.0/semantic.min.css">
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/semantic-ui/2.5.0/semantic.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+/* === Page Layout === */
+body {
+    padding: 0; margin: 0;
+    font-family: Lato, "Helvetica Neue", Arial, Helvetica, sans-serif;
+    width: 100%;
+}
+
+/* === Header Bar === */
+#header-stripe {
+    background-color: #1b1c1d;
+    color: white;
+    padding: 15px 0;
+}
+#header-stripe .ui.grid {
+    margin-top: 0; margin-bottom: 0;
+}
+#header-stripe .ui.grid > .column {
+    padding-top: 0; padding-bottom: 0;
+}
+#header-stripe {
+    position: relative;
+}
+#header-stripe .header-inner {
+    display: flex;
+    align-items: center;
+}
+#header-title {
+    font-size: 20px;
+    font-weight: 700;
+    color: white;
+}
+
+/* === Filter Panel === */
+#filter-panel {
+    background: #f9fafb;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 20px;
+    margin-bottom: 20px;
+    margin-top: 20px;
+}
+#filter-panel .field { margin-bottom: 12px; }
+#filter-panel label { font-weight: 700; font-size: 0.93em; }
+
+.radio-group {
+    display: flex; gap: 15px; flex-wrap: wrap; align-items: center;
+}
+.radio-group .ui.radio.checkbox { margin-right: 5px; }
+
+.checkbox-group {
+    display: flex; gap: 18px; flex-wrap: wrap;
+}
+.checkbox-group .ui.checkbox { padding-right: 5px; }
+
+/* Multi-key sort: draggable priority pills */
+.sort-by-control {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px;
+}
+.sort-pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; min-height: 24px; }
+.sort-pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: #2185d0; color: #fff; border-radius: 4px;
+    padding: 3px 8px; font-size: 0.85em; cursor: grab; user-select: none;
+}
+.sort-pill.drag-over { outline: 2px dashed #1b6fb3; outline-offset: 1px; }
+.sort-pill .pill-order { opacity: 0.7; font-weight: 700; }
+.sort-pill .pill-remove { cursor: pointer; opacity: 0.8; font-weight: 700; }
+.sort-pill .pill-remove:hover { opacity: 1; }
+.sort-pills-empty { color: #999; font-size: 0.85em; font-style: italic; }
+
+/* === Results Table === */
+#results-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 1.0em;
+    table-layout: fixed;
+}
+#results-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #f9fafb;
+    border-bottom: 2px solid #ddd;
+    padding: 6px 8px;
+    text-align: left;
+    font-weight: 600;
+    font-size: 0.95em;
+    color: #555;
+    user-select: none;
+    white-space: nowrap;
+}
+/* Only columns with a data-sort attribute are actually sortable (the click handler
+   binds to th[data-sort]), so scope the clickable affordance to those headers. */
+#results-table thead th[data-sort] { cursor: pointer; }
+#results-table thead th[data-sort]:hover { color: #000; }
+#results-table thead th .sort-icon { color: #bbb; margin-left: 3px; font-size: 0.8em; }
+#results-table thead th.sorted-asc .sort-icon,
+#results-table thead th.sorted-desc .sort-icon { color: #333; }
+
+/* Right-align numeric columns */
+#results-table .col-numeric { text-align: right; }
+
+/* Column widths */
+#results-table .col-row-num   { width: 36px; text-align: center; color: #999; }
+#results-table .col-expand    { width: 28px; text-align: center; cursor: pointer; }
+#results-table .col-locus     { width: 200px; }
+#results-table .col-motif     { width: 110px; }
+#results-table .col-region    { width: 80px; }
+#results-table .col-gene      { width: 140px; }
+#results-table .col-allele    { width: 70px; }
+#results-table .col-delta-ref { width: 65px; }
+#results-table .col-delta-pop { width: 65px; }
+#results-table .col-aff-unsolved { width: 55px; }
+#results-table .col-inheritance  { width: 60px; }
+#results-table .col-gene-pheno   { width: 180px; }
+#results-table .col-pli       { width: 50px; }
+#results-table .col-sigma-hprc { width: 105px; }
+#results-table .col-sigma-aou  { width: 105px; }
+#results-table .col-gene-pheno-sim { width: 85px; }
+#results-table .col-pairwise-sim   { width: 95px; }
+
+/* Data rows */
+#results-table tbody tr.locus-row {
+    border-bottom: 1px solid #eee;
+}
+#results-table tbody tr.locus-row:hover {
+    background: #f8f9ff;
+}
+#results-table tbody td {
+    padding: 5px 8px;
+    vertical-align: top;
+    line-height: 1.4;
+}
+
+/* Multi-line cell sub-lines */
+.cell-main { font-weight: 600; }
+.cell-sub  { font-size: 0.9em; color: #888; }
+
+/* Expand/collapse chevron */
+.expand-toggle {
+    cursor: pointer;
+    color: #888;
+    display: inline-block;
+    user-select: none;
+}
+.expand-toggle .icon {
+    margin: 0;
+}
+
+/* Expanded detail row */
+#results-table tbody tr.locus-detail-row td {
+    padding: 10px 14px 10px 40px;
+    background: #fafafa;
+    border-bottom: 2px solid #ddd;
+}
+
+/* === Threshold markers inside detail expansion === */
+.threshold-marker {
+    border-top: 2px dashed;
+    padding: 2px 6px;
+    font-size: inherit;
+    font-style: italic;
+    margin: 2px 0;
+}
+.threshold-unaffected { border-color: #43a047; color: #2e8b39; }
+.threshold-population { border-color: #2196f3; color: #1565c0; }
+.threshold-pathogenic { border-color: #ef5350; color: #c62828; }
+
+/* === Gene Region Badges === */
+.badge {
+    display: inline-block; padding: 1px 5px;
+    border-radius: 2px; font-size: 0.8em;
+    font-weight: 600;
+}
+.badge-cds         { background: #fce4ec; color: #c62828; }
+.badge-promoter    { background: #e3f2fd; color: #1565c0; }
+.badge-utr         { background: #fff3e0; color: #e65100; }
+.badge-intron      { background: #f3e5f5; color: #6a1b9a; }
+.badge-exon        { background: #e8f5e9; color: #2e7d32; }
+.badge-intergenic  { background: #f5f5f5; color: #757575; }
+.badge-known-motif { background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; }
+.badge-known-locus {
+    background: #ffebee;
+    color: #b71c1c;
+    border: 1px solid #c62828;
+    cursor: pointer;
+}
+.badge-known-locus:hover {
+    background: #ffcdd2;
+}
+.badge-tag {
+    background: #e3f2fd; color: #1565c0;
+    border: 1px solid #90caf9; cursor: default; margin-right: 3px;
+}
+.modal-tag-badge {
+    display: inline-block;
+    background: #e3f2fd;
+    color: #1565c0;
+    border: 1px solid #90caf9;
+    padding: 4px 8px;
+    border-radius: 3px;
+    margin: 2px 4px 2px 0;
+    font-size: 0.9em;
+}
+.modal-tag-badge .delete-modal-tag {
+    cursor: pointer;
+    margin-left: 6px;
+    opacity: 0.6;
+    color: #c62828;
+}
+.modal-tag-badge .delete-modal-tag:hover {
+    opacity: 1;
+}
+.badge-system-tag {
+    background: #bbdefb;
+    color: #0d47a1;
+    border: 1px solid #1976d2;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-block;
+    padding: 1px 5px;
+    border-radius: 2px;
+    font-size: 0.8em;
+    font-weight: 600;
+    margin-right: 3px;
+}
+.badge-system-tag:hover {
+    background: #90caf9;
+    color: #0d47a1;
+}
+.badge-system-tag-pending {
+    background: #ff9800;
+    color: white;
+    cursor: default;
+    display: inline-block;
+    padding: 1px 5px;
+    border-radius: 2px;
+    font-size: 0.8em;
+    font-weight: 600;
+    margin-right: 3px;
+}
+.note-indicator { font-size: 0.85em; margin-left: 4px; cursor: pointer; }
+.note-indicator:hover { opacity: 0.7; }
+.annotation-section {
+    margin-bottom: 10px; padding: 8px 12px;
+    background: #f0f7ff; border-left: 4px solid #2185d0; border-radius: 3px;
+}
+
+/* === Motif truncation popup === */
+.motif-truncated { cursor: pointer; text-decoration: underline dotted #999; }
+.motif-popup {
+    position: absolute; z-index: 1000;
+    background: #fff; border: 1px solid #ccc; border-radius: 4px;
+    padding: 6px 10px; font-family: monospace; font-size: 0.88em;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15); max-width: 500px; word-break: break-all;
+}
+
+/* === Mendelian Warning Popup === */
+.mendelian-warning-icon {
+    color: #f9a825;
+    cursor: pointer;
+    margin-right: 5px;
+}
+.mendelian-warning-icon:hover {
+    color: #f57f17;
+}
+.mendelian-warning-popup {
+    position: absolute;
+    z-index: 1000;
+    background: #fff;
+    border: 2px solid #f9a825;
+    border-radius: 6px;
+    padding: 10px 14px;
+    box-shadow: 0 3px 12px rgba(0,0,0,0.2);
+    min-width: 280px;
+    max-width: 400px;
+    font-size: 0.9em;
+}
+.mendelian-warning-popup .popup-header {
+    font-weight: 700;
+    color: #f57f17;
+    margin-bottom: 8px;
+    font-size: 1.05em;
+}
+.mendelian-warning-popup .high-rate {
+    color: #c62828;
+    font-weight: 700;
+}
+.mendelian-warning-popup .motif-section {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #ddd;
+}
+.mendelian-warning-popup .motif-section-header {
+    font-weight: 600;
+    color: #666;
+    font-size: 0.9em;
+    margin-bottom: 4px;
+}
+.mendelian-warning-popup .motif-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px 12px;
+    font-size: 0.88em;
+}
+.mendelian-warning-popup .motif-grid .motif-item {
+    display: flex;
+    justify-content: space-between;
+}
+
+/* === Gene Info === */
+.gene-info { color: #333; font-size: 0.92em; }
+.gene-inheritance { color: #1565c0; font-weight: 600; }
+.gene-pli { color: #e65100; }
+.gene-phenotype { color: #555; font-style: italic; font-size: 0.9em; }
+
+/* === OMIM & Color-Coded Values === */
+.omim-line { color: #6a1b9a; font-size: 0.92em; }
+
+/* Invisible tables for vertical alignment */
+.invisible-table {
+    border-collapse: collapse;
+    border: none;
+    width: 100%;
+}
+.invisible-table td {
+    border: none;
+    padding: 1px 8px 1px 0;
+    vertical-align: top;
+}
+/* OMIM table columns */
+.omim-table .omim-linkage { white-space: nowrap; }
+.omim-table .omim-phenotype { }
+.omim-table .omim-mim { white-space: nowrap; }
+/* Affected Unsolved table columns */
+.affected-unsolved-table .aff-allele { white-space: nowrap; }
+.affected-unsolved-table .aff-sample { white-space: nowrap; }
+.affected-unsolved-table .aff-phenotype { }
+
+.val-high    { background: #ffcdd2; }
+.val-medium  { background: #fff9c4; }
+.val-neutral { background: transparent; }
+
+/* === Per-sample sub-table inside detail expansion === */
+.sample-subtable {
+    width: 100%;
+    font-family: inherit;
+    font-size: 0.95em;
+    border-collapse: collapse;
+    margin-top: 6px;
+}
+.sample-subtable thead th {
+    background: #f0f0f0;
+    font-size: 0.9em;
+    color: #666;
+    padding: 3px 6px;
+    text-align: left;
+    font-weight: 600;
+    position: static;
+}
+.sample-subtable tr { border-bottom: 1px solid #f0f0f0; }
+.sample-subtable td { padding: 2px 6px; white-space: nowrap; }
+
+/* Row coloring by affected/analysis status */
+.sample-affected-unsolved { color: #c62828; font-weight: 600; }
+.sample-affected-solved   { color: #b8860b; }
+.sample-unaffected        { color: #2e8b39; }
+.sample-unknown           { color: #78909c; }
+
+/* === Pagination === */
+.pagination-container {
+    margin-top: 1em;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 0;
+    gap: 1em;
+    flex-wrap: wrap;
+}
+.total-results {
+    color: #666; font-size: 1.1em;
+    white-space: nowrap; order: 1;
+}
+.export-selector {
+    display: flex; align-items: center; gap: 10px;
+    white-space: nowrap; order: 2;
+}
+.export-selector .export-label {
+    color: #666;
+}
+.page-size-selector {
+    display: flex; align-items: center; gap: 10px;
+    color: #666; font-size: 1em;
+    white-space: nowrap; order: 3;
+}
+.pagination-controls {
+    display: flex; align-items: center; gap: 8px;
+    white-space: nowrap; order: 4;
+}
+.pagination-controls .ui.button {
+    padding: 8px; min-width: 36px;
+    background: white; border: 1px solid #ddd; box-shadow: none;
+}
+.pagination-controls .ui.button:hover { background: #f8f8f8; }
+.pagination-controls .ui.button.disabled { opacity: 0.5; }
+.page-input {
+    width: 55px; text-align: center;
+    border: 1px solid #ddd; border-radius: 4px;
+    padding: 6px 4px; font-size: 0.9em;
+}
+
+/* === Loading & Error === */
+.loading-indicator {
+    display: flex; align-items: center;
+    color: #888; font-size: 1.1em; font-weight: 300;
+}
+.loading-indicator .ui.loader { margin: 0; margin-right: 20px; }
+#results-container.loading { opacity: 0.6; pointer-events: none; }
+
+/* Summary Charts */
+#summary-charts-container {
+    background: #f9fafb;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 20px;
+    margin-top: 20px;
+}
+#summary-charts-container .column {
+    padding: 10px 20px;
+}
+
+</style>
+
+</head>
+<body>
+
+<div id="header-stripe">
+    <div class="ui grid" style="margin: 0;">
+        <div class="one wide column"></div>
+        <div class="fourteen wide column">
+            <div class="header-inner">
+                <a id="header-title" href="/" style="color: white; text-decoration: none;">TR Outlier Analysis:</a>
+                <a href="/" style="color: #7fbaff; font-size: 1.05em; margin-left: 43px; text-decoration: none;">Home</a>
+                <a href="/swim" style="color: #7fbaff; font-size: 1.05em; margin-left: 31px; text-decoration: none;">Swim Plot</a>
+                <a href="/sample_qc" style="color: #7fbaff; font-size: 1.05em; margin-left: 31px; text-decoration: none;">Sample QC1,</a>
+                <a href="/qc2" style="color: #7fbaff; font-size: 1.05em; margin-left: 5px; text-decoration: none;">QC2</a>
+            </div>
+        </div>
+        <div class="one wide column"></div>
+    </div>
+</div>

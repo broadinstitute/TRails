@@ -1,0 +1,290 @@
+<script>
+// =========================================================================
+// Shared QC helpers used by sample_qc_template.html, qc2_template.html, and
+// swim_plot_template.html. Kept in one place so fixes to the box-plot stats /
+// Mendelian-warning popup can't drift between the pages. (escapeHtml, renderMendelianWarning, computeBoxStats,
+// computePercentile, singleBinBoxPlotPlugin, and the Mendelian-warning popup handler.)
+// Page-specific pieces (MOTIF_BINS, MENDELIAN_WARNINGS, chart-building) stay in each page.
+// Requires Chart.js + jQuery (loaded by header_template.html) and the page-level
+// MENDELIAN_WARNINGS const (referenced only at call time).
+// =========================================================================
+
+// HTML escaping helper
+function escapeHtml(str) {
+    if (str == null) return '';
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+// Helper function to render warning icon if sample has warnings.
+// Mendelian-violation warnings are source-independent; outlier (99th-percentile) warnings are
+// per-source, so the outlier part is only included for the page's currently-selected `source`
+// (pass no source to show only the source-independent Mendelian part).
+function renderMendelianWarning(sampleId, source) {
+    if (!sampleId) return '';
+    const mendelian = MENDELIAN_WARNINGS[sampleId];
+    const outlierMap = (source && typeof OUTLIER_WARNINGS_BY_SOURCE !== 'undefined')
+        ? OUTLIER_WARNINGS_BY_SOURCE[source] : null;
+    const outlier = outlierMap ? outlierMap[sampleId] : undefined;
+    if (!mendelian && !outlier) return '';
+    const w = Object.assign({}, mendelian || {}, outlier || {});
+    // Determine tooltip text based on warning types
+    const hasMendelian = w.autosome_rate !== undefined;
+    const hasOutlier = w.outlier_bins !== undefined;
+    let tooltip = '';
+    if (hasMendelian && hasOutlier) {
+        tooltip = 'High Mendelian violation rate; TR outlier';
+    } else if (hasMendelian) {
+        tooltip = 'High Mendelian violation rate';
+    } else if (hasOutlier) {
+        tooltip = '99th percentile TR outlier';
+    }
+    return `<i class="warning sign icon mendelian-warning-icon"
+               title="${tooltip}"
+               data-warning='${JSON.stringify(w).replace(/'/g, "&apos;")}'
+               data-sample-id="${sampleId}"></i>`;
+}
+
+// Compute box plot statistics for an array of values
+function computeBoxStats(values) {
+    if (!values || values.length === 0) {
+        return { min: null, q1: null, median: null, q3: null, max: null };
+    }
+    const sorted = values.slice().sort((a, b) => a - b);
+    const n = sorted.length;
+
+    const median = n % 2 === 0
+        ? (sorted[n / 2 - 1] + sorted[n / 2]) / 2
+        : sorted[Math.floor(n / 2)];
+
+    // Q1: median of lower half
+    const lowerHalf = sorted.slice(0, Math.floor(n / 2));
+    const q1 = lowerHalf.length > 0
+        ? (lowerHalf.length % 2 === 0
+            ? (lowerHalf[lowerHalf.length / 2 - 1] + lowerHalf[lowerHalf.length / 2]) / 2
+            : lowerHalf[Math.floor(lowerHalf.length / 2)])
+        : median;
+
+    // Q3: median of upper half
+    const upperHalf = sorted.slice(Math.ceil(n / 2));
+    const q3 = upperHalf.length > 0
+        ? (upperHalf.length % 2 === 0
+            ? (upperHalf[upperHalf.length / 2 - 1] + upperHalf[upperHalf.length / 2]) / 2
+            : upperHalf[Math.floor(upperHalf.length / 2)])
+        : median;
+
+    // Whiskers: 1.5 * IQR
+    const iqr = q3 - q1;
+    const whiskerLow = q1 - 1.5 * iqr;
+    const whiskerHigh = q3 + 1.5 * iqr;
+
+    // Actual whisker values are min/max within the whisker bounds. Use ?? (not
+    // ||) for the fallback so a legitimate whisker value of 0 is not treated as
+    // missing (|| would discard it and draw the whisker at the array boundary).
+    const minVal = sorted.find(v => v >= whiskerLow) ?? sorted[0];
+    const maxVal = sorted.slice().reverse().find(v => v <= whiskerHigh) ?? sorted[n - 1];
+
+    return { min: minVal, q1: q1, median: median, q3: q3, max: maxVal };
+}
+
+// Compute percentile value from sorted array
+function computePercentile(sortedValues, percentile) {
+    if (!sortedValues || sortedValues.length === 0) return null;
+    const index = (percentile / 100) * (sortedValues.length - 1);
+    const lower = Math.floor(index);
+    const upper = Math.ceil(index);
+    if (lower === upper) return sortedValues[lower];
+    return sortedValues[lower] + (sortedValues[upper] - sortedValues[lower]) * (index - lower);
+}
+
+// Custom plugin to draw box plot for a single bin (centered at x=0)
+const singleBinBoxPlotPlugin = {
+    id: 'singleBinBoxPlotDrawer',
+    afterDatasetsDraw: function(chart) {
+        const ctx = chart.ctx;
+        const stats = chart.config._boxStats;
+        if (!stats || stats.median === null) return;
+
+        const xScale = chart.scales.x;
+        const yScale = chart.scales.y;
+        const boxWidth = 40;
+        const chartArea = chart.chartArea;
+
+        ctx.save();
+
+        // Draw percentile lines first (behind box plot)
+        const percentiles = chart.config._percentiles;
+        if (percentiles) {
+            const lineConfigs = [
+                { value: percentiles.p95, color: '#f9a825', label: '95%' },  // Yellow
+                { value: percentiles.p99, color: '#c62828', label: '99%' }   // Red
+            ];
+
+            ctx.setLineDash([4, 4]);
+            ctx.lineWidth = 1.5;
+
+            lineConfigs.forEach(config => {
+                if (config.value != null) {
+                    const yPixel = yScale.getPixelForValue(config.value);
+                    ctx.strokeStyle = config.color;
+                    ctx.beginPath();
+                    ctx.moveTo(chartArea.left, yPixel);
+                    ctx.lineTo(chartArea.right, yPixel);
+                    ctx.stroke();
+
+                    // Draw label on right side
+                    ctx.fillStyle = config.color;
+                    ctx.font = '9px sans-serif';
+                    ctx.textAlign = 'left';
+                    ctx.fillText(config.label, chartArea.right + 2, yPixel + 3);
+                }
+            });
+
+            ctx.setLineDash([]);
+        }
+
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.fillStyle = 'rgba(200, 200, 200, 0.4)';
+
+        const x = xScale.getPixelForValue(0);
+        const yMin = yScale.getPixelForValue(stats.min);
+        const yQ1 = yScale.getPixelForValue(stats.q1);
+        const yMedian = yScale.getPixelForValue(stats.median);
+        const yQ3 = yScale.getPixelForValue(stats.q3);
+        const yMax = yScale.getPixelForValue(stats.max);
+
+        // Draw box (Q1 to Q3)
+        ctx.fillRect(x - boxWidth / 2, yQ3, boxWidth, yQ1 - yQ3);
+        ctx.strokeRect(x - boxWidth / 2, yQ3, boxWidth, yQ1 - yQ3);
+
+        // Draw median line
+        ctx.beginPath();
+        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.8)';
+        ctx.moveTo(x - boxWidth / 2, yMedian);
+        ctx.lineTo(x + boxWidth / 2, yMedian);
+        ctx.stroke();
+
+        // Draw whiskers
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
+
+        // Lower whisker
+        ctx.beginPath();
+        ctx.moveTo(x, yQ1);
+        ctx.lineTo(x, yMin);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x - boxWidth / 4, yMin);
+        ctx.lineTo(x + boxWidth / 4, yMin);
+        ctx.stroke();
+
+        // Upper whisker
+        ctx.beginPath();
+        ctx.moveTo(x, yQ3);
+        ctx.lineTo(x, yMax);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x - boxWidth / 4, yMax);
+        ctx.lineTo(x + boxWidth / 4, yMax);
+        ctx.stroke();
+
+        ctx.restore();
+    }
+};
+
+Chart.register(singleBinBoxPlotPlugin);
+
+// Warning icon click handler — show violation rates and/or outlier info popup
+document.addEventListener('click', function(e) {
+    const icon = e.target.closest('.mendelian-warning-icon');
+    if (!icon) {
+        // Click outside the icon - close the popup, unless the click was inside the popup
+        // itself (so the user can select / highlight / copy its contents).
+        if (e.target.closest('.mendelian-warning-popup')) return;
+        const existingPopup = document.querySelector('.mendelian-warning-popup');
+        if (existingPopup) existingPopup.remove();
+        return;
+    }
+
+    e.stopPropagation();
+    const sampleId = icon.dataset.sampleId;
+    let warning;
+    try {
+        warning = JSON.parse(icon.dataset.warning);
+    } catch (err) {
+        return;
+    }
+    if (!warning) return;
+
+    // Remove any existing popup
+    const existingPopup = document.querySelector('.mendelian-warning-popup');
+    if (existingPopup) existingPopup.remove();
+
+    // Format percentage with color coding
+    const formatRate = (rate, threshold = 0.10) => {
+        const pct = (rate * 100).toFixed(1) + '%';
+        return rate > threshold ? `<span class="high-rate">${pct}</span>` : pct;
+    };
+
+    // Determine warning types
+    const hasMendelian = warning.autosome_rate !== undefined;
+    const hasOutlier = warning.outlier_bins !== undefined;
+
+    // Build popup HTML
+    let html = '<div class="mendelian-warning-popup">';
+    html += `<div style="font-size: 0.9em; color: #666; margin-bottom: 6px;">Sample: <b>${escapeHtml(sampleId)}</b></div>`;
+
+    // Mendelian violation section
+    if (hasMendelian) {
+        html += `<div class="popup-header">⚠️ High Mendelian Violation Rate</div>`;
+        html += '<table class="invisible-table">';
+        html += `<tr><td style="font-weight:600;color:#555;">Autosome</td><td style="text-align:right;">${formatRate(warning.autosome_rate)}</td><td style="color:#888;">(${warning.autosome_violations.toLocaleString()} / ${warning.autosome_total.toLocaleString()})</td></tr>`;
+        html += `<tr><td style="font-weight:600;color:#555;">chrX</td><td style="text-align:right;">${formatRate(warning.chrX_rate)}</td><td style="color:#888;">(${warning.chrX_violations.toLocaleString()} / ${warning.chrX_total.toLocaleString()})</td></tr>`;
+        html += `<tr><td style="font-weight:600;color:#555;">chrY</td><td style="text-align:right;">${formatRate(warning.chrY_rate, 1.0)}</td><td style="color:#888;">(${warning.chrY_violations.toLocaleString()} / ${warning.chrY_total.toLocaleString()})</td></tr>`;
+        html += '</table>';
+
+        // Motif size breakdown for Mendelian
+        if (warning.motif_rates && Object.keys(warning.motif_rates).length > 0) {
+            html += '<div class="motif-section">';
+            html += '<div class="motif-section-header">By Motif Size</div>';
+            html += '<div class="motif-grid">';
+            const motifLabels = {
+                '1bp': '1bp', '2bp': '2bp', '3bp': '3bp', '4bp': '4bp',
+                '5bp': '5bp', '6bp': '6bp', '7_24bp': '7-24bp', '25plusbp': '25+bp'
+            };
+            for (const [cat, data] of Object.entries(warning.motif_rates)) {
+                const label = motifLabels[cat] || cat;
+                html += `<div class="motif-item"><span>${label}:</span><span>${formatRate(data.rate, 1.0)}</span></div>`;
+            }
+            html += '</div></div>';
+        }
+    }
+
+    // Outlier section
+    if (hasOutlier) {
+        if (hasMendelian) html += '<hr style="margin: 10px 0; border: none; border-top: 1px solid #ddd;">';
+        html += `<div class="popup-header">⚠️ 99th Percentile TR Outlier</div>`;
+        html += '<table class="invisible-table">';
+        html += '<tr><th style="font-weight:600;color:#555;">Bin</th><th style="text-align:right;font-weight:600;color:#555;padding-right:8px;">Count</th><th style="text-align:left;color:#888;">Threshold</th></tr>';
+        const binOrder = ['1bp', '2bp', '3-6bp', '7-24bp', '25+bp'];
+        for (const bin of binOrder) {
+            if (warning.outlier_bins[bin]) {
+                const data = warning.outlier_bins[bin];
+                html += `<tr><td style="font-weight:600;color:#555;">${bin}</td><td style="text-align:right;padding-right:8px;"><span class="high-rate">${data.count}</span></td><td style="text-align:left;color:#888;">&ge; ${data.threshold}</td></tr>`;
+            }
+        }
+        html += '</table>';
+    }
+    html += '</div>';
+
+    const popup = document.createElement('div');
+    popup.innerHTML = html;
+    const popupEl = popup.firstChild;
+    document.body.appendChild(popupEl);
+    const rect = icon.getBoundingClientRect();
+    popupEl.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+    popupEl.style.left = (rect.left + window.scrollX) + 'px';
+});
+</script>

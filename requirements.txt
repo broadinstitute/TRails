@@ -1,0 +1,11 @@
+# TRails runtime dependencies. TRails is standalone — it does not depend on any external
+# package for small pieces of functionality (e.g. canonical-motif / locus-id parsing are
+# reimplemented in motif_utilities.py rather than pulled from str-analysis).
+flask            # the local results server
+pandas           # TSV I/O + SQLite writing convenience
+numpy            # numeric helpers used by the analysis columns
+tqdm             # progress bars (degrades gracefully if absent)
+msgpack          # the server's startup cache
+intervaltree     # interval-overlap lookups for known-disease-locus matching
+pyhpo            # HPO semantic similarity for phenotype scoring (optional; Jaccard fallback if absent)
+requests         # public (class-A) reference fetch
