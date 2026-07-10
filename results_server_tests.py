@@ -192,6 +192,32 @@ class ResultsServerTests(unittest.TestCase):
         body = response.get_data(as_text=True)
         self.assertIn("chr1\t100\t110\tchr1-100-110-AT", body)
 
+    def test_export_json_nested_metadata_and_samples(self):
+        response = self.client.get("/api/v1/export?outlier_type=all&format=json&min_pli=0.5")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(set(data.keys()), {"metadata", "loci"})
+        self.assertEqual(data["metadata"]["outlier_type"], "all")
+        self.assertEqual(data["metadata"]["total_loci"], 1)
+        self.assertEqual(data["metadata"]["filters_applied"], {"min_pli": 0.5})
+        self.assertNotIn("outlier_type", data["metadata"]["filters_applied"])
+
+        self.assertEqual(len(data["loci"]), 1)
+        locus = data["loci"][0]
+        self.assertEqual(locus["LocusId"], "chr1-100-110-AT")
+        # Every qualifying outlier sample must appear, not just the first one —
+        # this is the whole point of the nested Samples list over the old flat
+        # First/Second/ThirdAffected* columns.
+        sample_ids = {s["Sample ID"] for s in locus["Samples"]["AllAlleleOutliers"]}
+        self.assertEqual(sample_ids, {"sampleA", "sampleB"})
+
+    def test_export_json_empty_result_is_well_formed(self):
+        response = self.client.get("/api/v1/export?outlier_type=all&format=json&gene_id=NO_SUCH_GENE")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["metadata"]["total_loci"], 0)
+        self.assertEqual(data["loci"], [])
+
     def test_sample_qc_data(self):
         response = self.client.get("/api/v1/sample_qc_data")
         self.assertEqual(response.status_code, 200)

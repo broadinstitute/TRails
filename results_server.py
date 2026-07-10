@@ -102,8 +102,6 @@ VALID_SORTS = (
     "region", "size", "count", "family_count",
     "pairwise_similarity", "gene_phenotype",
     "sigma_hprc_rank", "sigma_aou_rank",
-    "aou_phase2_highcov_lps_stdev_pct", "aou_phase2_midcov_lps_stdev_pct",
-    "aou_phase2_highcov_methyl_stdev_pct", "aou_phase2_midcov_methyl_stdev_pct",
 )
 
 REQUIRED_TABLE = "loci"
@@ -136,12 +134,6 @@ LIST_COLUMNS_STATIC = [
     "TenK10K_MaxAllele", "TenK10K_99thPercentile",
     "TRExplorerSource", "TRExplorerReferenceRepeatPurity",
     "NonCodingAnnotations",
-    "AoUPhase2HighCov_N", "AoUPhase2HighCov_99thPercentile",
-    "AoUPhase2HighCov_MaxAllele", "AoUPhase2HighCov_LPS_StdPercentile",
-    "AoUPhase2HighCov_Methyl_N", "AoUPhase2HighCov_Methyl_Median", "AoUPhase2HighCov_Methyl_StdPercentile",
-    "AoUPhase2MidCov_N", "AoUPhase2MidCov_99thPercentile",
-    "AoUPhase2MidCov_MaxAllele", "AoUPhase2MidCov_LPS_StdPercentile",
-    "AoUPhase2MidCov_Methyl_N", "AoUPhase2MidCov_Methyl_Median", "AoUPhase2MidCov_Methyl_StdPercentile",
 ]
 
 # Outlier-type-specific columns (the _{ot} suffix is stripped in the response).
@@ -857,10 +849,6 @@ def build_api_order_by(params):
         "gene_phenotype": (f"MaxGenePhenoSim_{ot}", "DESC"),
         "sigma_hprc_rank": ("HPRC256_StdevPercentile", "ASC NULLS LAST"),
         "sigma_aou_rank": ("AoU1027_StdevPercentile", "ASC NULLS LAST"),
-        "aou_phase2_highcov_lps_stdev_pct": ("AoUPhase2HighCov_LPS_StdPercentile", "DESC"),
-        "aou_phase2_midcov_lps_stdev_pct": ("AoUPhase2MidCov_LPS_StdPercentile", "DESC"),
-        "aou_phase2_highcov_methyl_stdev_pct": ("AoUPhase2HighCov_Methyl_StdPercentile", "DESC"),
-        "aou_phase2_midcov_methyl_stdev_pct": ("AoUPhase2MidCov_Methyl_StdPercentile", "DESC"),
     }
 
     sequence = list(sort_list)
@@ -914,7 +902,7 @@ def build_api_query(params):
     if "require_above_population" in params:
         include_without_data = params.get("include_loci_without_population_data", False)
         m = "MaxAllele" if params.get("population_metric") == "max" else "99thPercentile"
-        pop_datasets = (["HPRC256", "AoU1027", "AoUPhase2HighCov", "AoUPhase2MidCov"]
+        pop_datasets = (["HPRC256", "AoU1027"]
                         if params["require_above_population"] == "long-read" else ["TenK10K"])
         present = [d for d in pop_datasets if f"{d}_{m}" in source_columns]
         above_terms = [f"(loci.{d}_{m} IS NULL OR loci.FirstAffectedAlleleSize_{ot} > loci.{d}_{m})"
@@ -1180,8 +1168,15 @@ def parse_outlier_samples(outlier_string, sample_lookup, affected_lookup, analys
     return results
 
 
-def build_sample_details(row_dict, raw_row, conn, lookups):
+def build_sample_details(row_dict, raw_row, conn, lookups, phenotype_scores=None):
     """Build sample details for outliers exceeding the population 99th percentile.
+
+    Args:
+        phenotype_scores: Optional pre-fetched {'per_outlier': ..., 'per_locus': ...}
+            dict for this locus (see fetch_all_phenotype_scores) — avoids one
+            fetch_phenotype_scores() DB round trip per call when the caller already
+            bulk-loaded scores for the whole result set. Falls back to fetching
+            per-locus from conn when not supplied.
 
     Returns:
         dict with AllAlleleOutliers / ShortAlleleOutliers / HemizygousOutliers keys
@@ -1190,12 +1185,12 @@ def build_sample_details(row_dict, raw_row, conn, lookups):
     pop_max = max(
         row_dict.get("HPRC256_99thPercentile") or 0,
         row_dict.get("AoU1027_99thPercentile") or 0,
-        row_dict.get("AoUPhase2HighCov_99thPercentile") or 0,
-        row_dict.get("AoUPhase2MidCov_99thPercentile") or 0,
     )
 
     locus_id = row_dict.get("LocusId", "")
-    per_outlier_scores = fetch_phenotype_scores(conn, locus_id).get("per_outlier", {}) if conn else {}
+    if phenotype_scores is None:
+        phenotype_scores = fetch_phenotype_scores(conn, locus_id) if conn else {}
+    per_outlier_scores = phenotype_scores.get("per_outlier", {})
 
     outlier_configs = [
         ("OutlierSampleIds_AllAlleles", "AllAlleleOutliers", "AllAlleles"),
@@ -1220,11 +1215,14 @@ def build_sample_details(row_dict, raw_row, conn, lookups):
                     "Allele": sample["allele_size"],
                     "Motif": motif,
                     "Sex": sample.get("sex") or "",
+                    "Ancestry": sample.get("ancestry") or "",
                     "Sample ID": sample["sample_id"],
                     "Family": sample.get("family_id") or "",
                     "Status": sample.get("affected_status") or "",
                     "Analysis": sample.get("analysis_status") or "",
                     "Phenotype": sample.get("phenotype_description") or "",
+                    "Purity": sample.get("purity"),
+                    "Methylation": sample.get("methylation"),
                     "Gene-Pheno Sim": score_data.get("gene_phenotype_similarity"),
                     "Pairwise Sim": score_data.get("pairwise_similarity_to_next"),
                 })
@@ -1394,6 +1392,83 @@ def fetch_phenotype_scores(conn, locus_id):
                     score_dict[k] = None
             result["per_locus"][row[0]] = score_dict
     return result
+
+
+def fetch_all_phenotype_scores(conn):
+    """Bulk-load phenotype scores for every locus in one pass.
+
+    Same per-locus output shape as fetch_phenotype_scores(), but issues two queries
+    total instead of one query per locus. Used by exports that enrich every row with
+    per-sample details, where calling fetch_phenotype_scores() per row would mean N
+    SQL round trips for an N-locus export — the per_outlier/per_locus_phenotype_scores
+    tables are small enough (low hundreds of thousands of rows) to hold in memory in
+    full for the lifetime of one export request.
+
+    Returns:
+        dict mapping locus_id to the same {'per_outlier': ..., 'per_locus': ...}
+        structure fetch_phenotype_scores() returns for a single locus.
+    """
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    if "per_outlier_phenotype_scores" not in tables:
+        return {}
+
+    results = collections.defaultdict(lambda: {"per_outlier": {}, "per_locus": {}})
+
+    rows = conn.execute(
+        """SELECT locus_id, sample_id, outlier_type, allele_size, gene_symbol,
+                  gene_phenotype_similarity, gene_phenotype_overlap_count,
+                  n_matching_diseases, best_matching_disease, best_disease_inheritance,
+                  pairwise_similarity_to_next, pairwise_shared_count_raw,
+                  pairwise_shared_count_ic, next_sample_id
+           FROM per_outlier_phenotype_scores
+           ORDER BY locus_id, outlier_type, allele_size DESC"""
+    ).fetchall()
+    for row in rows:
+        locus_id, outlier_type = row[0], row[2]
+        score_dict = {
+            "sample_id": row[1],
+            "allele_size": row[3],
+            "gene_symbol": row[4],
+            "gene_phenotype_similarity": row[5],
+            "gene_phenotype_overlap_count": row[6],
+            "n_matching_diseases": row[7],
+            "best_matching_disease": row[8],
+            "best_disease_inheritance": row[9],
+            "pairwise_similarity_to_next": row[10],
+            "pairwise_shared_count_raw": row[11],
+            "pairwise_shared_count_ic": row[12],
+            "next_sample_id": row[13],
+        }
+        for k, v in score_dict.items():
+            if isinstance(v, float) and v != v:
+                score_dict[k] = None
+        results[locus_id]["per_outlier"].setdefault(outlier_type, []).append(score_dict)
+
+    if "per_locus_phenotype_scores" in tables:
+        rows = conn.execute(
+            """SELECT locus_id, outlier_type, num_qualifying_samples, sum_pairwise_similarity,
+                      sum_pairwise_shared_raw, sum_pairwise_shared_ic,
+                      max_gene_phenotype_similarity, qualifying_sample_ids
+               FROM per_locus_phenotype_scores"""
+        ).fetchall()
+        for row in rows:
+            locus_id, outlier_type = row[0], row[1]
+            score_dict = {
+                "num_qualifying_samples": row[2],
+                "sum_pairwise_similarity": row[3],
+                "sum_pairwise_shared_raw": row[4],
+                "sum_pairwise_shared_ic": row[5],
+                "max_gene_phenotype_similarity": row[6],
+                "qualifying_sample_ids": row[7],
+            }
+            for k, v in score_dict.items():
+                if isinstance(v, float) and v != v:
+                    score_dict[k] = None
+            results[locus_id]["per_locus"][outlier_type] = score_dict
+
+    return dict(results)
 
 
 def row_to_full_dict(row):
@@ -1648,14 +1723,22 @@ def export_tsv(conn, query, sql_params, ot, params):
 
 
 def export_json(conn, query, count_query, sql_params, ot, params):
-    """JSON format: array of objects. Enriches with Samples when <=200 results, else streams."""
-    tags_dict = app.config["ANNOTATIONS"]["tags"]
+    """JSON format: {"metadata": {...}, "loci": [...]}.
 
-    def to_dict(row):
-        row_dict = row_to_list_dict(row, ot)
-        row_dict = {k: (None if isinstance(v, float) and (v != v) else v) for k, v in row_dict.items()}
-        row_dict["Tags"] = ",".join(tags_dict.get(row_dict.get("LocusId", ""), []))
-        return row_dict
+    Every locus is always enriched with a "Samples" key listing every qualifying
+    outlier sample (allele size, sample/family id, sex, ancestry, affected/analysis
+    status, phenotype, purity, methylation, and phenotype-similarity scores) —
+    regardless of result-set size. Phenotype scores are bulk-loaded once up front
+    (fetch_all_phenotype_scores) rather than per row, so this stays cheap even for
+    million-row exports. Rows still stream from the cursor so the full result set
+    is never materialized in memory.
+    """
+    tags_dict = app.config["ANNOTATIONS"]["tags"]
+    lookups = app.config["LOOKUPS"]
+
+    non_filter_keys = {"source", "outlier_type", "sort_by", "page", "page_size",
+                       "motif_size_clause", "motif_size_params"}
+    filters_applied = {k: v for k, v in params.items() if k not in non_filter_keys}
 
     try:
         total = conn.execute(count_query, sql_params).fetchone()[0]
@@ -1663,28 +1746,35 @@ def export_json(conn, query, count_query, sql_params, ot, params):
         conn.close()
         raise
 
-    if total <= 200:
-        try:
-            rows = conn.execute(query, sql_params).fetchall()
-            results = [to_dict(row) for row in rows]
-            lookups = app.config["LOOKUPS"]
-            for row_dict, raw_row in zip(results, rows):
-                sample_details = build_sample_details(row_dict, raw_row, conn, lookups)
-                if sample_details:
-                    row_dict["Samples"] = sample_details
-        finally:
-            conn.close()
-        return Response(json.dumps(results, indent=2), mimetype="application/json",
-                        headers={"Content-Disposition": f'attachment; filename="tr_outliers_{params["outlier_type"]}.json"'})
+    metadata = {
+        "source": app.config["DB_LABELS"][0],
+        "outlier_type": params["outlier_type"],
+        "sort_by": params.get("sort_by") or ["count"],
+        "filters_applied": filters_applied,
+        "total_loci": total,
+        "generated_at": datetime.now().isoformat(),
+    }
+
+    def to_dict(row):
+        row_dict = row_to_list_dict(row, ot)
+        row_dict = {k: (None if isinstance(v, float) and (v != v) else v) for k, v in row_dict.items()}
+        row_dict["Tags"] = ",".join(tags_dict.get(row_dict.get("LocusId", ""), []))
+        return row_dict
 
     def generate():
         try:
-            yield "[\n"
+            all_phenotype_scores = fetch_all_phenotype_scores(conn)
+            yield '{\n  "metadata": ' + json.dumps(metadata, indent=2).replace("\n", "\n  ") + ',\n  "loci": [\n'
             first = True
-            for row in conn.execute(query, sql_params):
-                yield ("" if first else ",\n") + json.dumps(to_dict(row), indent=2)
+            for raw_row in conn.execute(query, sql_params):
+                row_dict = to_dict(raw_row)
+                phenotype_scores = all_phenotype_scores.get(row_dict.get("LocusId", ""), {})
+                sample_details = build_sample_details(row_dict, raw_row, conn, lookups, phenotype_scores=phenotype_scores)
+                if sample_details:
+                    row_dict["Samples"] = sample_details
+                yield ("" if first else ",\n") + "    " + json.dumps(row_dict, indent=2).replace("\n", "\n    ")
                 first = False
-            yield "\n]"
+            yield "\n  ]\n}"
         finally:
             conn.close()
     return Response(generate(), mimetype="application/json",
@@ -1731,8 +1821,6 @@ def compute_plot_thresholds(row_dict, all_allele_outliers_str, short_allele_outl
         max_long_unaffected,
         row_dict.get("HPRC256_99thPercentile") or 0,
         row_dict.get("AoU1027_99thPercentile") or 0,
-        row_dict.get("AoUPhase2HighCov_99thPercentile") or 0,
-        row_dict.get("AoUPhase2MidCov_99thPercentile") or 0,
     )
     long_threshold = find_threshold(long_outliers, affected_lookup, long_comparison)
     short_threshold = find_threshold(short_outliers, affected_lookup, max_short_unaffected)
@@ -1857,7 +1945,7 @@ def get_locus_detail(locus_id):
     known_disease = compute_known_disease_info(row_dict, lookups)
 
     population_thresholds = {}
-    for cohort in ("HPRC256", "AoU1027", "TenK10K", "AoUPhase2HighCov", "AoUPhase2MidCov"):
+    for cohort in ("HPRC256", "AoU1027", "TenK10K"):
         for stat in ("MaxAllele", "99thPercentile", "90thPercentile", "Median", "Mode", "Stdev"):
             population_thresholds[f"{cohort}_{stat}"] = row_dict.get(f"{cohort}_{stat}")
 
@@ -1957,17 +2045,13 @@ def get_swim_plot_data():
         if include_loci_without_population_data:
             extra_clauses.append(f"""(
                 (HPRC256_{population_metric} IS NULL OR allele_size > HPRC256_{population_metric}) AND
-                (AoU1027_{population_metric} IS NULL OR allele_size > AoU1027_{population_metric}) AND
-                (AoUPhase2HighCov_{population_metric} IS NULL OR allele_size > AoUPhase2HighCov_{population_metric}) AND
-                (AoUPhase2MidCov_{population_metric} IS NULL OR allele_size > AoUPhase2MidCov_{population_metric})
+                (AoU1027_{population_metric} IS NULL OR allele_size > AoU1027_{population_metric})
             )""")
         else:
             extra_clauses.append(f"""(
-                (HPRC256_{population_metric} IS NOT NULL OR AoU1027_{population_metric} IS NOT NULL OR AoUPhase2HighCov_{population_metric} IS NOT NULL OR AoUPhase2MidCov_{population_metric} IS NOT NULL) AND
+                (HPRC256_{population_metric} IS NOT NULL OR AoU1027_{population_metric} IS NOT NULL) AND
                 (HPRC256_{population_metric} IS NULL OR allele_size > HPRC256_{population_metric}) AND
-                (AoU1027_{population_metric} IS NULL OR allele_size > AoU1027_{population_metric}) AND
-                (AoUPhase2HighCov_{population_metric} IS NULL OR allele_size > AoUPhase2HighCov_{population_metric}) AND
-                (AoUPhase2MidCov_{population_metric} IS NULL OR allele_size > AoUPhase2MidCov_{population_metric})
+                (AoU1027_{population_metric} IS NULL OR allele_size > AoU1027_{population_metric})
             )""")
     elif require_above_population == "short-read":
         if include_loci_without_population_data:
@@ -2352,7 +2436,7 @@ def get_schema():
             "require_above_population": {
                 "type": "enum",
                 "values": ["long-read", "short-read"],
-                "labels": {"long-read": "Long-read (HPRC256, AoU1027, AoU2High, AoU2Mid)", "short-read": "Short-read (TenK10K)"},
+                "labels": {"long-read": "Long-read (HPRC256, AoU1027)", "short-read": "Short-read (TenK10K)"},
             },
             "include_loci_without_population_data": {
                 "type": "boolean",
