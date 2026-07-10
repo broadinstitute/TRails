@@ -133,9 +133,7 @@ Extra columns (e.g. `age_of_onset`, `modifier`) are accepted and ignored.
 ### Optional licensed reference inputs  *(not bundled)*
 
 This improves annotation but is license-restricted, so TRails never downloads it; pass
-your own copy only if you are licensed. Absent → the dependent annotations (gene symbol,
-inheritance, pLI, disease-category and phenotype-summary columns, and gene-level phenotype
-scoring) are simply omitted.
+your own copy only if you have an OMIM API key. If absent, the dependent annotations will be omitted.
 
 | Input | Flag | Restriction |
 |-------|------|-------------|
