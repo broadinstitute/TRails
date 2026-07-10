@@ -22,6 +22,7 @@ import os
 import sqlite3
 import sys
 import traceback
+import zlib
 
 import msgpack
 import flask
@@ -95,6 +96,10 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 OUTLIER_TYPE_MAP = {"all": "AllAlleles", "short": "ShortAlleles", "hemi": "HemizygousAlleles"}
+
+# Labels for export filenames (build_export_filename). Kept in sync with the "labels" advertised
+# for outlier_type via /api/v1/schema ("Long Allele"/"Biallelic"/"Hemizygous").
+FILENAME_OUTLIER_TYPE_LABELS = {"all": "long_allele", "short": "biallelic", "hemi": "hemizygous"}
 
 # Valid sort_by values accepted by /api/v1/loci. Kept in sync with build_api_order_by's
 # SORT_MAPPING and advertised verbatim via /api/v1/schema.
@@ -1695,8 +1700,30 @@ def get_loci():
     })
 
 
-def export_bed(conn, query, sql_params, params):
+def gzip_stream(text_generator):
+    """Compress a text-yielding generator into gzip byte chunks, one chunk per yield."""
+    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    for chunk in text_generator:
+        compressed = compressor.compress(chunk.encode("utf-8"))
+        if compressed:
+            yield compressed
+    yield compressor.flush()
+
+
+def build_export_filename(outlier_type_key, total, ext):
+    """eg. tr_outliers.biallelic.33_loci.20260707_032555.json.gz"""
+    search_type = FILENAME_OUTLIER_TYPE_LABELS[outlier_type_key]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"tr_outliers.{search_type}.{total}_loci.{timestamp}.{ext}"
+
+
+def export_bed(conn, query, count_query, sql_params, params):
     """BED format: chrom, start, end, locus_id, motif, motif_size (no header). Streamed."""
+    try:
+        total = conn.execute(count_query, sql_params).fetchone()[0]
+    except Exception:
+        conn.close()
+        raise
     def generate():
         try:
             for row in conn.execute(query, sql_params):
@@ -1704,12 +1731,18 @@ def export_bed(conn, query, sql_params, params):
                 yield f"{r['Chrom']}\t{r['Start0Based']}\t{r['End1Based']}\t{r['LocusId']}\t{r['Motif']}\t{r['MotifSize']}\n"
         finally:
             conn.close()
+    filename = build_export_filename(params["outlier_type"], total, "bed")
     return Response(generate(), mimetype="text/tab-separated-values",
-                    headers={"Content-Disposition": f'attachment; filename="tr_outliers_{params["outlier_type"]}.bed"'})
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
-def export_tsv(conn, query, sql_params, ot, params):
-    """TSV format: all list columns with header. Streamed."""
+def export_tsv(conn, query, count_query, sql_params, ot, params):
+    """TSV format: all list columns with header. Streamed, gzip-compressed."""
+    try:
+        total = conn.execute(count_query, sql_params).fetchone()[0]
+    except Exception:
+        conn.close()
+        raise
     def generate():
         try:
             yield "\t".join(LIST_COLUMNS_STATIC + LIST_COLUMNS_OT_SPECIFIC) + "\n"
@@ -1718,8 +1751,9 @@ def export_tsv(conn, query, sql_params, ot, params):
                 yield "\t".join("" if v is None else str(v).replace("\t", " ").replace("\n", " ") for v in row_dict.values()) + "\n"
         finally:
             conn.close()
-    return Response(generate(), mimetype="text/tab-separated-values",
-                    headers={"Content-Disposition": f'attachment; filename="tr_outliers_{params["outlier_type"]}.tsv"'})
+    filename = build_export_filename(params["outlier_type"], total, "tsv.gz")
+    return Response(gzip_stream(generate()), mimetype="application/gzip",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 def export_json(conn, query, count_query, sql_params, ot, params):
@@ -1777,8 +1811,9 @@ def export_json(conn, query, count_query, sql_params, ot, params):
             yield "\n  ]\n}"
         finally:
             conn.close()
-    return Response(generate(), mimetype="application/json",
-                    headers={"Content-Disposition": f'attachment; filename="tr_outliers_{params["outlier_type"]}.json"'})
+    filename = build_export_filename(params["outlier_type"], total, "json.gz")
+    return Response(gzip_stream(generate()), mimetype="application/gzip",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 def compute_plot_thresholds(row_dict, all_allele_outliers_str, short_allele_outliers_str, affected_lookup):
@@ -1878,8 +1913,9 @@ def export_expansion_hunter(conn, query, count_query, sql_params, ot, params):
                     row_dict["Samples"] = sample_details
         finally:
             conn.close()
+        filename = build_export_filename(params["outlier_type"], total, "expansion_hunter.json")
         return Response(json.dumps(results, indent=2), mimetype="application/json",
-                        headers={"Content-Disposition": f'attachment; filename="tr_outliers_{params["outlier_type"]}.expansion_hunter.json"'})
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     def generate():
         try:
@@ -1891,8 +1927,9 @@ def export_expansion_hunter(conn, query, count_query, sql_params, ot, params):
             yield "\n]"
         finally:
             conn.close()
+    filename = build_export_filename(params["outlier_type"], total, "expansion_hunter.json")
     return Response(generate(), mimetype="application/json",
-                    headers={"Content-Disposition": f'attachment; filename="tr_outliers_{params["outlier_type"]}.expansion_hunter.json"'})
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.route("/api/v1/export")
@@ -1913,9 +1950,9 @@ def export_loci():
 
     conn = get_db()
     if format_param == "bed":
-        return export_bed(conn, base_query, sql_params, params)
+        return export_bed(conn, base_query, count_query, sql_params, params)
     if format_param == "tsv":
-        return export_tsv(conn, base_query, sql_params, ot, params)
+        return export_tsv(conn, base_query, count_query, sql_params, ot, params)
     if format_param == "json":
         return export_json(conn, base_query, count_query, sql_params, ot, params)
     return export_expansion_hunter(conn, base_query, count_query, sql_params, ot, params)

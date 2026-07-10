@@ -11,6 +11,8 @@ so no real TCP port is bound. They check that:
   * the kept pages/endpoints (schema, swim, export, qc) behave gracefully.
 """
 
+import gzip
+import json
 import os
 import sqlite3
 import tempfile
@@ -182,7 +184,8 @@ class ResultsServerTests(unittest.TestCase):
     def test_export_tsv(self):
         response = self.client.get("/api/v1/export?outlier_type=all&format=tsv")
         self.assertEqual(response.status_code, 200)
-        body = response.get_data(as_text=True)
+        self.assertIn(".tsv.gz", response.headers["Content-Disposition"])
+        body = gzip.decompress(response.get_data()).decode("utf-8")
         self.assertIn("LocusId", body.splitlines()[0])
         self.assertIn("chr1-100-110-AT", body)
 
@@ -195,7 +198,8 @@ class ResultsServerTests(unittest.TestCase):
     def test_export_json_nested_metadata_and_samples(self):
         response = self.client.get("/api/v1/export?outlier_type=all&format=json&min_pli=0.5")
         self.assertEqual(response.status_code, 200)
-        data = response.get_json()
+        self.assertIn(".json.gz", response.headers["Content-Disposition"])
+        data = json.loads(gzip.decompress(response.get_data()))
         self.assertEqual(set(data.keys()), {"metadata", "loci"})
         self.assertEqual(data["metadata"]["outlier_type"], "all")
         self.assertEqual(data["metadata"]["total_loci"], 1)
@@ -214,7 +218,7 @@ class ResultsServerTests(unittest.TestCase):
     def test_export_json_empty_result_is_well_formed(self):
         response = self.client.get("/api/v1/export?outlier_type=all&format=json&gene_id=NO_SUCH_GENE")
         self.assertEqual(response.status_code, 200)
-        data = response.get_json()
+        data = json.loads(gzip.decompress(response.get_data()))
         self.assertEqual(data["metadata"]["total_loci"], 0)
         self.assertEqual(data["loci"], [])
 
