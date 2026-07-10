@@ -176,9 +176,7 @@ def create_loci_indexes(connection, present_columns):
         "LocusId", "gene_id", "Chrom", "KnownDiseaseLocus", "gene_region",
         "gene_region_rank", "pLI", "Motif", "CanonicalMotif", "IsKnownMotif",
         "IsInMendelianGene", "NumRepeatsInReference", "HPRC256_StdevPercentile",
-        "AoU1027_StdevPercentile", "AoUPhase2HighCov_LPS_StdPercentile",
-        "AoUPhase2MidCov_LPS_StdPercentile", "AoUPhase2HighCov_Methyl_StdPercentile",
-        "AoUPhase2MidCov_Methyl_StdPercentile",
+        "AoU1027_StdevPercentile",
     ]:
         add_index(f"idx_loci_{column}", column)
 

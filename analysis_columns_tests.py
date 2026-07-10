@@ -108,8 +108,7 @@ class StatusTruthTableTests(unittest.TestCase):
 class PopulationThresholdTests(unittest.TestCase):
 
     def test_get_population_p99_threshold_max_of_present(self):
-        row = {"HPRC256_99thPercentile": 30, "AoU1027_99thPercentile": 45,
-               "AoUPhase2MidCov_99thPercentile": 40}
+        row = {"HPRC256_99thPercentile": 30, "AoU1027_99thPercentile": 45}
         self.assertEqual(get_population_p99_threshold(row), 45)
 
     def test_get_population_p99_threshold_none_when_absent(self):
@@ -368,8 +367,8 @@ class AddGeneColumnsTests(unittest.TestCase):
 class OutputColumnsTests(unittest.TestCase):
 
     def test_exact_count_and_uniqueness(self):
-        self.assertEqual(len(OUTPUT_COLUMNS), 143)
-        self.assertEqual(len(set(OUTPUT_COLUMNS)), 143)
+        self.assertEqual(len(OUTPUT_COLUMNS), 129)
+        self.assertEqual(len(set(OUTPUT_COLUMNS)), 129)
 
     def test_anchor_positions(self):
         # Spot-check load-bearing positions from the blueprint's numbered schema.
@@ -378,7 +377,7 @@ class OutputColumnsTests(unittest.TestCase):
         self.assertEqual(OUTPUT_COLUMNS[32], "pLI")  # col 33
         self.assertEqual(OUTPUT_COLUMNS[33], "inheritance")  # col 34
         self.assertEqual(OUTPUT_COLUMNS[34], "FirstAffectedAlleleSize_AllAlleles")  # col 35
-        self.assertEqual(OUTPUT_COLUMNS[142], "AoUPhase2MidCov_Methyl_StdPercentile")  # col 143
+        self.assertEqual(OUTPUT_COLUMNS[128], "VariationClusterSizeDiff")  # col 129
 
 
 if __name__ == "__main__":

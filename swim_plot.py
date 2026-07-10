@@ -49,13 +49,9 @@ SWIM_PLOT_LOCUS_COLUMNS = [
     "HPRC256_MaxAllele",
     "AoU1027_MaxAllele",
     "TenK10K_MaxAllele",
-    "AoUPhase2HighCov_MaxAllele",
-    "AoUPhase2MidCov_MaxAllele",
     "HPRC256_99thPercentile",
     "AoU1027_99thPercentile",
     "TenK10K_99thPercentile",
-    "AoUPhase2HighCov_99thPercentile",
-    "AoUPhase2MidCov_99thPercentile",
     "HPRC256_StdevPercentile",
     "AoU1027_StdevPercentile",
 ]

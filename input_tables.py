@@ -115,7 +115,7 @@ ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED = {normalize_column_name(name): name f
 # specific cohort/version tokens actually emitted upstream (not the bare cohort
 # abbreviation) so they can't swallow a genuine sample column whose id merely
 # starts with a cohort name (e.g. a sample named "AoU_0001").
-ANNOTATION_COLUMN_PREFIXES = ("hprc256", "aou1027", "aouphase2", "tenk10k", "trexplorer")
+ANNOTATION_COLUMN_PREFIXES = ("hprc256", "aou1027", "tenk10k", "trexplorer")
 
 
 def _coerce_annotation_value(value):

@@ -90,7 +90,7 @@
             </div>
             <div class="ui radio checkbox">
                 <input type="radio" name="require_above_population" value="long-read">
-                <label>Long-read (HPRC256, AoU1027, AoU2High, AoU2Mid)</label>
+                <label>Long-read (HPRC256, AoU1027)</label>
             </div>
             <div class="ui radio checkbox">
                 <input type="radio" name="require_above_population" value="short-read">
@@ -293,22 +293,6 @@
             <div class="ui checkbox">
                 <input type="checkbox" name="sort_by" value="sigma_aou_rank">
                 <label>σ<sub>AoU1027</sub> Rank</label>
-            </div>
-            <div class="ui checkbox">
-                <input type="checkbox" name="sort_by" value="aou_phase2_highcov_lps_stdev_pct">
-                <label>σ<sub>AoU2High</sub> Rank</label>
-            </div>
-            <div class="ui checkbox">
-                <input type="checkbox" name="sort_by" value="aou_phase2_midcov_lps_stdev_pct">
-                <label>σ<sub>AoU2Mid</sub> Rank</label>
-            </div>
-            <div class="ui checkbox">
-                <input type="checkbox" name="sort_by" value="aou_phase2_highcov_methyl_stdev_pct">
-                <label>Methyl σ<sub>AoU2High</sub> Rank</label>
-            </div>
-            <div class="ui checkbox">
-                <input type="checkbox" name="sort_by" value="aou_phase2_midcov_methyl_stdev_pct">
-                <label>Methyl σ<sub>AoU2Mid</sub> Rank</label>
             </div>
         </div>
     </div>
@@ -1419,7 +1403,7 @@ function renderLocusRow(locus, rowIndex) {
     const refRepeats = locus.NumRepeatsInReference;
     const deltaRef = (allele != null && refRepeats != null) ? allele - refRepeats : null;
     const popMaxVal = Math.max(
-        ...[locus.HPRC256_99thPercentile, locus.AoU1027_99thPercentile, locus.AoUPhase2HighCov_99thPercentile, locus.AoUPhase2MidCov_99thPercentile].filter(v => v != null), -Infinity
+        ...[locus.HPRC256_99thPercentile, locus.AoU1027_99thPercentile].filter(v => v != null), -Infinity
     );
     const popMax = popMaxVal === -Infinity ? null : popMaxVal;
     const deltaPop = (allele != null && popMax != null) ? allele - popMax : null;
@@ -1786,8 +1770,6 @@ function renderLocusDetail(detail, outlierType) {
         ['HPRC256', 'HPRC256'],
         ['AoU1027', 'AoU1027'],
         ['TenK10K', 'TenK10K'],
-        ['AoU2High', 'AoUPhase2HighCov'],
-        ['AoU2Mid',  'AoUPhase2MidCov'],
     ].map(([name, k]) => ({
         name,
         max:    popThresholds[`${k}_MaxAllele`],

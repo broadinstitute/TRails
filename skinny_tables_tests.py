@@ -47,14 +47,14 @@ class TestColumnDefinitions(unittest.TestCase):
 
     def test_shared_columns_count_and_membership(self):
         shared = skinny_tables.shared_columns()
-        # 29 entries, matching the reference add_skinny_tables.shared_columns()
+        # 21 entries, matching the reference add_skinny_tables.shared_columns()
         # exactly (the blueprint's "30" is an off-by-one; live source is source
-        # of truth).
-        self.assertEqual(len(shared), 29)
-        self.assertEqual(len(set(shared)), 29)
+        # of truth), with the AoU Phase 2 columns removed.
+        self.assertEqual(len(shared), 21)
+        self.assertEqual(len(set(shared)), 21)
         self.assertEqual(shared[0], "LocusId")
         for expected in ("Chrom", "Motif", "CanonicalMotif", "pLI",
-                         "GeneTableGeneSymbol", "AoUPhase2MidCov_Methyl_StdPercentile"):
+                         "GeneTableGeneSymbol", "AoU1027_StdevPercentile"):
             self.assertIn(expected, shared)
 
     def test_per_outlier_columns_count_and_suffix(self):
@@ -70,11 +70,11 @@ class TestColumnDefinitions(unittest.TestCase):
             self.assertIn(f"OutlierSampleIds_{outlier_type}", per_outlier)
             self.assertIn(f"SecondAffectedAlleleSize_{outlier_type}_ByFamily", per_outlier)
 
-    def test_all_alleles_total_is_42(self):
+    def test_all_alleles_total_is_34(self):
         self.assertEqual(
             len(skinny_tables.shared_columns()
                 + skinny_tables.per_outlier_columns("AllAlleles")),
-            42)
+            34)
 
 
 class TestBuildSkinnyTable(unittest.TestCase):

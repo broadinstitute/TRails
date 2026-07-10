@@ -48,7 +48,7 @@ chrX-148500631-148500691-GCC    GCC     21         20,21      45
 annotate the *locus* rather than a sample; they are recognized by name (case/underscore-insensitive)
 and written to the loci table, not treated as samples. Recognized: `gene_id` /
 `GencodeGeneId`, `gene_region` / `GencodeGeneRegion`, `ReferenceRegion`,
-`NumRepeatsInReference`, and per-cohort population-stat columns (`HPRC256_*`, `AoU*`,
+`NumRepeatsInReference`, and per-cohort population-stat columns (`HPRC256_*`, `AoU1027_*`,
 `TenK10K_*`, `TRExplorer*`). In particular, supplying a `gene_id` column is what lets the
 optional `--gene-table` populate the gene-symbol / inheritance / pLI / disease-category columns
 and enables gene-level phenotype scoring. Any header that is **not** a recognized annotation

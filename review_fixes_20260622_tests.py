@@ -80,7 +80,7 @@ class AnnotationColumnPrefixTests(unittest.TestCase):
 
     def test_real_cohort_stat_columns_still_recognized(self):
         for column in ("HPRC256_99thPercentile", "AoU1027_MaxAllele",
-                       "AoUPhase2HighCov_N", "TenK10K_MaxAllele", "TRExplorerMotif"):
+                       "TenK10K_MaxAllele", "TRExplorerMotif"):
             self.assertEqual(input_tables._is_annotation_column(column), column)
 
     def test_aou_sample_column_kept_as_sample(self):

@@ -116,7 +116,7 @@
                             </div>
                             <div class="ui radio checkbox">
                                 <input type="radio" name="swim_require_above_population" value="long-read">
-                                <label>Long-read (HPRC256, AoU1027, AoU2High, AoU2Mid)</label>
+                                <label>Long-read (HPRC256, AoU1027)</label>
                             </div>
                             <div class="ui radio checkbox">
                                 <input type="radio" name="swim_require_above_population" value="short-read">
@@ -965,8 +965,6 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
         ['HPRC256', 'HPRC256'],
         ['AoU1027', 'AoU1027'],
         ['TenK10K', 'TenK10K'],
-        ['AoU2High', 'AoUPhase2HighCov'],
-        ['AoU2Mid',  'AoUPhase2MidCov'],
     ].filter(([, k]) => popThresh[k + '_MaxAllele'] != null).forEach(([label, k]) => {
         const stdev = popThresh[k + '_Stdev'];
         html += '<tr><td>' + escapeHtml(label) + '</td>'

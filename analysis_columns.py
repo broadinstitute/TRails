@@ -6,7 +6,7 @@ analysis columns: the First/Second/Third affected and unaffected allele sizes
 (both per-sample and per-family), the matching affected phenotypes and sample
 ids, and the NumAffectedUnsolved{Samples,Families}AboveUnaffected counts. It
 also adds the gene-derived ``pLI`` / ``inheritance`` columns, and exposes the
-exact 143-name ordered ``OUTPUT_COLUMNS`` list that defines the loci table.
+exact 129-name ordered ``OUTPUT_COLUMNS`` list that defines the loci table.
 
 It is a faithful, standalone port of the corresponding logic in the reference
 ``analyze_results.py`` (parse_outlier_entries, is_unaffected_or_solved_status,
@@ -188,10 +188,10 @@ def is_affected_unsolved(sample_id, affected_lookup, analysis_lookup):
 def get_population_p99_threshold(row):
     """Return the max available population 99th-percentile threshold, or None.
 
-    Reads whichever of HPRC256_99thPercentile, AoU1027_99thPercentile,
-    AoUPhase2HighCov_99thPercentile, AoUPhase2MidCov_99thPercentile are present
-    (not None / not NaN) and returns their maximum, mirroring the long-read
-    cohorts in the server's above-population gate. Returns None if none present.
+    Reads whichever of HPRC256_99thPercentile, AoU1027_99thPercentile are
+    present (not None / not NaN) and returns their maximum, mirroring the
+    long-read cohorts in the server's above-population gate. Returns None if
+    none present.
 
     Args:
         row: A locus record dict that may carry the percentile columns.
@@ -202,8 +202,6 @@ def get_population_p99_threshold(row):
     candidate_values = [
         row.get("HPRC256_99thPercentile"),
         row.get("AoU1027_99thPercentile"),
-        row.get("AoUPhase2HighCov_99thPercentile"),
-        row.get("AoUPhase2MidCov_99thPercentile"),
     ]
     valid_values = [value for value in candidate_values if not _is_missing(value)]
     if not valid_values:
@@ -249,8 +247,6 @@ def is_above_population_p99(allele_size, row):
     candidate_values = [
         row.get("HPRC256_99thPercentile"),
         row.get("AoU1027_99thPercentile"),
-        row.get("AoUPhase2HighCov_99thPercentile"),
-        row.get("AoUPhase2MidCov_99thPercentile"),
     ]
     valid_values = [value for value in candidate_values if not _is_missing(value)]
     if not valid_values:
@@ -623,9 +619,8 @@ def add_gene_columns(records, gene_lookup):
     return records
 
 
-# The exact 143-name ordered loci-table column list (columns 1-143 of the live
-# DB schema). Columns 144-158 (the +15 population-distribution-stat columns) are
-# added afterward by enrichment, not part of OUTPUT_COLUMNS.
+# The exact 129-name ordered loci-table column list. The population-distribution-
+# stat columns are added afterward by enrichment, not part of OUTPUT_COLUMNS.
 OUTPUT_COLUMNS = [
     # Core locus info
     "LocusId",
@@ -797,22 +792,4 @@ OUTPUT_COLUMNS = [
     "NonCodingAnnotations",
     "RepeatMaskerIntervals",
     "VariationClusterSizeDiff",
-
-    # AoU Phase 2 high-coverage stats
-    "AoUPhase2HighCov_N",
-    "AoUPhase2HighCov_99thPercentile",
-    "AoUPhase2HighCov_MaxAllele",
-    "AoUPhase2HighCov_LPS_StdPercentile",
-    "AoUPhase2HighCov_Methyl_N",
-    "AoUPhase2HighCov_Methyl_Median",
-    "AoUPhase2HighCov_Methyl_StdPercentile",
-
-    # AoU Phase 2 mid-coverage stats
-    "AoUPhase2MidCov_N",
-    "AoUPhase2MidCov_99thPercentile",
-    "AoUPhase2MidCov_MaxAllele",
-    "AoUPhase2MidCov_LPS_StdPercentile",
-    "AoUPhase2MidCov_Methyl_N",
-    "AoUPhase2MidCov_Methyl_Median",
-    "AoUPhase2MidCov_Methyl_StdPercentile",
 ]
