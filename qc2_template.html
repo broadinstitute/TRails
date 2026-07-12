@@ -502,7 +502,7 @@ function createCenterChartsForSection(containerId, data, bins) {
             sortedData.forEach(item => {
                 const tr = document.createElement('tr');
                 const pct = (item.fraction * 100).toFixed(2) + '%';
-                tr.innerHTML = `<td>${item.center}</td><td>${item.trios}</td><td>${pct}</td>`;
+                tr.innerHTML = `<td>${escapeHtml(item.center)}</td><td>${item.trios}</td><td>${pct}</td>`;
                 tbody.appendChild(tr);
             });
             table.appendChild(tbody);

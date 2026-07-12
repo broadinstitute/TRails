@@ -46,9 +46,7 @@ try:
         motifs_match,
         normalize_affected_status_for_logic,
     )
-    HAVE_LOCUS_ANNOTATIONS = True
 except ImportError:
-    HAVE_LOCUS_ANNOTATIONS = False
 
     def normalize_affected_status_for_logic(value):
         """Lowercase + collapse 'possibly affected' to 'affected' (fallback)."""
@@ -894,8 +892,11 @@ def build_api_query(params):
 
     if "require_above_unaffected" in params:
         col_prefix = {"first": "First", "second": "Second", "third": "Third"}[params["require_above_unaffected"]]
-        clauses.append(f"(loci.{col_prefix}AffectedAlleleSize_{ot} > loci.FirstUnaffectedAlleleSize_{ot} + ? OR (loci.FirstUnaffectedAlleleSize_{ot} IS NULL OR loci.FirstUnaffectedAlleleSize_{ot} = 0) AND loci.{col_prefix}AffectedAlleleSize_{ot} IS NOT NULL)")
-        sql_params.append(min_expansion)
+        if not source_columns or (f"{col_prefix}AffectedAlleleSize_{ot}" in source_columns and f"FirstUnaffectedAlleleSize_{ot}" in source_columns):
+            clauses.append(f"(loci.{col_prefix}AffectedAlleleSize_{ot} > loci.FirstUnaffectedAlleleSize_{ot} + ? OR (loci.FirstUnaffectedAlleleSize_{ot} IS NULL OR loci.FirstUnaffectedAlleleSize_{ot} = 0) AND loci.{col_prefix}AffectedAlleleSize_{ot} IS NOT NULL)")
+            sql_params.append(min_expansion)
+        else:
+            clauses.append("1=0")
 
     if "require_families_above_unaffected" in params:
         col_prefix = {"first": "First", "second": "Second", "third": "Third"}[params["require_families_above_unaffected"]]
@@ -903,6 +904,11 @@ def build_api_query(params):
         if not source_columns or f"{col_prefix}AffectedAlleleSize_{ot}_ByFamily" in source_columns:
             clauses.append(f"({by_family_col} > loci.FirstUnaffectedAlleleSize_{ot} + ? OR (loci.FirstUnaffectedAlleleSize_{ot} IS NULL OR loci.FirstUnaffectedAlleleSize_{ot} = 0) AND {by_family_col} IS NOT NULL)")
             sql_params.append(min_expansion)
+        else:
+            # Backing column absent: the filter cannot be evaluated, so match no
+            # rows rather than silently returning every locus (mirrors the
+            # require_above_population "1=0" fallback below).
+            clauses.append("1=0")
 
     if "require_above_population" in params:
         include_without_data = params.get("include_loci_without_population_data", False)
@@ -935,8 +941,11 @@ def build_api_query(params):
             sql_params.extend(sorted(all_variants))
 
     if "min_repeats_threshold" in params:
-        clauses.append(f"loci.FirstAffectedAlleleSize_{ot} >= ?")
-        sql_params.append(params["min_repeats_threshold"])
+        if not source_columns or f"FirstAffectedAlleleSize_{ot}" in source_columns:
+            clauses.append(f"loci.FirstAffectedAlleleSize_{ot} >= ?")
+            sql_params.append(params["min_repeats_threshold"])
+        else:
+            clauses.append("1=0")
 
     if "gene_regions" in params:
         db_regions = []
@@ -949,12 +958,17 @@ def build_api_query(params):
         db_regions = []
         for region in params["exclude_gene_regions"]:
             db_regions.extend(GENE_REGION_MAP[region])
-        clauses.append(f"loci.gene_region NOT IN ({','.join('?' * len(db_regions))})")
+        # NULL NOT IN (...) is unknown in SQL, which would drop unannotated
+        # (NULL gene_region) loci; keep them since they are not in the excluded set.
+        clauses.append(f"(loci.gene_region IS NULL OR loci.gene_region NOT IN ({','.join('?' * len(db_regions))}))")
         sql_params.extend(db_regions)
 
     if "min_pli" in params:
-        clauses.append("pLI >= ?")
-        sql_params.append(params["min_pli"])
+        if not source_columns or "pLI" in source_columns:
+            clauses.append("pLI >= ?")
+            sql_params.append(params["min_pli"])
+        else:
+            clauses.append("1=0")
 
     if params.get("known_loci_only"):
         known_ids = app.config.get("KNOWN_DISEASE_LOCUS_IDS", set())
@@ -994,6 +1008,10 @@ def build_api_query(params):
         elif aou_exists:
             clauses.append("(loci.AoU1027_StdevPercentile IS NOT NULL AND loci.AoU1027_StdevPercentile <= ?)")
             sql_params.append(threshold)
+        else:
+            # Neither sigma-percentile column is present: match no rows instead of
+            # silently ignoring the filter.
+            clauses.append("1=0")
 
     if "phenotype_keyword" in params:
         kw_clauses = [f"FirstAffectedPhenotype_{ot} LIKE ? COLLATE NOCASE" for _ in params["phenotype_keyword"]]
@@ -1024,8 +1042,11 @@ def build_api_query(params):
         sql_params.append(params["chrom"])
 
     if "gene_id" in params:
-        clauses.append("gene_id = ?")
-        sql_params.append(params["gene_id"])
+        if not source_columns or "gene_id" in source_columns:
+            clauses.append("gene_id = ?")
+            sql_params.append(params["gene_id"])
+        else:
+            clauses.append("1=0")
 
     if "gene_symbol" in params:
         if "GeneTableGeneSymbol" in app.config["DB_COLUMNS_SET"]:
@@ -2073,28 +2094,27 @@ def get_swim_plot_data():
             extra_clauses.append(f"({' OR '.join(threshold_clauses)})")
 
     if mendelian_only == "1":
-        extra_clauses.append("IsInMendelianGene = 1")
+        extra_clauses.append("IsInMendelianGene = 1" if (not source_columns or "IsInMendelianGene" in source_columns) else "1=0")
 
     if known_motifs_only == "1":
-        extra_clauses.append("IsKnownMotif = 1")
+        extra_clauses.append("IsKnownMotif = 1" if (not source_columns or "IsKnownMotif" in source_columns) else "1=0")
 
-    if require_above_population == "long-read":
+    if require_above_population in ("long-read", "short-read"):
+        # Only reference population-stat columns that actually exist in the DB
+        # (a minimal-input build omits them); with none present the filter cannot
+        # be evaluated, so match no rows. Mirrors build_api_query.
+        datasets = ["HPRC256", "AoU1027"] if require_above_population == "long-read" else ["TenK10K"]
+        present = [d for d in datasets if not source_columns or f"{d}_{population_metric}" in source_columns]
+        above_terms = [f"({d}_{population_metric} IS NULL OR allele_size > {d}_{population_metric})" for d in present]
         if include_loci_without_population_data:
-            extra_clauses.append(f"""(
-                (HPRC256_{population_metric} IS NULL OR allele_size > HPRC256_{population_metric}) AND
-                (AoU1027_{population_metric} IS NULL OR allele_size > AoU1027_{population_metric})
-            )""")
+            if above_terms:
+                extra_clauses.append("(" + " AND ".join(above_terms) + ")")
         else:
-            extra_clauses.append(f"""(
-                (HPRC256_{population_metric} IS NOT NULL OR AoU1027_{population_metric} IS NOT NULL) AND
-                (HPRC256_{population_metric} IS NULL OR allele_size > HPRC256_{population_metric}) AND
-                (AoU1027_{population_metric} IS NULL OR allele_size > AoU1027_{population_metric})
-            )""")
-    elif require_above_population == "short-read":
-        if include_loci_without_population_data:
-            extra_clauses.append(f"(TenK10K_{population_metric} IS NULL OR allele_size > TenK10K_{population_metric})")
-        else:
-            extra_clauses.append(f"(TenK10K_{population_metric} IS NOT NULL AND allele_size > TenK10K_{population_metric})")
+            if present:
+                exists_term = " OR ".join(f"{d}_{population_metric} IS NOT NULL" for d in present)
+                extra_clauses.append("((" + exists_term + ") AND " + " AND ".join(above_terms) + ")")
+            else:
+                extra_clauses.append("1=0")
 
     if gene_regions_raw:
         db_regions = []
@@ -2109,7 +2129,9 @@ def get_swim_plot_data():
         for r in (x.strip() for x in exclude_gene_regions_raw.split(",") if x.strip()):
             db_regions.extend(GENE_REGION_MAP.get(r, []))
         if db_regions:
-            extra_clauses.append(f"gene_region NOT IN ({','.join('?' * len(db_regions))})")
+            # Keep unannotated (NULL gene_region) rows: NULL NOT IN (...) is unknown
+            # in SQL and would otherwise drop them.
+            extra_clauses.append(f"(gene_region IS NULL OR gene_region NOT IN ({','.join('?' * len(db_regions))}))")
             extra_params.extend(db_regions)
 
     if motif_size_raw:
@@ -2141,15 +2163,22 @@ def get_swim_plot_data():
             extra_params.extend([f"%{gs}%" for gs in symbols])
 
     if gene_id:
-        extra_clauses.append("gene_id = ?")
-        extra_params.append(gene_id)
+        if not source_columns or "gene_id" in source_columns:
+            extra_clauses.append("gene_id = ?")
+            extra_params.append(gene_id)
+        else:
+            extra_clauses.append("1=0")
 
     if min_pli:
         try:
-            extra_params.append(float(min_pli))
-            extra_clauses.append("pLI >= ?")
+            pli_value = float(min_pli)
         except ValueError:
             return jsonify({"error": "Invalid parameter", "detail": f"min_pli must be a number, got '{min_pli}'"}), 400
+        if not source_columns or "pLI" in source_columns:
+            extra_params.append(pli_value)
+            extra_clauses.append("pLI >= ?")
+        else:
+            extra_clauses.append("1=0")
 
     if phenotype_keyword_raw:
         keywords = [kw.strip() for kw in phenotype_keyword_raw.split(",") if kw.strip()]
@@ -2199,6 +2228,8 @@ def get_swim_plot_data():
             elif aou_exists:
                 extra_clauses.append("(AoU1027_StdevPercentile IS NOT NULL AND AoU1027_StdevPercentile <= ?)")
                 extra_params.append(threshold)
+            else:
+                extra_clauses.append("1=0")
         except ValueError:
             return jsonify({"error": "Invalid parameter", "detail": f"min_sigma_percentile must be a number between 0 and 1, got '{min_sigma_percentile_raw}'"}), 400
 
@@ -2482,6 +2513,8 @@ def get_schema():
             "min_expansion": {"type": "int", "min": 0},
             "min_repeats_threshold": {"type": "int", "min": 0},
             "min_pli": {"type": "float", "min": 0.0, "max": 1.0},
+            "min_sigma_percentile": {"type": "float", "min": 0.0, "max": 1.0, "description": "Keep loci whose HPRC256/AoU1027 stdev percentile is in the top (1 - value) fraction"},
+            "chrom": {"type": "string", "description": "Filter to a single chromosome (e.g. chr1)"},
             "motif": {"type": "string"},
             "phenotype_keyword": {"type": "string"},
             "sample_id_keyword": {"type": "string", "description": "Comma-separated exact sample IDs from dropdown"},

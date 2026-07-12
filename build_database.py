@@ -131,10 +131,13 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
     # promote any per-locus annotation columns carried in 'extra_columns'
     # (gene_id, GencodeGeneRegion, HPRC256_* ...) onto the record top level so the
     # gene / population stages can read them.
+    promoted_annotation_columns = set()
     for record in records:
         record["LocusId"] = record["trid"]
         record["Motif"] = record["motif"]
-        record.update(record.pop("extra_columns", {}))
+        extra = record.pop("extra_columns", {})
+        promoted_annotation_columns.update(extra)
+        record.update(extra)
 
     # Stage 6: derived coordinate / motif / source / gene-region columns.
     print("Adding derived locus columns ...")
@@ -154,10 +157,19 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
         print("  no known-loci catalog supplied; KnownDiseaseLocus / IsKnownMotif left NULL/0")
 
     for record in records:
-        record["KnownDiseaseLocus"] = locus_annotations.matches_disease_locus(
-            record["LocusId"], interval_trees, strchive_trees) if (interval_trees or strchive_trees) else None
-        record["IsKnownMotif"] = locus_annotations.compute_is_known_motif(
-            record["CanonicalMotif"], known_canonical_motifs)
+        # When a catalog is supplied it is authoritative; otherwise preserve any
+        # KnownDiseaseLocus / IsKnownMotif value the input matrix already provided
+        # (promoted from extra_columns above) rather than clobbering it with NULL/0.
+        if interval_trees or strchive_trees:
+            record["KnownDiseaseLocus"] = locus_annotations.matches_disease_locus(
+                record["LocusId"], interval_trees, strchive_trees)
+        else:
+            record.setdefault("KnownDiseaseLocus", None)
+        if known_canonical_motifs:
+            record["IsKnownMotif"] = locus_annotations.compute_is_known_motif(
+                record["CanonicalMotif"], known_canonical_motifs)
+        else:
+            record.setdefault("IsKnownMotif", 0)
         record["IsInMendelianGene"] = locus_annotations.is_in_mendelian_gene(
             record.get("gene_id"), gene_lookup)
 
@@ -190,13 +202,14 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
     connection, tmp_path = result_database.open_new_database(db_path)
     try:
         _, present_columns = result_database.write_loci_table(
-            connection, records, analysis_columns.OUTPUT_COLUMNS)
+            connection, records, analysis_columns.OUTPUT_COLUMNS,
+            extra_columns=promoted_annotation_columns)
         result_database.create_loci_indexes(connection, present_columns)
         result_database.write_skinny_tables(connection, present_columns)
 
         swim_rows = swim_plot.generate_swim_plot_table(
             records, sample_lookup, affected_lookup, analysis_lookup)
-        result_database.write_swim_plot(connection, swim_rows)
+        result_database.write_swim_plot(connection, swim_rows, columns=swim_plot.SWIM_PLOT_COLUMNS)
 
         result_database.write_phenotype_tables(
             connection, per_outlier_phenotype_rows, per_locus_phenotype_rows)

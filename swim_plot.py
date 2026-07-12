@@ -56,6 +56,17 @@ SWIM_PLOT_LOCUS_COLUMNS = [
     "AoU1027_StdevPercentile",
 ]
 
+# The full swim_plot column order, matching the row dicts generate_swim_plot_table
+# emits (the per-row keys below, then the copied locus columns). Used by
+# result_database.write_swim_plot to create an empty-but-queryable table when a
+# build yields zero outlier rows.
+SWIM_PLOT_COLUMNS = [
+    "outlier_type", "outlier_rank", "motif_category", "SourceDb", "allele_size",
+    "sample_id", "family_id", "affected_status", "analysis_status", "sex",
+    "phenotype_description", "purity", "methylation", "FirstUnaffectedAlleleSize",
+    "is_above_first_unaffected",
+] + SWIM_PLOT_LOCUS_COLUMNS
+
 
 def _is_missing(value):
     """Return True if value is None or a float NaN (NaN is never equal to itself)."""
@@ -96,7 +107,9 @@ def _normalize_affected_status(raw_affected):
         return "Affected"
     if normalized == "unaffected":
         return "Unaffected"
-    return str(raw_affected).strip().title() if raw_affected else "Unknown"
+    if not normalized:  # whitespace-only value strips to empty -> treat as missing
+        return "Unknown"
+    return str(raw_affected).strip().title()
 
 
 def _normalize_analysis_status(raw_analysis):
@@ -187,7 +200,9 @@ def generate_swim_plot_table(records, sample_lookup, affected_lookup, analysis_l
             ):
                 sample_row = sample_lookup.get(sample_id)
                 phenotype_description = sample_row.get("phenotype_description") if sample_row else None
-                if _is_missing(phenotype_description):
+                if _is_missing(phenotype_description) or (isinstance(phenotype_description, str) and not phenotype_description.strip()):
+                    # read_sample_metadata uses keep_default_na=False, so a blank
+                    # cell arrives as '' (never None/NaN); normalize it to NULL.
                     phenotype_description = None
 
                 # Prefer the raw sample-row affected_status so "possibly affected" is

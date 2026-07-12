@@ -31,6 +31,8 @@ import gzip
 
 import pandas
 
+import analysis_columns
+
 
 # Allowed normalized values for sample-metadata status columns. A value outside
 # the corresponding set raises (mirrors validate_sample_metadata in the source).
@@ -117,6 +119,14 @@ ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED = {normalize_column_name(name): name f
 # starts with a cohort name (e.g. a sample named "AoU_0001").
 ANNOTATION_COLUMN_PREFIXES = ("hprc256", "aou1027", "tenk10k", "trexplorer")
 
+# Normalized -> canonical spelling for every loci-table output column, so a
+# prefix-matched cohort-stat header supplied in non-canonical casing/underscoring
+# (e.g. "hprc256_99thpercentile") is stored under the exact OUTPUT_COLUMNS name the
+# server reads ("HPRC256_99thPercentile") rather than as a separate raw column.
+_NORMALIZED_OUTPUT_COLUMNS = {
+    normalize_column_name(name): name for name in analysis_columns.OUTPUT_COLUMNS
+}
+
 
 def _coerce_annotation_value(value):
     """Coerce a raw string annotation cell to int/float when numeric, else str/None.
@@ -147,7 +157,9 @@ def _is_annotation_column(column_name):
     if normalized in ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED:
         return ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED[normalized]
     if normalized.startswith(ANNOTATION_COLUMN_PREFIXES):
-        return column_name  # cohort-stat columns pass through under their own header
+        # Canonicalize known cohort-stat columns to their OUTPUT_COLUMNS spelling;
+        # genuinely unknown extras (not in the schema) pass through under their header.
+        return _NORMALIZED_OUTPUT_COLUMNS.get(normalized, column_name)
     return None
 
 

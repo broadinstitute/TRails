@@ -77,6 +77,27 @@ def trails_git_sha():
         return "unknown"
 
 
+def trails_code_version():
+    """Return a fingerprint of the TRails code for the build manifest.
+
+    Uses the git commit in a checkout; outside a checkout (a tarball install,
+    where ``trails_git_sha()`` is the constant 'unknown') it falls back to a
+    sha256 over the TRails Python sources, so re-running after a code update
+    correctly triggers a rebuild instead of reusing a stale database.
+    """
+    sha = trails_git_sha()
+    if sha != "unknown":
+        return sha
+    digest = hashlib.sha256()
+    for name in sorted(os.listdir(SCRIPT_DIR)):
+        if name.endswith(".py"):
+            file_hash = hash_file(os.path.join(SCRIPT_DIR, name))
+            if file_hash:
+                digest.update(name.encode())
+                digest.update(file_hash.encode())
+    return digest.hexdigest()
+
+
 def default_db_path(tsv_path, work_dir):
     """Return the default result-DB path derived from the genotype TSV's basename in work_dir."""
     base = os.path.basename(tsv_path)
@@ -95,7 +116,7 @@ def build_manifest(inputs, flags):
     """
     return {"inputs": {label: hash_file(path) for label, path in inputs.items()},
             "flags": flags,
-            "trails_sha": trails_git_sha()}
+            "trails_sha": trails_code_version()}
 
 
 def needs_rebuild(db_path, manifest_path, manifest, force):

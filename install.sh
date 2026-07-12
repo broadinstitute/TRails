@@ -34,11 +34,11 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -d|--dir)
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a directory argument" >&2; exit 1; }
-      INSTALL_DIR="$2"; shift 2 ;;
-    --dir=*)   INSTALL_DIR="${1#*=}"; shift ;;
+      INSTALL_DIR="$2"; INSTALL_DIR_EXPLICIT=1; shift 2 ;;
+    --dir=*)   INSTALL_DIR="${1#*=}"; INSTALL_DIR_EXPLICIT=1; shift ;;
     -h|--help) echo "Usage: install.sh [--dir INSTALL_DIR]"; exit 0 ;;
     -*)        echo "ERROR: unknown option: $1" >&2; exit 1 ;;
-    *)         INSTALL_DIR="$1"; shift ;;   # bare positional = install dir
+    *)         INSTALL_DIR="$1"; INSTALL_DIR_EXPLICIT=1; shift ;;   # bare positional = install dir
   esac
 done
 
@@ -47,6 +47,15 @@ TRAILS_DIR=""
 if [[ "${BASH_SOURCE[0]:-}" == *install.sh ]]; then
   _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   [[ -f "$_d/requirements.txt" ]] && TRAILS_DIR="$_d"
+fi
+
+# In checkout mode the install operates on the checkout itself, so an explicit
+# install directory cannot be honored; reject it rather than silently ignoring it.
+if [[ -n "$TRAILS_DIR" && "${INSTALL_DIR_EXPLICIT:-}" == "1" ]]; then
+  echo "ERROR: --dir is not supported when running from a checkout (it installs into the checkout at $TRAILS_DIR)." >&2
+  echo "       To install into a different directory, run the curl bootstrap instead:" >&2
+  echo "         curl -fsSL https://raw.githubusercontent.com/$TRAILS_REPO/$TRAILS_VERSION/install.sh | bash -s -- --dir $INSTALL_DIR" >&2
+  exit 1
 fi
 
 # Bootstrap mode: no local checkout -> download + extract the repo. Needs only curl + tar
@@ -125,7 +134,6 @@ python3 "$TRAILS_DIR/trails_setup.py" fetch --dir "$REF_DIR" $REMOTE_FLAG $FORCE
 
 echo ""
 echo "Class B (licensed / controlled-access — NOT fetched; supply your own if licensed):"
-echo "  - OMIM table          -> pass via --omim-table PATH        (license: omim.org)"
 echo "  - gene-disease table  -> pass via --gene-table PATH        (OMIM/HPO-derived)"
 echo ""
 echo "Class C (your own data — NOT fetched; see docs/INPUT_FORMATS.md):"

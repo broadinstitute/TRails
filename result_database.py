@@ -96,7 +96,10 @@ def write_table_from_dicts(connection, table_name, rows, column_order=None,
 
     column_definitions = []
     for column in column_order:
-        definition = column
+        # Quote the identifier so annotation headers containing spaces or other
+        # non-identifier characters (promoted verbatim from the input matrix) do
+        # not corrupt the CREATE TABLE DDL.
+        definition = f'"{column}"'
         if column == primary_key_column:
             definition += " TEXT PRIMARY KEY"
         elif column in integer_columns:
@@ -113,7 +116,7 @@ def write_table_from_dicts(connection, table_name, rows, column_order=None,
     return len(rows)
 
 
-def write_loci_table(connection, records, output_columns):
+def write_loci_table(connection, records, output_columns, extra_columns=None):
     """Writes the wide ``loci`` table from the in-memory locus records.
 
     Columns are written in ``output_columns`` order, restricted to the columns
@@ -140,6 +143,14 @@ def write_loci_table(connection, records, output_columns):
     # valid, queryable loci table instead of the invalid DDL `CREATE TABLE loci ()`.
     if not present_columns:
         present_columns = list(output_columns)
+    # Recognized annotation columns the input supplied that are not part of the
+    # fixed OUTPUT_COLUMNS schema (e.g. cohort HPRC256_Mode / _Median /
+    # _90thPercentile that the locus-detail view reads) are appended after the
+    # schema columns so they are persisted rather than silently dropped.
+    if extra_columns:
+        for column in sorted(extra_columns):
+            if column in present and column not in output_columns:
+                present_columns.append(column)
 
     row_count = write_table_from_dicts(
         connection, "loci", records, column_order=present_columns)
@@ -217,25 +228,31 @@ def create_loci_indexes(connection, present_columns):
     return created
 
 
-def write_swim_plot(connection, swim_rows):
+def write_swim_plot(connection, swim_rows, columns=None):
     """Writes the ``swim_plot`` table (one row per outlier allele) + its indexes.
 
-    The 38-column schema and its order come from the keys of the first swim row
-    (as produced by ``swim_plot.generate_swim_plot_table``). If ``swim_rows`` is
-    empty the table is not created.
+    The column schema and order come from the keys of the first swim row (as
+    produced by ``swim_plot.generate_swim_plot_table``). When ``swim_rows`` is
+    empty but ``columns`` (the canonical ``swim_plot.SWIM_PLOT_COLUMNS`` order) is
+    supplied, an empty-but-queryable table is still created so the server's
+    swim-plot endpoints return an empty result instead of 500-ing on a missing
+    table (a valid build can legitimately yield zero outlier rows).
 
     Args:
         connection: An open sqlite3 connection.
         swim_rows: A list of swim-plot row dicts.
+        columns: Optional canonical column order used to create the table when
+            ``swim_rows`` is empty.
 
     Returns:
         The number of rows written.
     """
-    if not swim_rows:
+    if not swim_rows and not columns:
         print("  swim_plot: 0 rows (skipped)")
         return 0
 
-    row_count = write_table_from_dicts(connection, "swim_plot", swim_rows)
+    column_order = None if swim_rows else list(columns)
+    row_count = write_table_from_dicts(connection, "swim_plot", swim_rows, column_order=column_order)
 
     cursor = connection.cursor()
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_outlier_category ON swim_plot(outlier_type, motif_category)")

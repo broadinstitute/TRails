@@ -349,11 +349,13 @@ let swimLoadSeq = 0;  // monotonic load id; a stale response must not overwrite 
 
 // Category helpers
 function categoryToY(cat) {
+    if (cat === 'Unknown') return 0;
     if (cat === '25+bp') return 25;
     return parseInt(cat, 10);
 }
 
 function yToLabel(y) {
+    if (y === 0) return 'Unknown';
     if (y === 25) return '25+bp';
     return y + 'bp';
 }
@@ -520,6 +522,11 @@ function renderSwimChart(data) {
         if (parsedMin !== Infinity) yMin = Math.max(1, Math.min(parsedMin, 25));
         if (parsedMax !== -Infinity) yMax = Math.min(parsedMax, 25);
     }
+    // Unknown-motif-size loci map to a dedicated row at y=0 (labelled "Unknown");
+    // extend the axis floor to include it only when such points are present, so the
+    // normal chart (no Unknown loci) is unchanged. Without this they get y=NaN and
+    // are silently dropped by Chart.js.
+    const yFloor = data.some(item => item.motif_category === 'Unknown') ? 0 : yMin;
 
     const ctx = document.getElementById('swim-chart-canvas').getContext('2d');
 
@@ -640,7 +647,7 @@ function renderSwimChart(data) {
                 y: {
                     type: 'linear',
                     reverse: true,
-                    min: yMin - 0.5,
+                    min: yFloor - 0.5,
                     max: yMax + 0.5,
                     title: {
                         display: true,
@@ -649,13 +656,13 @@ function renderSwimChart(data) {
                     },
                     afterBuildTicks: function(axis) {
                         axis.ticks = [];
-                        for (let i = yMin; i <= yMax; i++) {
+                        for (let i = yFloor; i <= yMax; i++) {
                             axis.ticks.push({ value: i });
                         }
                     },
                     ticks: {
                         callback: function(value) {
-                            if (value >= yMin && value <= yMax && Number.isInteger(value)) {
+                            if (value >= yFloor && value <= yMax && Number.isInteger(value)) {
                                 return yToLabel(value);
                             }
                             return '';
