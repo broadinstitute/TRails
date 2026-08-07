@@ -201,15 +201,19 @@
             <input type="text" name="motif_size" placeholder="e.g., 3, 5-10, 15-" title="Examples: 3 (exact), 3-6 (range), 5- (5 and above), -10 (up to 10). Comma-separate for OR.">
         </div>
         <div class="field">
-            <label>Motif(s)</label>
-            <input type="text" name="motif" placeholder="e.g., CCG, CAG">
-        </div>
-        <div class="field">
             <label>Locus Id(s)</label>
             <input type="text" name="locus_id" placeholder="e.g., 2-89831737-89831752-CCATT">
         </div>
+        <div class="field">
+            <label>Reference Region</label>
+            <input type="text" name="reference_region" placeholder="e.g., chr16:11579459-11579529" title="Keeps the loci that overlap this region of the reference genome. The start is 0-based and the end is exclusive, matching the coordinates in a Locus Id. The 'chr' prefix and comma separators are optional. Also accepts a single position (chr16:11579459) or a whole chromosome (chr16).">
+        </div>
     </div>
     <div class="column">
+        <div class="field">
+            <label>Motif(s)</label>
+            <input type="text" name="motif" placeholder="e.g., CCG, CAG">
+        </div>
         <div class="field">
             <label>Gene Symbol(s)</label>
             <input type="text" name="gene_symbol" placeholder="e.g., FMR1, HTT">
@@ -217,10 +221,6 @@
         <div class="field">
             <label>Gene ID</label>
             <input type="text" name="gene_id" placeholder="e.g., ENSG00000102081">
-        </div>
-        <div class="field">
-            <label>Min pLI</label>
-            <input type="text" name="min_pli" placeholder="e.g., 0.9">
         </div>
     </div>
     <div class="column">
@@ -250,6 +250,10 @@
         <div class="field">
             <label>Min Repeats (most expanded individual)</label>
             <input type="number" name="min_repeats_threshold" min="0" placeholder="e.g., 50">
+        </div>
+        <div class="field">
+            <label>Min pLI</label>
+            <input type="text" name="min_pli" placeholder="e.g., 0.9">
         </div>
     </div>
     </div>
@@ -653,6 +657,7 @@ const DEFAULT_STATE = {
     gene_symbol: '',
     gene_id: '',
     locus_id: '',
+    reference_region: '',
     tag: '',
     sort_by: 'count',
     page: 1,
@@ -749,7 +754,7 @@ function applyStateToUI() {
     for (const name of ['min_expansion', 'min_repeats_threshold', 'min_pli', 'min_sigma_percentile',
                         'motif_size', 'motif',
                         'phenotype_keyword', 'sample_id_like',
-                        'gene_symbol', 'gene_id', 'locus_id']) {
+                        'gene_symbol', 'gene_id', 'locus_id', 'reference_region']) {
         $(`input[name="${name}"]`).val(currentState[name]);
     }
 
@@ -808,7 +813,7 @@ function readStateFromUI() {
     for (const name of ['min_expansion', 'min_repeats_threshold', 'min_pli', 'min_sigma_percentile',
                         'motif_size', 'motif',
                         'phenotype_keyword', 'sample_id_like',
-                        'gene_symbol', 'gene_id', 'locus_id']) {
+                        'gene_symbol', 'gene_id', 'locus_id', 'reference_region']) {
         currentState[name] = $(`input[name="${name}"]`).val().trim();
     }
 
@@ -844,7 +849,7 @@ function buildApiUrl() {
         'require_above_unaffected', 'require_families_above_unaffected',
         'require_above_population', 'motif', 'phenotype_keyword',
         'sample_id_keyword', 'sample_id_like', 'gene_symbol', 'gene_id', 'locus_id',
-        'gene_regions', 'exclude_gene_regions', 'sort_by', 'tag',
+        'reference_region', 'gene_regions', 'exclude_gene_regions', 'sort_by', 'tag',
     ];
     for (const name of optionalStringParams) {
         if (currentState[name]) params.set(name, currentState[name]);
@@ -1088,6 +1093,7 @@ async function performExport(format) {
         if (currentState.gene_symbol) params.set('gene_symbol', currentState.gene_symbol);
         if (currentState.gene_id) params.set('gene_id', currentState.gene_id);
         if (currentState.locus_id) params.set('locus_id', currentState.locus_id);
+        if (currentState.reference_region) params.set('reference_region', currentState.reference_region);
         if (currentState.tag) params.set('tag', currentState.tag);
         if (currentState.sort_by && currentState.sort_by !== 'count') params.set('sort_by', currentState.sort_by);
 
@@ -1132,7 +1138,8 @@ function updateActiveFiltersBar() {
         min_expansion: 'Min Exp', min_repeats_threshold: 'Min Repeats', min_pli: 'Min pLI', min_sigma_percentile: 'σ Percentile',
         motif_size: 'Motif Size',
         motif: 'Motif', phenotype_keyword: 'Phenotype', sample_id_keyword: 'Sample ID',
-        sample_id_like: 'Sample Keyword', gene_symbol: 'Gene', gene_id: 'Gene ID', locus_id: 'Locus ID', tag: 'Tag',
+        sample_id_like: 'Sample Keyword', gene_symbol: 'Gene', gene_id: 'Gene ID', locus_id: 'Locus ID',
+        reference_region: 'Region', tag: 'Tag',
     };
     for (const [key, value] of Object.entries(currentState)) {
         if (key === 'page' || key === 'page_size') continue;

@@ -79,6 +79,11 @@ def _build_minimal_db(path):
         "INSERT INTO loci VALUES (" + ",".join("?" * 37) + ")", rows
     )
 
+    # The reference-region filter's backing index (see result_database.create_loci_indexes);
+    # named through the server's constant so a rename cannot silently split the two.
+    conn.execute(f"CREATE INDEX {results_server.REFERENCE_REGION_INDEX} "
+                 f"ON loci(Chrom, Start0Based, End1Based)")
+
     conn.execute("""CREATE TABLE swim_plot (
         outlier_type TEXT,
         outlier_rank INTEGER,
@@ -263,6 +268,129 @@ class ResultsServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         # The readviz request route is gone, so its handler script must not appear.
         self.assertNotIn("/readviz/request", response.get_data(as_text=True))
+
+    # -- Reference region filter -------------------------------------------------
+
+    def test_parse_reference_region_formats(self):
+        for text, expected in [
+            ("chr16:11579459-11579529", ("chr16", 11579459, 11579529)),
+            ("chr16:11,579,459-11,579,529", ("chr16", 11579459, 11579529)),
+            ("16:100-200", ("chr16", 100, 200)),
+            ("  chrX:0-5  ", ("chrX", 0, 5)),
+            # The prefix is rebuilt in lowercase whatever case was typed.
+            ("Chr1:100-200", ("chr1", 100, 200)),
+            ("CHR1:100-200", ("chr1", 100, 200)),
+            # A bare position, and a zero-length interval, both mean that single base.
+            ("chr1:100", ("chr1", 100, 101)),
+            ("chr1:100-100", ("chr1", 100, 101)),
+            # A chromosome on its own means the whole chromosome.
+            ("chr1", ("chr1", 0, None)),
+            ("chr1:", ("chr1", 0, None)),
+        ]:
+            region, error = results_server.parse_reference_region(text)
+            self.assertIsNone(error, text)
+            self.assertEqual(region, expected, text)
+
+    def test_parse_reference_region_rejects_invalid(self):
+        for text in ["chr1:200-100", "chr1:abc", "chr1:100-abc", "chr1:-200", "chr1:100-200-300", "ch r1:1-2",
+                     # isdigit() accepts these but int() does not, and SQLite cannot bind
+                     # a coordinate wider than a signed 64-bit integer.
+                     "chr1:²", "chr1:9223372036854775808",
+                     "chr1:99999999999999999999-99999999999999999999999",
+                     # A dash means an end is coming; without one the region is truncated,
+                     # not a bare position.
+                     "chr1:100-", "chr1:-"]:
+            region, error = results_server.parse_reference_region(text)
+            self.assertIsNone(region, text)
+            self.assertTrue(error, text)
+        # Blank input is not an error, it just means "no region filter".
+        self.assertEqual(results_server.parse_reference_region("  "), (None, None))
+
+    def test_reference_region_filters_to_overlapping_loci(self):
+        # loci: chr1:[100,110) and chr2:[200,209).
+        for region, expected_ids in [
+            ("chr1:105-106", {"chr1-100-110-AT"}),
+            ("1:105-106", {"chr1-100-110-AT"}),
+            # Case variants of the chromosome name still match the stored "chr1".
+            ("Chr1:105-106", {"chr1-100-110-AT"}),
+            ("CHR1:105-106", {"chr1-100-110-AT"}),
+            ("chr1:105", {"chr1-100-110-AT"}),
+            ("chr1:0-100000", {"chr1-100-110-AT"}),
+            ("chr2", {"chr2-200-209-AAG"}),
+            # Half-open: a region abutting the locus on either side does not overlap it.
+            ("chr1:110-120", set()),
+            ("chr1:90-100", set()),
+            ("chr3:1-1000", set()),
+        ]:
+            response = self.client.get(f"/api/v1/loci?outlier_type=all&reference_region={region}")
+            self.assertEqual(response.status_code, 200, region)
+            data = response.get_json()
+            self.assertEqual({r["LocusId"] for r in data["results"]}, expected_ids, region)
+            self.assertEqual(data["total"], len(expected_ids), region)
+            # The user-facing string is reported back; the parsed tuple stays internal.
+            self.assertEqual(data["filters_applied"].get("reference_region"), region)
+            self.assertNotIn("reference_region_parsed", data["filters_applied"])
+
+    def test_reference_region_invalid_returns_400(self):
+        # An out-of-range coordinate must be rejected up front, not surface as a 500 from
+        # SQLite refusing to bind it.
+        for region in ["chr1:200-100", "chr1:9223372036854775808"]:
+            response = self.client.get(f"/api/v1/loci?outlier_type=all&reference_region={region}")
+            self.assertEqual(response.status_code, 400, region)
+            self.assertIn("reference_region", json.dumps(response.get_json()), region)
+
+    def test_chromosome_name_variants(self):
+        # Both naming conventions, both suffix cases, and the M/MT synonym.
+        self.assertEqual(results_server.chromosome_name_variants("chr1"), ["1", "chr1"])
+        self.assertEqual(results_server.chromosome_name_variants("chrx"),
+                         ["X", "chrX", "chrx", "x"])
+        self.assertEqual(results_server.chromosome_name_variants("chrMT"),
+                         ["M", "MT", "chrM", "chrMT"])
+        self.assertEqual(results_server.chromosome_name_variants("chrM"),
+                         ["M", "MT", "chrM", "chrMT"])
+
+    def test_reference_region_advertised_in_schema(self):
+        filters = self.client.get("/api/v1/schema").get_json()["filters"]
+        self.assertIn("reference_region", filters)
+
+    def test_reference_region_export(self):
+        response = self.client.get("/api/v1/export?outlier_type=all&format=tsv&reference_region=chr1:105-106")
+        self.assertEqual(response.status_code, 200)
+        body = gzip.decompress(response.get_data()).decode("utf-8")
+        self.assertIn("chr1-100-110-AT", body)
+        self.assertNotIn("chr2-200-209-AAG", body)
+
+    def test_reference_region_query_bypasses_skinny_table(self):
+        # Start0Based / End1Based are not projected into the skinny tables, so a region
+        # query has to run against loci even when the skinny fast path is available.
+        base = {"outlier_type": "all", "page": 1, "page_size": 50}
+        original = results_server.app.config.get("HAS_SKINNY", False)
+        results_server.app.config["HAS_SKINNY"] = True
+        try:
+            select_query = results_server.build_api_query(base)[0]
+            self.assertIn("FROM sk_AllAlleles AS loci", select_query)
+
+            region_params = dict(base, reference_region="chr1:105-106",
+                                 reference_region_parsed=("chr1", 105, 106))
+            select_query = results_server.build_api_query(region_params)[0]
+            self.assertNotIn("sk_AllAlleles", select_query)
+            self.assertIn("FROM loci AS loci", select_query)
+        finally:
+            results_server.app.config["HAS_SKINNY"] = original
+
+    def test_reference_region_uses_the_composite_index(self):
+        # The whole point of the filter's shape: an equality seek on Chrom followed by a
+        # b-tree range scan over Start0Based, rather than a scan of every locus.
+        _, count_query, _, _, sql_params, _ = results_server.build_api_query(
+            {"outlier_type": "all", "page": 1, "page_size": 50,
+             "reference_region_parsed": ("chr1", 105, 106)})
+        conn = sqlite3.connect(self.db_path)
+        try:
+            plan = " ".join(str(row) for row in conn.execute(
+                "EXPLAIN QUERY PLAN " + count_query, sql_params))
+        finally:
+            conn.close()
+        self.assertIn(results_server.REFERENCE_REGION_INDEX, plan)
 
 
 if __name__ == "__main__":

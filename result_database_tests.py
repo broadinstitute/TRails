@@ -85,6 +85,20 @@ class WriteLociTableTests(unittest.TestCase):
         self.assertIn("idx_loci_Chrom", created)
         self.assertNotIn("idx_loci_gene_id", created)
         self.assertIn("idx_loci_LocusId", index_names(self.connection, "loci"))
+        # The coordinate columns are absent here, so the composite reference-region index
+        # is correctly skipped.
+        self.assertNotIn("idx_loci_Chrom_Start0Based", created)
+
+    def test_create_loci_indexes_creates_the_reference_region_index(self):
+        # The results server looks this index up by name (results_server.REFERENCE_REGION_INDEX)
+        # and silently falls back to an unindexed region query when it is missing, so pin the
+        # name to its only producer here.
+        records = [{"LocusId": "1-1-10-A", "Chrom": "chr1", "Start0Based": 1, "End1Based": 10}]
+        _, present = result_database.write_loci_table(
+            self.connection, records, self.output_columns + ["Start0Based", "End1Based"])
+        created = result_database.create_loci_indexes(self.connection, present)
+        self.assertIn("idx_loci_Chrom_Start0Based", created)
+        self.assertIn("idx_loci_Chrom_Start0Based", index_names(self.connection, "loci"))
 
 
 class WriteSwimPlotTests(unittest.TestCase):

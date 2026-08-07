@@ -191,6 +191,15 @@ def create_loci_indexes(connection, present_columns):
     ]:
         add_index(f"idx_loci_{column}", column)
 
+    # Composite index backing the reference-region filter: an equality seek on Chrom
+    # followed by a b-tree range scan over Start0Based. End1Based is carried as a third
+    # column so the overlap test and the max-locus-span scan the server runs are served
+    # from the index without touching the table.
+    if {"Chrom", "Start0Based", "End1Based"} <= present:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_loci_Chrom_Start0Based "
+                       "ON loci(Chrom, Start0Based, End1Based)")
+        created.append("idx_loci_Chrom_Start0Based")
+
     # Phenotype score indexes (present only when phenotype scoring ran).
     for outlier_type in OUTLIER_TYPES:
         add_index(f"idx_loci_MaxGenePhenoSim_{outlier_type}",

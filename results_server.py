@@ -110,6 +110,15 @@ VALID_SORTS = (
 REQUIRED_TABLE = "loci"
 REQUIRED_COLUMNS = {"LocusId", "Chrom", "Start0Based", "End1Based", "Motif", "MotifSize"}
 
+# Composite index on loci(Chrom, Start0Based, End1Based) that makes the reference-region
+# filter a b-tree range scan instead of a full table scan (see result_database.py).
+REFERENCE_REGION_INDEX = "idx_loci_Chrom_Start0Based"
+
+# SQLite stores integers as signed 64-bit, so a larger coordinate cannot be bound as a
+# query parameter. A reference-region start must stay strictly below the limit, since a
+# bare position is widened to [start, start + 1).
+MAX_REFERENCE_COORDINATE = 2 ** 63 - 1
+
 GENE_REGION_MAP = {
     "cds": ["CDS"],
     "promoter": ["promoter"],
@@ -247,6 +256,86 @@ def parse_motif_size_filter(motif_size_str):
     return "(" + " OR ".join(clauses) + ")", params, None
 
 
+def parse_reference_region(region_string):
+    """Parse a reference region string into a (chrom, start_0based, end_1based) tuple.
+
+    The "chr" prefix is optional and comma thousands separators are stripped, so the
+    lexical form of a region copied from IGV or the UCSC browser is accepted — but note
+    that the start is read as 0-based, unlike those browsers' 1-based display. The
+    returned chromosome always carries a lowercase "chr" prefix, whatever case was typed.
+
+    - "chr1:100-200": the half-open interval [100, 200), i.e. the same 0-based
+      start / 1-based end convention as the Start0Based and End1Based columns.
+    - "chr1:100": the single base at 0-based position 100, i.e. [100, 101).
+      "chr1:100-100" is read the same way, since a zero-length interval could
+      never overlap any locus.
+    - "chr1": the whole chromosome, returned with an end of None.
+
+    Args:
+        region_string: The filter string from the API parameter.
+
+    Returns:
+        Tuple (region, error_message). region is a (chrom, start_0based, end_1based)
+        tuple, or None when region_string is blank or could not be parsed (in which
+        case error_message describes the problem).
+    """
+    text = (region_string or "").strip().replace(",", "")
+    if not text:
+        return None, None
+
+    expected = "expected 'chrom:start-end' with a 0-based start, e.g. chr16:11579459-11579529"
+    chrom_text, _, span_text = text.partition(":")
+    if not chrom_text or not all(c.isalnum() or c in "._" for c in chrom_text):
+        return None, f"reference_region '{region_string}' has an invalid chromosome — {expected}"
+    # Rebuild the prefix rather than keeping the typed one, so "Chr1" and "CHR1" both
+    # come out as "chr1" and match the stored, case-sensitive chromosome names.
+    suffix = chrom_text[len("chr"):] if chrom_text.lower().startswith("chr") else chrom_text
+    chrom = f"chr{suffix}"
+
+    span_text = span_text.strip()
+    if not span_text:
+        return (chrom, 0, None), None
+
+    start_text, dash, end_text = span_text.partition("-")
+    # isdecimal() rather than isdigit(): the latter also accepts characters like the
+    # superscript "²", which int() then rejects with a ValueError. The end is required
+    # whenever a dash was typed, so a truncated "chr1:100-" is an error rather than
+    # quietly collapsing to the bare-position reading.
+    if not start_text.isdecimal() or (dash and not end_text.isdecimal()):
+        return None, f"reference_region '{region_string}' could not be parsed — {expected}"
+    start = int(start_text)
+    end = int(end_text) if dash else start
+    if end < start:
+        return None, f"reference_region '{region_string}' ends before it starts — {expected}"
+    if start >= MAX_REFERENCE_COORDINATE or end > MAX_REFERENCE_COORDINATE:
+        return None, (f"reference_region '{region_string}' has a coordinate above "
+                      f"{MAX_REFERENCE_COORDINATE} — {expected}")
+
+    return (chrom, start, max(end, start + 1)), None
+
+
+def chromosome_name_variants(chrom):
+    """Return the plausible spellings of a chromosome name, for matching a database.
+
+    Databases differ in whether they store the "chr" prefix, users differ in how they
+    capitalize the suffix, and the mitochondrial chromosome is written as either M or MT.
+    Listing the alternatives as an IN set keeps the lookup an equality seek on the leading
+    column of REFERENCE_REGION_INDEX; a COLLATE NOCASE comparison would match more
+    spellings but would stop SQLite from using the index at all.
+
+    Args:
+        chrom: A chromosome name carrying the lowercase "chr" prefix.
+
+    Returns:
+        A sorted list of candidate names, each with and without the "chr" prefix.
+    """
+    suffix = chrom[len("chr"):]
+    suffixes = {suffix, suffix.upper()}
+    if suffix.upper() in ("M", "MT"):
+        suffixes.update(("M", "MT"))
+    return sorted(suffixes | {f"chr{s}" for s in suffixes})
+
+
 # Override Flask's jsonify to handle NaN values.
 _original_jsonify = flask.jsonify
 
@@ -360,6 +449,11 @@ def validate_database(path):
         if missing:
             print(f"Error: database table '{REQUIRED_TABLE}' missing required columns: {sorted(missing)}")
             sys.exit(1)
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                            (REFERENCE_REGION_INDEX,)).fetchone():
+            print(f"Warning: {path} has no {REFERENCE_REGION_INDEX} index, so Reference Region "
+                  f"searches cannot use the composite Chrom/Start range scan and may have to "
+                  f"examine every locus on the matching chromosome. Rebuild the database to add it.")
     finally:
         conn.close()
 
@@ -622,6 +716,38 @@ def get_db():
     return conn
 
 
+def get_max_locus_span():
+    """Return the largest End1Based - Start0Based across all loci (None if unknown).
+
+    The reference-region filter uses this to put a lower bound on Start0Based: a locus
+    can only overlap a region starting at ``start`` if it begins at or after
+    ``start - max_span``. Without that bound, the index range scan would have to walk
+    every locus on the chromosome from position 0 up to the region.
+
+    Computed once per process and cached, as an index-only scan of
+    ``REFERENCE_REGION_INDEX``. Without that index the region query cannot do the
+    Chrom/Start range scan the bound exists to tighten, so the (then unindexed, and
+    therefore expensive) MAX scan is skipped and None is returned, which simply leaves
+    the lower bound off. That verdict is deliberately not cached: the index can be added
+    to a database while the server is running (see the warning in validate_database), and
+    re-running the sqlite_master lookup on each region query costs nothing.
+
+    Returns:
+        The maximum locus span in bp, or None when it is not worth computing.
+    """
+    if "MAX_LOCUS_SPAN" not in app.config:
+        conn = get_db()
+        try:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                                (REFERENCE_REGION_INDEX,)).fetchone():
+                return None
+            app.config["MAX_LOCUS_SPAN"] = conn.execute(
+                "SELECT MAX(End1Based - Start0Based) FROM loci").fetchone()[0]
+        finally:
+            conn.close()
+    return app.config["MAX_LOCUS_SPAN"]
+
+
 # ---------------------------------------------------------------------------
 # CORS handler
 # ---------------------------------------------------------------------------
@@ -792,6 +918,16 @@ def validate_params():
 
     if request.args.get("locus_id"):
         params["locus_id"] = [lid.strip() for lid in request.args["locus_id"].split(",") if lid.strip()]
+
+    if request.args.get("reference_region"):
+        region, error = parse_reference_region(request.args["reference_region"])
+        if error:
+            errors.append(error)
+        elif region:
+            # Keep the user-facing string for filters_applied; the parsed tuple below is
+            # a SQL internal consumed by build_api_query (excluded from filters_applied).
+            params["reference_region"] = request.args["reference_region"].strip()
+            params["reference_region_parsed"] = region
 
     if request.args.get("chrom"):
         params["chrom"] = request.args["chrom"]
@@ -1037,6 +1173,33 @@ def build_api_query(params):
         clauses.append(f"LocusId IN ({','.join('?' * len(params['locus_id']))})")
         sql_params.extend(params["locus_id"])
 
+    if "reference_region_parsed" in params:
+        chrom, region_start, region_end = params["reference_region_parsed"]
+        # Chrom is matched against both naming conventions ("chr1" and "1") so the filter
+        # works whichever one the database uses; both are equality seeks on the leading
+        # column of REFERENCE_REGION_INDEX.
+        chrom_names = chromosome_name_variants(chrom)
+        region_clauses = [f"loci.Chrom IN ({','.join('?' * len(chrom_names))})"]
+        region_params = list(chrom_names)
+        if region_end is not None:
+            # Half-open overlap: the locus starts before the region ends and ends after
+            # the region starts.
+            region_clauses.append("loci.Start0Based < ?")
+            region_params.append(region_end)
+            region_clauses.append("loci.End1Based > ?")
+            region_params.append(region_start)
+        # A locus that overlaps the region cannot start before this. The bound is
+        # redundant with End1Based > region_start, but it is what lets SQLite range-scan
+        # REFERENCE_REGION_INDEX (and stay inside it) rather than walking the whole
+        # chromosome and reading each locus from the table. It stays in even for a
+        # whole-chromosome region, where it is just >= 0, for the same reason. A locus
+        # with no Start0Based is dropped, which is right for a coordinate filter.
+        max_span = get_max_locus_span()
+        region_clauses.append("loci.Start0Based >= ?")
+        region_params.append(max(0, region_start - max_span) if max_span is not None else 0)
+        clauses.append(" AND ".join(region_clauses))
+        sql_params.extend(region_params)
+
     if "chrom" in params:
         clauses.append("Chrom = ?")
         sql_params.append(params["chrom"])
@@ -1078,14 +1241,25 @@ def build_api_query(params):
     order_by, _ = build_api_order_by(params)
     motif_count_col = "CanonicalMotif" if "CanonicalMotif" in source_columns else "Motif"
 
-    if app.config.get("HAS_SKINNY", False):
-        skinny = f"sk_{ot}"
-        inner = f"SELECT LocusId FROM {skinny} AS loci WHERE {where}{order_by} LIMIT ? OFFSET ?"
+    # The reference-region filter reads Start0Based / End1Based, which the skinny tables
+    # do not project, so those queries run against the full loci table — where
+    # REFERENCE_REGION_INDEX turns the region into a b-tree range scan, which is far more
+    # selective than the skinny table's sequential scan anyway. The deferred-lookup shape
+    # below is kept either way, so the sort never holds wide rows.
+    if "reference_region_parsed" in params:
+        filter_table = "loci"
+    elif app.config.get("HAS_SKINNY", False):
+        filter_table = f"sk_{ot}"
+    else:
+        filter_table = None
+
+    if filter_table:
+        inner = f"SELECT LocusId FROM {filter_table} AS loci WHERE {where}{order_by} LIMIT ? OFFSET ?"
         select_query = (f"SELECT loci.* FROM loci "
                         f"JOIN ({inner}) pick ON loci.LocusId = pick.LocusId{order_by}")
-        count_query = f"SELECT COUNT(*) FROM {skinny} AS loci WHERE {where}"
-        motif_count_query = f"SELECT {motif_count_col}, COUNT(*) as count FROM {skinny} AS loci WHERE {where} GROUP BY {motif_count_col} ORDER BY count DESC"
-        gene_region_count_query = f"SELECT gene_region, COUNT(*) as count FROM {skinny} AS loci WHERE {where} GROUP BY gene_region"
+        count_query = f"SELECT COUNT(*) FROM {filter_table} AS loci WHERE {where}"
+        motif_count_query = f"SELECT {motif_count_col}, COUNT(*) as count FROM {filter_table} AS loci WHERE {where} GROUP BY {motif_count_col} ORDER BY count DESC"
+        gene_region_count_query = f"SELECT gene_region, COUNT(*) as count FROM {filter_table} AS loci WHERE {where} GROUP BY gene_region"
     else:
         select_query = f"SELECT * FROM loci WHERE {where}{order_by} LIMIT ? OFFSET ?"
         count_query = f"SELECT COUNT(*) FROM loci WHERE {where}"
@@ -1706,7 +1880,8 @@ def get_loci():
             r["PathogenicMin"] = pathogenic_thresholds[lid]
 
     filters_applied = {k: v for k, v in params.items()
-                       if k not in ("page", "page_size", "outlier_type", "sort_by", "motif_size_clause", "motif_size_params")}
+                       if k not in ("page", "page_size", "outlier_type", "sort_by", "motif_size_clause",
+                                    "motif_size_params", "reference_region_parsed")}
 
     return jsonify({
         "total": total,
@@ -1792,7 +1967,7 @@ def export_json(conn, query, count_query, sql_params, ot, params):
     lookups = app.config["LOOKUPS"]
 
     non_filter_keys = {"source", "outlier_type", "sort_by", "page", "page_size",
-                       "motif_size_clause", "motif_size_params"}
+                       "motif_size_clause", "motif_size_params", "reference_region_parsed"}
     filters_applied = {k: v for k, v in params.items() if k not in non_filter_keys}
 
     try:
@@ -2515,6 +2690,7 @@ def get_schema():
             "min_pli": {"type": "float", "min": 0.0, "max": 1.0},
             "min_sigma_percentile": {"type": "float", "min": 0.0, "max": 1.0, "description": "Keep loci whose HPRC256/AoU1027 stdev percentile is in the top (1 - value) fraction"},
             "chrom": {"type": "string", "description": "Filter to a single chromosome (e.g. chr1)"},
+            "reference_region": {"type": "string", "description": "Keep loci overlapping a reference-genome region, as 'chrom:start-end' with a 0-based start and an exclusive end (e.g. chr16:11579459-11579529). The 'chr' prefix and comma separators are optional; a bare position or a bare chromosome is also accepted"},
             "motif": {"type": "string"},
             "phenotype_keyword": {"type": "string"},
             "sample_id_keyword": {"type": "string", "description": "Comma-separated exact sample IDs from dropdown"},
@@ -2579,6 +2755,8 @@ def configure_app(db_path, sample_table=None, known_loci_json=None, annotations_
     """
     db_path = os.path.abspath(db_path)
     app.config["DB_PATH"] = db_path
+    # Drop any max-locus-span cached from a previously configured database.
+    app.config.pop("MAX_LOCUS_SPAN", None)
     # The templates still expect a db_labels list (their source-selector block is
     # guarded by `db_labels|length > 1`, so a single entry hides the selector).
     app.config["DB_LABELS"] = ["TRails"]
