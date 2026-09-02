@@ -39,17 +39,18 @@ OUTLIER_TYPES = ("AllAlleles", "ShortAlleles", "HemizygousAlleles")
 def shared_columns():
     """Returns the shared (not outlier-type-specific) skinny-table column names.
 
-    These are the 21 columns referenced by the server's filters and sorts that do
+    These are the 22 columns referenced by the server's filters and sorts that do
     not carry an outlier-type suffix. The order is preserved exactly so the
     projection is stable across runs.
 
     Returns:
-        A list of 21 column-name strings.
+        A list of 22 column-name strings.
     """
     return [
         "LocusId", "Chrom", "gene_id", "Motif", "CanonicalMotif",
         "gene_region", "gene_region_rank", "MotifSize", "NumRepeatsInReference",
         "pLI", "IsKnownMotif", "IsInMendelianGene", "GeneTableGeneSymbol",
+        "VariationClusterSizeDiff",
         "HPRC256_99thPercentile", "HPRC256_MaxAllele",
         "AoU1027_99thPercentile", "AoU1027_MaxAllele",
         "TenK10K_99thPercentile", "TenK10K_MaxAllele",

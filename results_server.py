@@ -19,6 +19,7 @@ from datetime import datetime
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 import traceback
@@ -256,6 +257,94 @@ def parse_motif_size_filter(motif_size_str):
     return "(" + " OR ".join(clauses) + ")", params, None
 
 
+# Shapes the merged search box routes on, checked in this order (see classify_search_term).
+# A locus id is "{chrom}-{start}-{end}-{MOTIF}"; a gene id is an Ensembl accession; a region is
+# a chromosome with an optional span. Everything else is treated as a gene symbol.
+SEARCH_LOCUS_ID_PATTERN = re.compile(r"^[0-9A-Za-z._]+-\d+-\d+-[ACGTNacgtn]+$")
+SEARCH_GENE_ID_PATTERN = re.compile(r"^(ENSG\d+)(?:\.\d+)?$", re.IGNORECASE)
+# Commas do double duty in the search box: they separate terms, and they are the thousands
+# separators parse_reference_region accepts inside a region ("chr16:11,579,459-11,579,529").
+# Matching a region-with-span first consumes those internal commas as part of the term, leaving
+# every other comma to separate terms. The span is required in this branch, so a bare chromosome
+# is not swallowed and "1,2,3" still splits into three terms.
+SEARCH_TERM_PATTERN = re.compile(
+    r"\s*(?:(?P<region>(?:chr)?(?:\d{1,2}|X|Y|M|MT):[\d,]+(?:-[\d,]+)?)|(?P<other>[^,]+))\s*(?:,|$)",
+    re.IGNORECASE)
+
+
+def split_search_terms(text):
+    """Split the search box's value into terms without breaking comma-formatted regions.
+
+    Args:
+        text: The raw search string.
+
+    Returns:
+        List of stripped, non-empty terms.
+    """
+    terms = []
+    for match in SEARCH_TERM_PATTERN.finditer(text or ""):
+        term = (match.group("region") or match.group("other") or "").strip()
+        if term:
+            terms.append(term)
+    return terms
+SEARCH_REGION_PATTERN = re.compile(r"^(?:chr)?(?:\d{1,2}|X|Y|M|MT)(?::[\d,]+(?:-[\d,]+)?)?$", re.IGNORECASE)
+
+
+def normalize_gene_id(text):
+    """Return an Ensembl gene id spelled the way the database stores it, else None.
+
+    Stored gene ids are upper case and carry no ".<version>" suffix. Normalizing the queried value
+    keeps the comparison an indexed equality test, which COLLATE NOCASE would give up.
+
+    Args:
+        text: A candidate gene id.
+
+    Returns:
+        The normalized gene id, or None when text is not shaped like an Ensembl gene id.
+    """
+    match = SEARCH_GENE_ID_PATTERN.match((text or "").strip())
+    return match.group(1).upper() if match else None
+
+
+def classify_search_term(term):
+    """Route one term from the merged search box to the filter it belongs to.
+
+    The search box replaces the separate Gene Symbol(s), Gene ID, Locus Id(s) and Reference
+    Region fields, so each term is classified by its shape:
+
+      - "2-89831737-89831752-CCATT"           -> locus id
+      - "ENSG00000102081"                     -> gene id
+      - "chr16:11579459-11579529", "chr16"    -> reference region
+      - anything else, e.g. "FMR1"            -> gene symbol
+
+    Regions are recognized with a strict pattern rather than by handing every term to
+    parse_reference_region, which reads any bare alphanumeric string as a whole chromosome and
+    would therefore swallow every gene symbol.
+
+    Args:
+        term: One stripped, non-empty term from the search box.
+
+    Returns:
+        Tuple (kind, value, error_message). kind is "locus_id", "gene_id", "region" or
+        "gene_symbol". value is the parsed (chrom, start_0based, end_1based) tuple for a
+        region and the term itself otherwise. On a region that will not parse, kind and value
+        are None and error_message says why.
+    """
+    if SEARCH_LOCUS_ID_PATTERN.match(term):
+        # Stored locus ids spell the motif in upper case. Normalize rather than comparing with
+        # COLLATE NOCASE, which would give up the index on LocusId.
+        return "locus_id", term.upper(), None
+    normalized_gene_id = normalize_gene_id(term)
+    if normalized_gene_id:
+        return "gene_id", normalized_gene_id, None
+    if SEARCH_REGION_PATTERN.match(term):
+        region, error = parse_reference_region(term)
+        if region is None:
+            return None, None, error or f"search term '{term}' is not a valid region"
+        return "region", region, None
+    return "gene_symbol", term, None
+
+
 def parse_reference_region(region_string):
     """Parse a reference region string into a (chrom, start_0based, end_1based) tuple.
 
@@ -426,6 +515,49 @@ def parse_args():
     return parser.parse_args()
 
 
+def find_leftover_write_files(path):
+    """Find leftover journal files sitting next to a SQLite database.
+
+    A script that is killed part way through writing leaves behind a rollback journal
+    (<db>-journal) or a write-ahead log (<db>-wal). SQLite has to roll the database back
+    to its last committed state before it will serve any read, so a read-only connection
+    fails on even a plain SELECT with "attempt to write a readonly database".
+
+    Args:
+        path: Path to the SQLite database file.
+
+    Returns:
+        List of (filename, size in bytes) tuples for each journal file that exists.
+    """
+    return [(path + suffix, os.path.getsize(path + suffix))
+            for suffix in ("-journal", "-wal")
+            if os.path.exists(path + suffix)]
+
+
+def print_leftover_write_files_help(path, error, leftover):
+    """Explain a read-only open that failed because of leftover journal files.
+
+    Args:
+        path: Path to the SQLite database file.
+        error: The sqlite3 error that was raised.
+        leftover: List of (filename, size in bytes) tuples from find_leftover_write_files.
+    """
+    abspath = os.path.abspath(path)
+    print(f"Error: database could not be read: {error}")
+    print(f"  This is almost certainly because of these leftover journal files next to {path}:")
+    for filename, size in leftover:
+        print(f"    {os.path.basename(filename)}  ({size:,d} bytes)")
+    print("  They are left behind when a script writing to the database is killed part way through, and")
+    print("  SQLite has to roll the database back to its last committed state before it will serve any")
+    print("  read. This server opens databases read-only, so it cannot do that and even a SELECT fails.")
+    print("  To recover, first check that nothing is still writing to the database:")
+    print(f"    lsof '{abspath}'")
+    print("  If that prints nothing, open it once read-write so SQLite does the rollback itself:")
+    print(f"    python3 -c \"import sqlite3; sqlite3.connect('{abspath}').execute('SELECT 1')\"")
+    print("  The interrupted write never committed, so its changes are discarded and whichever script")
+    print("  was writing to the database has to be re-run.")
+
+
 def validate_database(path):
     """Validate that the database file exists and has the required table/columns.
 
@@ -437,9 +569,16 @@ def validate_database(path):
         sys.exit(1)
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        tables = [row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()]
+        try:
+            tables = [row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()]
+        except sqlite3.OperationalError as e:
+            leftover = find_leftover_write_files(path)
+            if not leftover:
+                raise
+            print_leftover_write_files_help(path, e, leftover)
+            sys.exit(1)
         if REQUIRED_TABLE not in tables:
             print(f"Error: database missing required table '{REQUIRED_TABLE}'. Found tables: {tables}")
             sys.exit(1)
@@ -916,6 +1055,32 @@ def validate_params():
     if request.args.get("sample_id_like"):
         params["sample_id_like"] = [kw.strip() for kw in request.args["sample_id_like"].split(",") if kw.strip()]
 
+    # search (optional, comma-separated; each term routed by shape, all OR'ed together). The
+    # separate locus_id / reference_region / gene_symbol / gene_id parameters below still work
+    # for anyone calling the API directly; the UI sends this one instead.
+    if request.args.get("search"):
+        search_terms = []
+        for term in split_search_terms(request.args["search"]):
+            kind, value, error = classify_search_term(term)
+            if error:
+                errors.append(error)
+            else:
+                search_terms.append((kind, value))
+        if search_terms:
+            # Keep the user-facing string for filters_applied; the classified terms below are
+            # a SQL internal consumed by build_api_query (excluded from filters_applied).
+            params["search"] = request.args["search"].strip()
+            params["search_terms"] = search_terms
+
+    # max_variation_cluster_size_diff (optional, bp): keeps loci whose TRExplorer variation
+    # cluster is at most this much larger than the repeat itself.
+    if request.args.get("max_variation_cluster_size_diff"):
+        try:
+            params["max_variation_cluster_size_diff"] = int(request.args["max_variation_cluster_size_diff"])
+        except ValueError:
+            errors.append("max_variation_cluster_size_diff must be an integer number of base pairs, "
+                          f"got '{request.args['max_variation_cluster_size_diff']}'")
+
     if request.args.get("locus_id"):
         params["locus_id"] = [lid.strip() for lid in request.args["locus_id"].split(",") if lid.strip()]
 
@@ -932,7 +1097,10 @@ def validate_params():
     if request.args.get("chrom"):
         params["chrom"] = request.args["chrom"]
     if request.args.get("gene_id"):
-        params["gene_id"] = request.args["gene_id"]
+        # Normalized like a search-box term, so ?gene_id=ensg00000102081 and a versioned
+        # ?gene_id=ENSG00000102081.5 match the stored spelling instead of silently returning
+        # nothing. A value that is not an Ensembl gene id is passed through unchanged.
+        params["gene_id"] = normalize_gene_id(request.args["gene_id"]) or request.args["gene_id"].strip()
     if request.args.get("gene_symbol"):
         params["gene_symbol"] = [gs.strip() for gs in request.args["gene_symbol"].split(",") if gs.strip()]
 
@@ -1005,6 +1173,68 @@ def build_api_order_by(params):
     if not order_parts:
         return f" ORDER BY FirstAffectedAlleleSize_{ot} DESC", False
     return " ORDER BY " + ", ".join(order_parts), False
+
+
+def requires_full_loci_table(params, ot):
+    """Whether a query has to filter over `loci` rather than over a skinny sk_{ot} table.
+
+    The skinny tables project only the columns the common queries need. Start0Based / End1Based
+    are never projected, so a reference region (including one typed into the search box) always
+    falls back. The variation-cluster filter falls back only when this database's skinny tables
+    predate the column, so a rebuilt database answers it from the narrow table instead.
+
+    Args:
+        params: dict of validated query parameters.
+        ot: outlier-type suffix ("AllAlleles", "ShortAlleles", "HemizygousAlleles").
+
+    Returns:
+        True when the query must filter over the full loci table.
+    """
+    if ("reference_region_parsed" in params
+            or any(kind == "region" for kind, _value in params.get("search_terms", []))):
+        return True
+    if "max_variation_cluster_size_diff" in params:
+        return "VariationClusterSizeDiff" not in app.config.get("SKINNY_COLUMNS", {}).get(ot, set())
+    return False
+
+
+def reference_region_clause(parsed_region):
+    """Build the SQL that keeps the loci overlapping one reference region.
+
+    Shared by the reference_region filter and by any region typed into the merged search box,
+    so both get the same index-friendly bounds.
+
+    Args:
+        parsed_region: (chrom, start_0based, end_1based) from parse_reference_region. The end
+            is None for a whole chromosome.
+
+    Returns:
+        Tuple (clause, params) to append to a WHERE clause.
+    """
+    chrom, region_start, region_end = parsed_region
+    # Chrom is matched against both naming conventions ("chr1" and "1") so the filter
+    # works whichever one the database uses; both are equality seeks on the leading
+    # column of REFERENCE_REGION_INDEX.
+    chrom_names = chromosome_name_variants(chrom)
+    region_clauses = [f"loci.Chrom IN ({','.join('?' * len(chrom_names))})"]
+    region_params = list(chrom_names)
+    if region_end is not None:
+        # Half-open overlap: the locus starts before the region ends and ends after
+        # the region starts.
+        region_clauses.append("loci.Start0Based < ?")
+        region_params.append(region_end)
+        region_clauses.append("loci.End1Based > ?")
+        region_params.append(region_start)
+    # A locus that overlaps the region cannot start before this. The bound is
+    # redundant with End1Based > region_start, but it is what lets SQLite range-scan
+    # REFERENCE_REGION_INDEX (and stay inside it) rather than walking the whole
+    # chromosome and reading each locus from the table. It stays in even for a
+    # whole-chromosome region, where it is just >= 0, for the same reason. A locus
+    # with no Start0Based is dropped, which is right for a coordinate filter.
+    max_span = get_max_locus_span()
+    region_clauses.append("loci.Start0Based >= ?")
+    region_params.append(max(0, region_start - max_span) if max_span is not None else 0)
+    return " AND ".join(region_clauses), region_params
 
 
 def build_api_query(params):
@@ -1174,31 +1404,44 @@ def build_api_query(params):
         sql_params.extend(params["locus_id"])
 
     if "reference_region_parsed" in params:
-        chrom, region_start, region_end = params["reference_region_parsed"]
-        # Chrom is matched against both naming conventions ("chr1" and "1") so the filter
-        # works whichever one the database uses; both are equality seeks on the leading
-        # column of REFERENCE_REGION_INDEX.
-        chrom_names = chromosome_name_variants(chrom)
-        region_clauses = [f"loci.Chrom IN ({','.join('?' * len(chrom_names))})"]
-        region_params = list(chrom_names)
-        if region_end is not None:
-            # Half-open overlap: the locus starts before the region ends and ends after
-            # the region starts.
-            region_clauses.append("loci.Start0Based < ?")
-            region_params.append(region_end)
-            region_clauses.append("loci.End1Based > ?")
-            region_params.append(region_start)
-        # A locus that overlaps the region cannot start before this. The bound is
-        # redundant with End1Based > region_start, but it is what lets SQLite range-scan
-        # REFERENCE_REGION_INDEX (and stay inside it) rather than walking the whole
-        # chromosome and reading each locus from the table. It stays in even for a
-        # whole-chromosome region, where it is just >= 0, for the same reason. A locus
-        # with no Start0Based is dropped, which is right for a coordinate filter.
-        max_span = get_max_locus_span()
-        region_clauses.append("loci.Start0Based >= ?")
-        region_params.append(max(0, region_start - max_span) if max_span is not None else 0)
-        clauses.append(" AND ".join(region_clauses))
+        clause, region_params = reference_region_clause(params["reference_region_parsed"])
+        clauses.append(clause)
         sql_params.extend(region_params)
+
+    # Merged search box: locus ids, gene ids, gene symbols and reference regions in one field,
+    # matching a locus that satisfies any one of them. A term whose column the database lacks is
+    # dropped from the OR, the same way the separate gene filters below degrade; if that leaves
+    # no terms at all the filter matches nothing rather than everything.
+    if "search_terms" in params:
+        search_clauses = []
+        for kind, value in params["search_terms"]:
+            if kind == "locus_id":
+                search_clauses.append("LocusId = ?")
+                sql_params.append(value)
+            elif kind == "gene_id":
+                if not source_columns or "gene_id" in source_columns:
+                    search_clauses.append("gene_id = ?")
+                    sql_params.append(value)
+            elif kind == "gene_symbol":
+                if "GeneTableGeneSymbol" in app.config["DB_COLUMNS_SET"]:
+                    search_clauses.append("GeneTableGeneSymbol LIKE ? COLLATE NOCASE")
+                    sql_params.append(f"%{value}%")
+            else:
+                clause, region_params = reference_region_clause(value)
+                search_clauses.append(f"({clause})")
+                sql_params.extend(region_params)
+        clauses.append(f"({' OR '.join(search_clauses)})" if search_clauses else "0")
+
+    # Max variation cluster size diff. The TRExplorer column is TEXT, so it is compared
+    # numerically. A locus with no variation cluster has no variation beyond the repeat itself,
+    # so it passes any maximum.
+    if "max_variation_cluster_size_diff" in params:
+        if not source_columns or "VariationClusterSizeDiff" in source_columns:
+            clauses.append("(loci.VariationClusterSizeDiff IS NULL OR loci.VariationClusterSizeDiff = '' "
+                           "OR CAST(loci.VariationClusterSizeDiff AS INTEGER) <= ?)")
+            sql_params.append(params["max_variation_cluster_size_diff"])
+        else:
+            clauses.append("1=0")
 
     if "chrom" in params:
         clauses.append("Chrom = ?")
@@ -1241,12 +1484,13 @@ def build_api_query(params):
     order_by, _ = build_api_order_by(params)
     motif_count_col = "CanonicalMotif" if "CanonicalMotif" in source_columns else "Motif"
 
-    # The reference-region filter reads Start0Based / End1Based, which the skinny tables
-    # do not project, so those queries run against the full loci table — where
-    # REFERENCE_REGION_INDEX turns the region into a b-tree range scan, which is far more
-    # selective than the skinny table's sequential scan anyway. The deferred-lookup shape
-    # below is kept either way, so the sort never holds wide rows.
-    if "reference_region_parsed" in params:
+    # The reference-region filter reads Start0Based / End1Based and the variation-cluster
+    # filter reads VariationClusterSizeDiff, none of which the skinny tables project, so those
+    # queries run against the full loci table, where REFERENCE_REGION_INDEX turns a region into
+    # a b-tree range scan, which is far more selective than the skinny table's sequential scan
+    # anyway. The deferred-lookup shape below is kept either way, so the sort never holds wide
+    # rows.
+    if requires_full_loci_table(params, ot):
         filter_table = "loci"
     elif app.config.get("HAS_SKINNY", False):
         filter_table = f"sk_{ot}"
@@ -1881,7 +2125,8 @@ def get_loci():
 
     filters_applied = {k: v for k, v in params.items()
                        if k not in ("page", "page_size", "outlier_type", "sort_by", "motif_size_clause",
-                                    "motif_size_params", "reference_region_parsed")}
+                                    "motif_size_params", "reference_region_parsed",
+                                    "search_terms")}
 
     return jsonify({
         "total": total,
@@ -1967,7 +2212,8 @@ def export_json(conn, query, count_query, sql_params, ot, params):
     lookups = app.config["LOOKUPS"]
 
     non_filter_keys = {"source", "outlier_type", "sort_by", "page", "page_size",
-                       "motif_size_clause", "motif_size_params", "reference_region_parsed"}
+                       "motif_size_clause", "motif_size_params", "reference_region_parsed",
+                       "search_terms"}
     filters_applied = {k: v for k, v in params.items() if k not in non_filter_keys}
 
     try:
@@ -2225,6 +2471,8 @@ def get_swim_plot_data():
     locus_id_raw = request.args.get("locus_id", "")
     gene_symbol_raw = request.args.get("gene_symbol", "")
     gene_id = request.args.get("gene_id", "")
+    search_raw = request.args.get("search", "")
+    max_variation_cluster_size_diff = request.args.get("max_variation_cluster_size_diff", "")
     min_pli = request.args.get("min_pli", "")
     phenotype_keyword_raw = request.args.get("phenotype_keyword", "")
     sample_id_keyword_raw = request.args.get("sample_id_keyword", "")
@@ -2340,7 +2588,60 @@ def get_swim_plot_data():
     if gene_id:
         if not source_columns or "gene_id" in source_columns:
             extra_clauses.append("gene_id = ?")
-            extra_params.append(gene_id)
+            extra_params.append(normalize_gene_id(gene_id) or gene_id.strip())
+        else:
+            extra_clauses.append("1=0")
+
+    # Merged search box, the same OR over locus ids / gene ids / gene symbols / regions that
+    # build_api_query applies. swim_plot carries no coordinates, so a region term is answered by
+    # a subquery against loci in the same database rather than by materializing its locus ids,
+    # which for a whole chromosome would be hundreds of thousands of bind parameters.
+    if search_raw:
+        search_clauses = []
+        for term in split_search_terms(search_raw):
+            kind, value, error = classify_search_term(term)
+            if error:
+                return jsonify({"error": "Invalid parameter", "detail": error}), 400
+            if kind == "locus_id":
+                search_clauses.append("LocusId = ?")
+                extra_params.append(value)
+            elif kind == "gene_id":
+                if not source_columns or "gene_id" in source_columns:
+                    search_clauses.append("gene_id = ?")
+                    extra_params.append(value)
+            elif kind == "gene_symbol":
+                if not source_columns or "GeneTableGeneSymbol" in source_columns:
+                    search_clauses.append("GeneTableGeneSymbol LIKE ? COLLATE NOCASE")
+                    extra_params.append(f"%{value}%")
+            else:
+                clause, region_params = reference_region_clause(value)
+                search_clauses.append(f"LocusId IN (SELECT LocusId FROM loci AS loci WHERE {clause})")
+                extra_params.extend(region_params)
+        extra_clauses.append(f"({' OR '.join(search_clauses)})" if search_clauses else "1=0")
+
+    # Max variation cluster size diff. swim_plot does not copy VariationClusterSizeDiff, so this
+    # is answered against loci too, the same way a region term is.
+    # Set below when the variation-cluster filter is active, and consumed once the connection is
+    # open to populate the vc_filtered_loci temp table the clause refers to.
+    vc_filter_max = None
+    if max_variation_cluster_size_diff:
+        try:
+            max_vc_diff = int(max_variation_cluster_size_diff)
+        except ValueError:
+            return jsonify({
+                "error": "Invalid parameter",
+                "detail": "max_variation_cluster_size_diff must be an integer number of base pairs, "
+                          f"got '{max_variation_cluster_size_diff}'",
+            }), 400
+        # The lookup reads loci, not swim_plot, so the guard checks the loci column set rather
+        # than source_columns above. Without the column the filter cannot be answered, so match
+        # nothing instead of raising "no such column", the same choice build_api_query makes.
+        if not source_columns or "VariationClusterSizeDiff" in source_columns:
+            # This endpoint runs one query per motif category, so an inline subquery over loci
+            # would re-scan that table 25 times for a single chart. Materialize the matching
+            # LocusIds once, after the connection is opened, and probe them by index instead.
+            vc_filter_max = max_vc_diff
+            extra_clauses.append("LocusId IN (SELECT LocusId FROM vc_filtered_loci)")
         else:
             extra_clauses.append("1=0")
 
@@ -2430,6 +2731,15 @@ def get_swim_plot_data():
             "SELECT name FROM sqlite_master WHERE type='table' AND name='swim_plot'"
         ).fetchone():
             return jsonify({"error": "swim_plot table not found", "detail": "The database has no swim_plot table."}), 500
+
+        if vc_filter_max is not None:
+            # A read-only main database still allows temp tables (they live in the separate temp
+            # database), so this costs one scan of loci per request instead of one per category.
+            conn.execute(
+                "CREATE TEMP TABLE vc_filtered_loci AS SELECT LocusId FROM loci "
+                "WHERE VariationClusterSizeDiff IS NULL OR VariationClusterSizeDiff = '' "
+                "OR CAST(VariationClusterSizeDiff AS INTEGER) <= ?", (vc_filter_max,))
+            conn.execute("CREATE INDEX temp.idx_vc_filtered_loci ON vc_filtered_loci(LocusId)")
 
         for motif_category in categories:
             query = ("""SELECT rowid, allele_size, motif_category, affected_status,
@@ -2699,6 +3009,9 @@ def get_schema():
             "known_loci_only": {"type": "boolean"},
             "known_motifs_only": {"type": "boolean"},
             "mendelian_genes_only": {"type": "boolean"},
+            "search": {"type": "string", "description": "Comma-separated search terms, OR-combined. Each term is routed by its shape: a locus id (2-89831737-89831752-CCATT), an Ensembl gene id (ENSG00000102081), a reference region (chr16:11579459-11579529, chr16:11579459 or chr16), or otherwise a gene symbol matched as a substring. Commas inside a region's coordinates are treated as thousands separators, not term separators"},
+            "max_variation_cluster_size_diff": {"type": "integer", "description": "Keep loci whose TRExplorer variation cluster is at most this many base pairs larger than the repeat itself. Loci with no variation cluster annotation are kept"},
+            # The legacy parameters below are superseded by 'search', which the UI sends instead; they still work for direct API callers.
             "gene_id": {"type": "string"},
             "gene_symbol": {"type": "string"},
             "locus_id": {"type": "string"},
@@ -2812,6 +3125,13 @@ def configure_app(db_path, sample_table=None, known_loci_json=None, annotations_
             })
         else:
             sample_ids = []
+        # Which columns each skinny table projects. A filter reading a column the narrow table
+        # does not carry has to fall back to loci, and which columns those are depends on when
+        # the database was built (see skinny_tables.shared_columns).
+        skinny_columns = {
+            ot: {row[1] for row in conn.execute(f"SELECT * FROM pragma_table_info('sk_{ot}')")}
+            for ot in OUTLIER_TYPE_MAP.values() if f"sk_{ot}" in tables
+        }
     finally:
         conn.close()
 
@@ -2821,6 +3141,7 @@ def configure_app(db_path, sample_table=None, known_loci_json=None, annotations_
     app.config["DB_COLUMNS_SET"] = db_columns_set
     app.config["DB_TABLES"] = tables
     app.config["HAS_SKINNY"] = {f"sk_{ot}" for ot in OUTLIER_TYPE_MAP.values()}.issubset(tables)
+    app.config["SKINNY_COLUMNS"] = skinny_columns
     app.config["HAS_MENDELIAN"] = "mendelian_violations" in tables
     app.config["SAMPLE_IDS"] = sample_ids
 

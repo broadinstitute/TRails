@@ -193,34 +193,26 @@
     </div>
     </div>
 
-    <!-- Additional filters (4 columns) -->
-    <div class="ui stackable four column grid" style="margin: 0;">
+    <!-- Search: gene symbols, gene IDs, locus IDs and reference regions in one box -->
+    <div class="field" style="margin-bottom: 1.2em;">
+        <label style="display: inline;">Search</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="Searches <b>gene symbols, gene IDs, locus IDs and reference regions</b> in one box, replacing the four separate fields.<br /><br />Each comma-separated term is routed by its shape, and a locus is kept if it matches <b>any</b> term:<br />&bull; <b>FMR1</b> &mdash; gene symbol (substring match)<br />&bull; <b>ENSG00000102081</b> &mdash; Ensembl gene ID<br />&bull; <b>2-89831737-89831752-CCATT</b> &mdash; locus ID<br />&bull; <b>chr16:11579459-11579529</b>, <b>chr16:11579459</b> or <b>chr16</b> &mdash; reference region, with a 0-based start"></i>
+        <input type="text" name="search" placeholder="e.g., FMR1, ENSG00000102081, 2-89831737-89831752-CCATT, chr16:11579459-11579529">
+    </div>
+
+    <!-- Additional filters (3 columns) -->
+    <div class="ui stackable three column grid" style="margin: 0;">
     <div class="column">
         <div class="field">
             <label>Motif Size (bp)</label>
             <input type="text" name="motif_size" placeholder="e.g., 3, 5-10, 15-" title="Examples: 3 (exact), 3-6 (range), 5- (5 and above), -10 (up to 10). Comma-separate for OR.">
         </div>
         <div class="field">
-            <label>Locus Id(s)</label>
-            <input type="text" name="locus_id" placeholder="e.g., 2-89831737-89831752-CCATT">
-        </div>
-        <div class="field">
-            <label>Reference Region</label>
-            <input type="text" name="reference_region" placeholder="e.g., chr16:11579459-11579529" title="Keeps the loci that overlap this region of the reference genome. The start is 0-based and the end is exclusive, matching the coordinates in a Locus Id. The 'chr' prefix and comma separators are optional. Also accepts a single position (chr16:11579459) or a whole chromosome (chr16).">
-        </div>
-    </div>
-    <div class="column">
-        <div class="field">
             <label>Motif(s)</label>
             <input type="text" name="motif" placeholder="e.g., CCG, CAG">
         </div>
         <div class="field">
-            <label>Gene Symbol(s)</label>
-            <input type="text" name="gene_symbol" placeholder="e.g., FMR1, HTT">
-        </div>
-        <div class="field">
-            <label>Gene ID</label>
-            <input type="text" name="gene_id" placeholder="e.g., ENSG00000102081">
+            <label style="display: inline;">Max Variation Cluster Size Diff (bp)</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="Keeps loci whose <b>variation cluster</b> is at most this many base pairs larger than the tandem repeat itself.<br /><br />TRExplorer annotates some repeats with a surrounding variation cluster: a wider interval that also varies between people. A large difference means most of the variation lies outside the repeat being genotyped.<br /><br />Loci with no variation cluster have no variation beyond the repeat itself, so they are kept whatever value you enter."></i>
+            <input type="number" name="max_variation_cluster_size_diff" min="0" placeholder="e.g., 20" style="display: block;">
         </div>
     </div>
     <div class="column">
@@ -654,10 +646,8 @@ const DEFAULT_STATE = {
     phenotype_keyword: '',
     sample_id_keyword: '',
     sample_id_like: '',
-    gene_symbol: '',
-    gene_id: '',
-    locus_id: '',
-    reference_region: '',
+    search: '',
+    max_variation_cluster_size_diff: '',
     tag: '',
     sort_by: 'count',
     page: 1,
@@ -667,7 +657,8 @@ const DEFAULT_STATE = {
 let currentState = JSON.parse(JSON.stringify(DEFAULT_STATE));
 
 // 6.2 Write State to URL
-function writeStateToUrl() {
+// Build the '#...' hash that represents the current filter state.
+function buildStateHash() {
     const params = {};
     for (const [key, value] of Object.entries(currentState)) {
         // population_metric only affects results when require_above_population is set; don't
@@ -677,9 +668,24 @@ function writeStateToUrl() {
             params[key] = value;
         }
     }
-    const hash = '#' + $.param(params);
+    return '#' + $.param(params);
+}
+
+// Push the current state as a new history entry.
+function writeStateToUrl() {
+    const hash = buildStateHash();
     if (window.location.hash !== hash) {
         window.history.pushState(null, '', hash);
+    }
+}
+
+// Rewrite the current URL in place, without adding a history entry. Used when the hash the user
+// arrived on is normalized into an equivalent one (see the legacy-parameter fold below): pushing
+// there would make Back return to the original hash, normalize it again, and push forward again.
+function replaceStateInUrl() {
+    const hash = buildStateHash();
+    if (window.location.hash !== hash) {
+        window.history.replaceState(null, '', hash);
     }
 }
 
@@ -702,6 +708,27 @@ function readStateFromUrl() {
             }
         }
     }
+
+    // Legacy URLs: the Gene Symbol(s), Gene ID, Locus Id(s) and Reference Region boxes were
+    // merged into one search field, so fold those parameters into it and an old bookmark
+    // still finds its loci with the UI showing what it filtered on. They stay valid API
+    // parameters for anyone calling /api/v1/loci directly. Several of them at once used to
+    // AND together and now OR, which is what the merged box does.
+    // locus_id and gene_symbol were comma-separated lists, so they split. reference_region and
+    // gene_id each held a single value, and a region may itself contain comma thousands
+    // separators ("chr16:11,579,459-11,579,529"), so splitting those would shred the coordinates.
+    const legacyTerms = [
+        ...['locus_id', 'gene_symbol'].flatMap(name => (params.get(name) || '').split(',')),
+        ...['reference_region', 'gene_id'].map(name => params.get(name) || ''),
+    ].map(term => term.trim()).filter(Boolean);
+    if (legacyTerms.length) {
+        currentState.search = [currentState.search, ...legacyTerms].filter(Boolean).join(', ');
+        // Normalize the legacy hash in place. writeStateToUrl would otherwise push the folded URL
+        // as a new entry, so Back would land on the legacy hash, fold it again, and push forward
+        // again, trapping the user on this page.
+        replaceStateInUrl();
+    }
+
     applyStateToUI();
 }
 
@@ -754,7 +781,7 @@ function applyStateToUI() {
     for (const name of ['min_expansion', 'min_repeats_threshold', 'min_pli', 'min_sigma_percentile',
                         'motif_size', 'motif',
                         'phenotype_keyword', 'sample_id_like',
-                        'gene_symbol', 'gene_id', 'locus_id', 'reference_region']) {
+                        'search', 'max_variation_cluster_size_diff']) {
         $(`input[name="${name}"]`).val(currentState[name]);
     }
 
@@ -813,7 +840,7 @@ function readStateFromUI() {
     for (const name of ['min_expansion', 'min_repeats_threshold', 'min_pli', 'min_sigma_percentile',
                         'motif_size', 'motif',
                         'phenotype_keyword', 'sample_id_like',
-                        'gene_symbol', 'gene_id', 'locus_id', 'reference_region']) {
+                        'search', 'max_variation_cluster_size_diff']) {
         currentState[name] = $(`input[name="${name}"]`).val().trim();
     }
 
@@ -848,8 +875,8 @@ function buildApiUrl() {
     const optionalStringParams = [
         'require_above_unaffected', 'require_families_above_unaffected',
         'require_above_population', 'motif', 'phenotype_keyword',
-        'sample_id_keyword', 'sample_id_like', 'gene_symbol', 'gene_id', 'locus_id',
-        'reference_region', 'gene_regions', 'exclude_gene_regions', 'sort_by', 'tag',
+        'sample_id_keyword', 'sample_id_like', 'search', 'max_variation_cluster_size_diff',
+        'gene_regions', 'exclude_gene_regions', 'sort_by', 'tag',
     ];
     for (const name of optionalStringParams) {
         if (currentState[name]) params.set(name, currentState[name]);
@@ -1090,10 +1117,8 @@ async function performExport(format) {
         if (currentState.phenotype_keyword) params.set('phenotype_keyword', currentState.phenotype_keyword);
         if (currentState.sample_id_keyword) params.set('sample_id_keyword', currentState.sample_id_keyword);
         if (currentState.sample_id_like) params.set('sample_id_like', currentState.sample_id_like);
-        if (currentState.gene_symbol) params.set('gene_symbol', currentState.gene_symbol);
-        if (currentState.gene_id) params.set('gene_id', currentState.gene_id);
-        if (currentState.locus_id) params.set('locus_id', currentState.locus_id);
-        if (currentState.reference_region) params.set('reference_region', currentState.reference_region);
+        if (currentState.search) params.set('search', currentState.search);
+        if (currentState.max_variation_cluster_size_diff) params.set('max_variation_cluster_size_diff', currentState.max_variation_cluster_size_diff);
         if (currentState.tag) params.set('tag', currentState.tag);
         if (currentState.sort_by && currentState.sort_by !== 'count') params.set('sort_by', currentState.sort_by);
 
@@ -1138,8 +1163,8 @@ function updateActiveFiltersBar() {
         min_expansion: 'Min Exp', min_repeats_threshold: 'Min Repeats', min_pli: 'Min pLI', min_sigma_percentile: 'σ Percentile',
         motif_size: 'Motif Size',
         motif: 'Motif', phenotype_keyword: 'Phenotype', sample_id_keyword: 'Sample ID',
-        sample_id_like: 'Sample Keyword', gene_symbol: 'Gene', gene_id: 'Gene ID', locus_id: 'Locus ID',
-        reference_region: 'Region', tag: 'Tag',
+        sample_id_like: 'Sample Keyword', search: 'Search',
+        max_variation_cluster_size_diff: 'Max VC Size Diff', tag: 'Tag',
     };
     for (const [key, value] of Object.entries(currentState)) {
         if (key === 'page' || key === 'page_size') continue;
@@ -1540,26 +1565,34 @@ function renderLocusRow(locus, rowIndex) {
 
     // Sigma columns with rank text
     function getSigmaRankText(stdev, rankByMotif, rankTotal) {
-        if (stdev == null) return { value: '', rankText: '' };
+        if (stdev == null) return { value: '', rankText: '', bgColor: '' };
         const value = stdev.toFixed(2);
         let rankText = '';
+        let bgColor = '';
         if (rankByMotif != null && rankTotal != null) {
             const percentByMotif = rankTotal > 0 ? rankByMotif / rankTotal : 1;
             if (rankTotal == 1) {
                 rankText = '(only)';
             } else if (percentByMotif <= 0.001) {
                 rankText = '(top 0.1%)';
+                bgColor = '#ff9999';
             } else if (percentByMotif <= 0.01) {
                 rankText = '(top 1%)';
+                bgColor = '#ffcccc';
             } else if (percentByMotif <= 0.05) {
                 rankText = '(top 5%)';
+                bgColor = '#ffe8cc';
             } else if (percentByMotif <= 0.1) {
                 rankText = '(top 10%)';
+                bgColor = '#ffffcc';
             } else {
                 rankText = '(rank)';
             }
+            // A locus that barely varies is not interesting however it ranks within its motif,
+            // so leave those cells uncolored.
+            if (stdev < 0.2) bgColor = '';
         }
-        return { value, rankText };
+        return { value, rankText, bgColor };
     }
     const sigmaHprc = getSigmaRankText(locus.HPRC256_Stdev, locus.HPRC256_StdevRankByMotif, locus.HPRC256_StdevRankTotalNumberByMotif);
     const sigmaAou = getSigmaRankText(locus.AoU1027_Stdev, locus.AoU1027_StdevRankByMotif, locus.AoU1027_StdevRankTotalNumberByMotif);
@@ -1594,8 +1627,8 @@ function renderLocusRow(locus, rowIndex) {
         <td class="col-inheritance" style="font-size: 0.92em;">${escapeHtml(inheritance)}</td>
         <td class="col-gene-pheno" style="font-size: 0.85em; color: #555;">${genePhenoHtml}</td>
         <td class="col-pli col-numeric" style="${pliStyle}">${pli}</td>
-        <td class="col-sigma-hprc col-numeric">${sigmaHprc.value}${sigmaHprc.rankText ? ` <span style="color: #888; font-size: 0.9em;">${sigmaHprc.rankText}</span>` : ''}</td>
-        <td class="col-sigma-aou col-numeric">${sigmaAou.value}${sigmaAou.rankText ? ` <span style="color: #888; font-size: 0.9em;">${sigmaAou.rankText}</span>` : ''}</td>
+        <td class="col-sigma-hprc col-numeric"${sigmaHprc.bgColor ? ` style="background-color: ${sigmaHprc.bgColor};"` : ''}>${sigmaHprc.value}${sigmaHprc.rankText ? ` <span style="color: #888; font-size: 0.9em;">${sigmaHprc.rankText}</span>` : ''}</td>
+        <td class="col-sigma-aou col-numeric"${sigmaAou.bgColor ? ` style="background-color: ${sigmaAou.bgColor};"` : ''}>${sigmaAou.value}${sigmaAou.rankText ? ` <span style="color: #888; font-size: 0.9em;">${sigmaAou.rankText}</span>` : ''}</td>
         <td class="col-gene-pheno-sim col-numeric" style="${locus.MaxGenePhenoSim >= 0.5 ? 'color: #e65100; font-weight: 600;' : ''}">${locus.MaxGenePhenoSim != null ? locus.MaxGenePhenoSim.toFixed(2) : ''}</td>
         <td class="col-pairwise-sim col-numeric" style="${locus.SumPairwiseSim >= 1.0 ? 'color: #e65100; font-weight: 600;' : ''}">${locus.SumPairwiseSim != null ? locus.SumPairwiseSim.toFixed(2) : ''}</td>
     </tr>`;
@@ -1732,6 +1765,7 @@ $(document).on('click', '.col-expand', async function() {
         $td.wrapInner('<div class="slide-wrapper"></div>');
         $td.find('.slide-wrapper').slideUp(200, function() {
             $existingDetail.remove();
+            refreshCollapseAllButton();
         });
         $toggle.removeClass('expanded').html('<i class="chevron right icon"></i>');
         return;
@@ -1741,6 +1775,7 @@ $(document).on('click', '.col-expand', async function() {
     $toggle.addClass('expanded').html('<i class="chevron down icon"></i>');
     const $loadingRow = $(`<tr class="locus-detail-row"><td colspan="17" style="padding: 12px 14px; background: #fafafa; border-top: 1px solid #ccc; border-bottom: 2px solid #2185d0;"><div class="ui tiny active inline loader"></div> Loading...</td></tr>`);
     $row.after($loadingRow);
+    refreshCollapseAllButton();
 
     try {
         const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${currentState.source}`);
@@ -2060,8 +2095,30 @@ $(document).on('click', '.collapse-detail-btn', function() {
     $td.wrapInner('<div class="slide-wrapper"></div>');
     $td.find('.slide-wrapper').slideUp(200, function() {
         $detailRow.remove();
+        refreshCollapseAllButton();
     });
     $locusRow.find('.expand-toggle').removeClass('expanded').html('<i class="chevron right icon"></i>');
+});
+
+// The Collapse all button has nothing to do when no locus is expanded, so it is only shown while
+// at least one detail panel is open. Called from every place that opens or closes one.
+function refreshCollapseAllButton() {
+    $('.collapse-all-btn').toggle($('.locus-detail-row').length > 0);
+}
+
+// Collapse every expanded locus at once, with the same slide animation as collapsing one.
+$(document).on('click', '.collapse-all-btn', function() {
+    const $detailRows = $('.locus-detail-row');
+    if (!$detailRows.length) return;
+    // Reset every chevron up front rather than per row: the rows themselves go away in the
+    // animation callbacks below, and their locus rows stay put.
+    $('.locus-row .expand-toggle').removeClass('expanded').html('<i class="chevron right icon"></i>');
+    const $td = $detailRows.find('td');
+    $td.wrapInner('<div class="slide-wrapper"></div>');
+    $td.find('.slide-wrapper').slideUp(200, function() {
+        $(this).closest('.locus-detail-row').remove();
+        refreshCollapseAllButton();
+    });
 });
 
 // D4: Quick-filter toggles for the per-sample table in the detail panel.
@@ -2121,6 +2178,10 @@ function updatePaginationControls(data) {
     const paginationHtml = `
         <div class="total-results">
             Showing ${nFirst.toLocaleString()}&ndash;${nLast.toLocaleString()} of ${total.toLocaleString()}
+            <button class="ui mini basic button collapse-all-btn" style="margin-left: 12px; display: none;"
+                    title="Collapse every expanded locus on this page">
+                <i class="chevron up icon"></i> Collapse all
+            </button>
         </div>
         <div class="export-selector">
             <span class="export-label"><b>Export to:</b></span>
@@ -2174,6 +2235,7 @@ function updatePaginationControls(data) {
 
     $top.html(paginationHtml);
     $bottom.html(paginationHtml);
+    refreshCollapseAllButton();
 
     // Initialize page size dropdowns
     let _pageSizeChanging = false;
