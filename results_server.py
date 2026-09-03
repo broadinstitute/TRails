@@ -25,16 +25,19 @@ import sys
 import traceback
 import zlib
 
-import msgpack
 import flask
 from flask import Flask, request, Response
 from werkzeug.exceptions import HTTPException
-import intervaltree
 import jinja2
 import numpy as np
 
 # Standalone motif primitive (no str_analysis dependency, no sys.path insertion).
-from motif_utilities import compute_canonical_motif
+from motif_utilities import COMPLEMENT, compute_canonical_motif
+
+# The bases compute_canonical_motif can canonicalize. Deriving this from motif_utilities.COMPLEMENT
+# rather than spelling the alphabet out here keeps the two from drifting: anything outside the table
+# makes reverse_complement raise KeyError, so the "motif" query parameter is validated against it.
+VALID_MOTIF_PATTERN = re.compile(f"^[{''.join(sorted(COMPLEMENT))}]+$", re.IGNORECASE)
 
 # Known-disease-locus matching and affected-status normalization live in the ported
 # locus_annotations module. Import them defensively so the server stays importable
@@ -42,12 +45,18 @@ from motif_utilities import compute_canonical_motif
 # known-disease annotations simply degrade to "no match" in that case.
 try:
     from locus_annotations import (
+        BLANK_STATUS_VALUES,
         compute_jaccard,
         load_known_disease_loci,
         motifs_match,
         normalize_affected_status_for_logic,
     )
-except ImportError:
+except ImportError as import_error:
+    # A missing module is the supported degraded mode; a missing *name* means the two files have
+    # drifted, which would otherwise disable the known-disease annotations without a word.
+    print(f"WARNING: falling back to the built-in known-disease stubs: {import_error}")
+
+    BLANK_STATUS_VALUES = {"", "nan", "none", "na", "n/a", "null"}
 
     def normalize_affected_status_for_logic(value):
         """Lowercase + collapse 'possibly affected' to 'affected' (fallback)."""
@@ -145,7 +154,7 @@ LIST_COLUMNS_STATIC = [
     "HPRC256_StdevPercentile",
     "AoU1027_StdevPercentile",
     "TenK10K_MaxAllele", "TenK10K_99thPercentile",
-    "TRExplorerSource", "TRExplorerReferenceRepeatPurity",
+    "TRExplorerLocusId", "TRExplorerSource", "TRExplorerReferenceRepeatPurity",
     "NonCodingAnnotations",
 ]
 
@@ -190,6 +199,46 @@ def resolve_tag_to_loci(tag):
     return app.config["ANNOTATIONS"]["tag_to_loci"].get(tag, set())
 
 
+# SQLite stores integers as signed 64-bit, so binding a larger Python int raises OverflowError at
+# query time, which would surface as a 500. Every parsed integer that becomes a query parameter goes
+# through parse_sqlite_int so an oversized value fails validation with a 400 like any other bad input.
+SQLITE_MIN_INT = -(2 ** 63)
+SQLITE_MAX_INT = 2 ** 63 - 1
+
+
+def escape_like_wildcards(text):
+    """Escape SQL LIKE metacharacters so text matches literally.
+
+    Pair with ``ESCAPE '\\'`` in the LIKE clause. Used where a value that is conceptually an exact
+    match has to go through LIKE because it is embedded in a larger delimited string.
+
+    Args:
+        text: The literal value to match.
+
+    Returns:
+        The value with ``\\``, ``%`` and ``_`` backslash-escaped.
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def parse_sqlite_int(text):
+    """Parse text as an integer SQLite can bind.
+
+    Args:
+        text: The raw parameter value.
+
+    Returns:
+        The parsed integer.
+
+    Raises:
+        ValueError: If text is not an integer, or is outside SQLite's signed 64-bit range.
+    """
+    value = int(text)
+    if not SQLITE_MIN_INT <= value <= SQLITE_MAX_INT:
+        raise ValueError(f"integer out of SQLite's 64-bit range: '{text}'")
+    return value
+
+
 def parse_motif_size_filter(motif_size_str):
     """Parse a motif_size filter string into SQL clauses and parameters.
 
@@ -227,18 +276,18 @@ def parse_motif_size_filter(motif_size_str):
             if left and right:
                 try:
                     clauses.append("MotifSize BETWEEN ? AND ?")
-                    params.extend([int(left), int(right)])
+                    params.extend([parse_sqlite_int(left), parse_sqlite_int(right)])
                 except ValueError:
                     return None, [], f"Invalid motif_size range: '{part}'"
             elif left and not right:
                 try:
-                    params.append(int(left))
+                    params.append(parse_sqlite_int(left))
                     clauses.append("MotifSize >= ?")
                 except ValueError:
                     return None, [], f"Invalid motif_size value: '{part}'"
             elif not left and right:
                 try:
-                    params.append(int(right))
+                    params.append(parse_sqlite_int(right))
                     clauses.append("MotifSize <= ?")
                 except ValueError:
                     return None, [], f"Invalid motif_size value: '{part}'"
@@ -246,7 +295,7 @@ def parse_motif_size_filter(motif_size_str):
                 return None, [], f"Invalid motif_size format: '{part}'"
         else:
             try:
-                params.append(int(part))
+                params.append(parse_sqlite_int(part))
                 clauses.append("MotifSize = ?")
             except ValueError:
                 return None, [], f"Invalid motif_size value: '{part}'"
@@ -260,7 +309,11 @@ def parse_motif_size_filter(motif_size_str):
 # Shapes the merged search box routes on, checked in this order (see classify_search_term).
 # A locus id is "{chrom}-{start}-{end}-{MOTIF}"; a gene id is an Ensembl accession; a region is
 # a chromosome with an optional span. Everything else is treated as a gene symbol.
-SEARCH_LOCUS_ID_PATTERN = re.compile(r"^[0-9A-Za-z._]+-\d+-\d+-[ACGTNacgtn]+$")
+# The motif field accepts the same alphabet the motif filter does (motif_utilities.COMPLEMENT),
+ # so a locus id whose motif carries an IUPAC ambiguity code is still recognized as a locus id
+ # rather than falling through to a gene-symbol search.
+SEARCH_LOCUS_ID_PATTERN = re.compile(
+    r"^[0-9A-Za-z._]+-\d+-\d+-[%s%s]+$" % ("".join(sorted(COMPLEMENT)), "".join(sorted(COMPLEMENT)).lower()))
 SEARCH_GENE_ID_PATTERN = re.compile(r"^(ENSG\d+)(?:\.\d+)?$", re.IGNORECASE)
 # Commas do double duty in the search box: they separate terms, and they are the thousands
 # separators parse_reference_region accepts inside a region ("chr16:11,579,459-11,579,529").
@@ -319,7 +372,9 @@ def classify_search_term(term):
 
     Regions are recognized with a strict pattern rather than by handing every term to
     parse_reference_region, which reads any bare alphanumeric string as a whole chromosome and
-    would therefore swallow every gene symbol.
+    would therefore swallow every gene symbol. A term that carries a ":" is the one exception:
+    gene symbols never contain one, so it is treated as a region attempt and its parse error is
+    reported rather than silently searching for a gene of that name.
 
     Args:
         term: One stripped, non-empty term from the search box.
@@ -331,13 +386,15 @@ def classify_search_term(term):
         are None and error_message says why.
     """
     if SEARCH_LOCUS_ID_PATTERN.match(term):
-        # Stored locus ids spell the motif in upper case. Normalize rather than comparing with
-        # COLLATE NOCASE, which would give up the index on LocusId.
-        return "locus_id", term.upper(), None
+        # Stored locus ids spell the motif in upper case but keep the chromosome exactly as the
+        # input matrix wrote it ("chr1-100-110-AT"), so only the motif field is normalized here.
+        # Normalizing rather than comparing with COLLATE NOCASE keeps the index on LocusId.
+        head, _, motif = term.rpartition("-")
+        return "locus_id", f"{head}-{motif.upper()}", None
     normalized_gene_id = normalize_gene_id(term)
     if normalized_gene_id:
         return "gene_id", normalized_gene_id, None
-    if SEARCH_REGION_PATTERN.match(term):
+    if SEARCH_REGION_PATTERN.match(term) or ":" in term:
         region, error = parse_reference_region(term)
         if region is None:
             return None, None, error or f"search term '{term}' is not a valid region"
@@ -487,6 +544,13 @@ def parse_args():
         help="Bind address (default: 127.0.0.1).",
     )
     parser.add_argument(
+        "--allow-remote-writes",
+        action="store_true",
+        help="Allow notes and tags to be edited from other machines. Only meaningful with a "
+             "non-loopback --host; the annotation routes have no authentication, so anyone who "
+             "can reach the port could change them.",
+    )
+    parser.add_argument(
         "--sample-table",
         default=None,
         help="Optional path to sample metadata table for outlier-sample enrichment.",
@@ -631,7 +695,11 @@ def load_sample_table(filepath):
             f"Sample table {filepath} is missing a 'sample_id' column; "
             f"found columns: {list(df.columns)[:10]}")
     rename = {id_column: "sample_id"}
-    for canonical in ("affected_status", "analysis_status", "phenotype_description"):
+    # Every column input_tables.read_sample_metadata canonicalizes for the build (input_tables.py's
+    # match_columns list), so a "FamilyID"/"Sex" header reaches parse_outlier_samples under the
+    # lower-case name it looks up instead of coming back as None.
+    for canonical in ("sex", "family_id", "maternal_id", "paternal_id",
+                      "affected_status", "analysis_status", "phenotype_description"):
         actual = column_by_normalized.get(_normalize_metadata_column(canonical))
         if actual and actual != canonical:
             rename[actual] = canonical
@@ -642,7 +710,10 @@ def load_sample_table(filepath):
         df["analysis_status"] = (
             df["analysis_status"].astype(str).str.strip().str.lower().replace(analysis_status_remap)
         )
-        df["analysis_status"] = df["analysis_status"].replace({"": "unknown", "nan": "unknown"})
+        # The build maps every blank spelling to "unknown" (input_tables.read_sample_metadata);
+        # covering only "" and "nan" here would leave a plain "NA" cell rendering as "Na".
+        df["analysis_status"] = df["analysis_status"].apply(
+            lambda v: "unknown" if v in BLANK_STATUS_VALUES else v)
     else:
         df["analysis_status"] = "unknown"
     if "affected_status" not in df.columns:
@@ -743,6 +814,7 @@ def compute_sample_qc_data(db_path):
 
         bin_case = """
             CASE
+                WHEN MotifSize IS NULL OR MotifSize <= 0 THEN 'Unknown'
                 WHEN MotifSize = 1 THEN '1bp'
                 WHEN MotifSize = 2 THEN '2bp'
                 WHEN MotifSize >= 3 AND MotifSize <= 6 THEN '3-6bp'
@@ -892,11 +964,55 @@ def get_max_locus_span():
 # ---------------------------------------------------------------------------
 
 
+# Loopback addresses. A server bound to one of these is reachable only from this machine, which
+# is what makes the unauthenticated annotation routes acceptable by default.
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+@app.before_request
+def restrict_writes():
+    """Reject state-changing requests that this server should not accept.
+
+    Two separate exposures, both of which matter because the annotation routes (notes and tags)
+    have no authentication:
+
+      * Another origin. A POST with a plain content type is a "simple" request the browser sends
+        before CORS gets a chance to hide anything, so the response headers below cannot stop
+        another page the user has open from writing to this database.
+      * Another machine. Bound to a non-loopback address the write routes are reachable by anyone
+        who can route to the port, so they are refused unless --allow-remote-writes says otherwise.
+
+    Read requests are never affected, and a local script with no Origin header still works.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    if not app.config.get("ALLOW_REMOTE_WRITES", False) \
+            and app.config.get("BIND_HOST") not in LOOPBACK_HOSTS \
+            and request.remote_addr not in LOOPBACK_HOSTS:
+        return jsonify({
+            "error": "annotation changes are limited to this machine",
+            "detail": "This server is bound to a non-loopback address and has no authentication, "
+                      "so notes and tags cannot be edited remotely. Restart it with "
+                      "--allow-remote-writes if every client that can reach this port is trusted.",
+        }), 403
+    origin = request.headers.get("Origin")
+    if origin and origin.rstrip("/") != request.host_url.rstrip("/"):
+        return jsonify({"error": "cross-origin requests are not allowed"}), 403
+    return None
+
+
 @app.after_request
 def add_cors_headers(response):
+    """Allow cross-origin reads of the API, but never cross-origin writes.
+
+    The bundled UI is same-origin (index_page_template.html builds API_BASE_URL from
+    window.location.origin), so it needs no CORS headers at all. The wildcard exists only so a
+    notebook or a separate viewer can GET the read-only endpoints; advertising PUT/POST/DELETE
+    here would invite any page to mutate this database's notes and tags.
+    """
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
     return response
 
 
@@ -915,8 +1031,10 @@ def get_motif_variants(motif):
     motif = motif.upper()
     for i in range(len(motif)):
         variants.add(motif[i:] + motif[:i])
-    complement = {"A": "T", "T": "A", "C": "G", "G": "C"}
-    rc = "".join(complement.get(b, b) for b in reversed(motif))
+    # The full IUPAC table, not a local ACGT-only map: validate_params accepts every base in
+    # COMPLEMENT, so an ambiguity code such as Y would otherwise be left uncomplemented here and
+    # this fallback would disagree with the CanonicalMotif path it stands in for.
+    rc = "".join(COMPLEMENT.get(base, base) for base in reversed(motif))
     for i in range(len(rc)):
         variants.add(rc[i:] + rc[:i])
     return variants
@@ -946,7 +1064,7 @@ def validate_params():
     # page (default: 1)
     page_raw = request.args.get("page", "1")
     try:
-        params["page"] = int(page_raw)
+        params["page"] = parse_sqlite_int(page_raw)
         if params["page"] < 1:
             raise ValueError
     except ValueError:
@@ -955,15 +1073,22 @@ def validate_params():
     # page_size (default: 50, max: 500)
     page_size_raw = request.args.get("page_size", "50")
     try:
-        params["page_size"] = int(page_size_raw)
+        params["page_size"] = parse_sqlite_int(page_size_raw)
         if params["page_size"] < 1 or params["page_size"] > 500:
             raise ValueError
     except ValueError:
         errors.append(f"page_size must be an integer between 1 and 500, got '{page_size_raw}'")
 
+    # SQLite binds the derived OFFSET, not `page`, so both have to be in range: page=2**62 with
+    # page_size=50 passes the checks above and then overflows when bound.
+    if "page" in params and "page_size" in params:
+        if (params["page"] - 1) * params["page_size"] > SQLITE_MAX_INT:
+            errors.append(f"page is too large for page_size={params['page_size']}, "
+                          f"got '{page_raw}'")
+
     if request.args.get("min_expansion"):
         try:
-            params["min_expansion"] = int(request.args["min_expansion"])
+            params["min_expansion"] = parse_sqlite_int(request.args["min_expansion"])
             if params["min_expansion"] < 0:
                 raise ValueError
         except ValueError:
@@ -1002,12 +1127,19 @@ def validate_params():
 
     if request.args.get("motif"):
         motif_list = [m.strip() for m in request.args["motif"].split(",") if m.strip()]
-        if motif_list:
+        # compute_canonical_motif raises KeyError on any base outside the IUPAC table, which would
+        # surface as a 500. Reject the value here so a typo gets the same 400 as every other filter.
+        invalid_motifs = [m for m in motif_list if not VALID_MOTIF_PATTERN.match(m)]
+        if invalid_motifs:
+            errors.append(
+                f"motif must contain only IUPAC bases ({''.join(sorted(COMPLEMENT))}); got "
+                f"'{invalid_motifs[0]}'")
+        elif motif_list:
             params["motif"] = motif_list
 
     if request.args.get("min_repeats_threshold"):
         try:
-            params["min_repeats_threshold"] = int(request.args["min_repeats_threshold"])
+            params["min_repeats_threshold"] = parse_sqlite_int(request.args["min_repeats_threshold"])
         except ValueError:
             errors.append(f"min_repeats_threshold must be an integer, got '{request.args['min_repeats_threshold']}'")
 
@@ -1076,7 +1208,7 @@ def validate_params():
     # cluster is at most this much larger than the repeat itself.
     if request.args.get("max_variation_cluster_size_diff"):
         try:
-            params["max_variation_cluster_size_diff"] = int(request.args["max_variation_cluster_size_diff"])
+            params["max_variation_cluster_size_diff"] = parse_sqlite_int(request.args["max_variation_cluster_size_diff"])
         except ValueError:
             errors.append("max_variation_cluster_size_diff must be an integer number of base pairs, "
                           f"got '{request.args['max_variation_cluster_size_diff']}'")
@@ -1171,7 +1303,10 @@ def build_api_order_by(params):
         order_parts.append(f"{col} {direction}")
 
     if not order_parts:
-        return f" ORDER BY FirstAffectedAlleleSize_{ot} DESC", False
+        # Every mapped sort column is absent from this database. LocusId is in REQUIRED_COLUMNS, so
+        # it is the one ordering that is always valid; naming a sort column here instead would
+        # re-reference the very column the loop just skipped and raise "no such column".
+        return " ORDER BY LocusId ASC", False
     return " ORDER BY " + ", ".join(order_parts), False
 
 
@@ -1250,7 +1385,13 @@ def build_api_query(params):
     sql_params = []
     min_expansion = params.get("min_expansion", 0)
 
-    clauses.append(f"(loci.OutlierSampleIds_{ot} IS NOT NULL AND loci.OutlierSampleIds_{ot} != '')")
+    # Guarded like every other filter below: a database built without this outlier type simply has
+    # no rows for it, which is not the same thing as a SQL error. OUTLIER_TYPE_MAP advertises all
+    # three types regardless of what the loaded database actually contains.
+    if not source_columns or f"OutlierSampleIds_{ot}" in source_columns:
+        clauses.append(f"(loci.OutlierSampleIds_{ot} IS NOT NULL AND loci.OutlierSampleIds_{ot} != '')")
+    else:
+        clauses.append("1=0")
 
     if "min_expansion" in params:
         clauses.append(f"loci.FirstAffectedAlleleSize_{ot} >= loci.NumRepeatsInReference + ?")
@@ -1259,7 +1400,10 @@ def build_api_query(params):
     if "require_above_unaffected" in params:
         col_prefix = {"first": "First", "second": "Second", "third": "Third"}[params["require_above_unaffected"]]
         if not source_columns or (f"{col_prefix}AffectedAlleleSize_{ot}" in source_columns and f"FirstUnaffectedAlleleSize_{ot}" in source_columns):
-            clauses.append(f"(loci.{col_prefix}AffectedAlleleSize_{ot} > loci.FirstUnaffectedAlleleSize_{ot} + ? OR (loci.FirstUnaffectedAlleleSize_{ot} IS NULL OR loci.FirstUnaffectedAlleleSize_{ot} = 0) AND loci.{col_prefix}AffectedAlleleSize_{ot} IS NOT NULL)")
+            # NULL means "this locus has no unaffected sample". 0 does not: it is a real allele
+            # size (a full deletion of the repeat), and treating it as missing would pass every
+            # affected allele at that locus without comparing it to anything.
+            clauses.append(f"(loci.{col_prefix}AffectedAlleleSize_{ot} > loci.FirstUnaffectedAlleleSize_{ot} + ? OR loci.FirstUnaffectedAlleleSize_{ot} IS NULL AND loci.{col_prefix}AffectedAlleleSize_{ot} IS NOT NULL)")
             sql_params.append(min_expansion)
         else:
             clauses.append("1=0")
@@ -1268,7 +1412,8 @@ def build_api_query(params):
         col_prefix = {"first": "First", "second": "Second", "third": "Third"}[params["require_families_above_unaffected"]]
         by_family_col = f"loci.{col_prefix}AffectedAlleleSize_{ot}_ByFamily"
         if not source_columns or f"{col_prefix}AffectedAlleleSize_{ot}_ByFamily" in source_columns:
-            clauses.append(f"({by_family_col} > loci.FirstUnaffectedAlleleSize_{ot} + ? OR (loci.FirstUnaffectedAlleleSize_{ot} IS NULL OR loci.FirstUnaffectedAlleleSize_{ot} = 0) AND {by_family_col} IS NOT NULL)")
+            # Same as above: only NULL means "no unaffected baseline"; 0 is a real allele size.
+            clauses.append(f"({by_family_col} > loci.FirstUnaffectedAlleleSize_{ot} + ? OR loci.FirstUnaffectedAlleleSize_{ot} IS NULL AND {by_family_col} IS NOT NULL)")
             sql_params.append(min_expansion)
         else:
             # Backing column absent: the filter cannot be evaluated, so match no
@@ -1385,14 +1530,19 @@ def build_api_query(params):
         sql_params.extend([f"%{kw}%" for kw in params["phenotype_keyword"]])
 
     if "sample_id_keyword" in params:
+        # These are exact sample ids picked from a dropdown, matched by LIKE only because the ids
+        # are packed into one "{n}x:{sample_id},..." string. Sample ids routinely contain "_",
+        # which is LIKE's single-character wildcard, so escape the metacharacters; otherwise
+        # "sample_1" would also match the unrelated "sampleX1".
         kw_clauses = [
-            f"((',' || OutlierSampleIds_{ot} || ',') LIKE ? COLLATE NOCASE"
-            f" OR OutlierSampleIds_{ot} LIKE ? COLLATE NOCASE)"
+            f"((',' || OutlierSampleIds_{ot} || ',') LIKE ? ESCAPE '\\' COLLATE NOCASE"
+            f" OR OutlierSampleIds_{ot} LIKE ? ESCAPE '\\' COLLATE NOCASE)"
             for _ in params["sample_id_keyword"]
         ]
         clauses.append(f"({' OR '.join(kw_clauses)})")
         for kw in params["sample_id_keyword"]:
-            sql_params.extend([f"%:{kw},%", f"%:{kw}:%"])
+            escaped = escape_like_wildcards(kw)
+            sql_params.extend([f"%:{escaped},%", f"%:{escaped}:%"])
 
     if "sample_id_like" in params:
         kw_clauses = [f"OutlierSampleIds_{ot} LIKE ? COLLATE NOCASE" for _ in params["sample_id_like"]]
@@ -1436,12 +1586,14 @@ def build_api_query(params):
     # numerically. A locus with no variation cluster has no variation beyond the repeat itself,
     # so it passes any maximum.
     if "max_variation_cluster_size_diff" in params:
+        # The clause deliberately passes loci whose cluster size is unknown (NULL or ''), so a
+        # database with no VariationClusterSizeDiff column at all is the same situation for every
+        # locus: add no clause rather than the "1=0" the filters below use, which would contradict
+        # this filter's own treatment of missing data and return an empty result set.
         if not source_columns or "VariationClusterSizeDiff" in source_columns:
             clauses.append("(loci.VariationClusterSizeDiff IS NULL OR loci.VariationClusterSizeDiff = '' "
                            "OR CAST(loci.VariationClusterSizeDiff AS INTEGER) <= ?)")
             sql_params.append(params["max_variation_cluster_size_diff"])
-        else:
-            clauses.append("1=0")
 
     if "chrom" in params:
         clauses.append("Chrom = ?")
@@ -1478,18 +1630,29 @@ def build_api_query(params):
 
     if params["outlier_type"] == "hemi":
         clauses.append("Chrom IN ('chrX', 'chrY')")
-        clauses.append("HemizygousAlleleHistogram IS NOT NULL")
+        # The build writes "" (not NULL) for a locus with no hemizygous alleles
+        # (allele_histograms.convert_counts_to_histogram_string returns "" for an empty count
+        # dict), so IS NOT NULL alone matches every row and filters nothing. Guarded on the column
+        # like the filters above, so an autosome-only database matches nothing instead of raising.
+        if not source_columns or "HemizygousAlleleHistogram" in source_columns:
+            clauses.append("HemizygousAlleleHistogram IS NOT NULL AND HemizygousAlleleHistogram != ''")
+        else:
+            clauses.append("1=0")
 
     where = " AND ".join(clauses) if clauses else "1=1"
     order_by, _ = build_api_order_by(params)
     motif_count_col = "CanonicalMotif" if "CanonicalMotif" in source_columns else "Motif"
+    # gene_region is an optional annotation column. Without it the region summary simply has
+    # nothing to report; querying for it anyway would fail the whole /api/v1/loci request.
+    has_gene_region = not source_columns or "gene_region" in source_columns
 
-    # The reference-region filter reads Start0Based / End1Based and the variation-cluster
-    # filter reads VariationClusterSizeDiff, none of which the skinny tables project, so those
-    # queries run against the full loci table, where REFERENCE_REGION_INDEX turns a region into
-    # a b-tree range scan, which is far more selective than the skinny table's sequential scan
-    # anyway. The deferred-lookup shape below is kept either way, so the sort never holds wide
-    # rows.
+    # The reference-region filter reads Start0Based / End1Based, which the skinny tables never
+    # project, so a region query always runs against the full loci table -- where
+    # REFERENCE_REGION_INDEX turns it into a b-tree range scan, far more selective than the skinny
+    # table's sequential scan anyway. The variation-cluster filter falls back only against older
+    # skinny tables built before VariationClusterSizeDiff was projected (skinny_tables.py's
+    # shared_columns includes it now), so a rebuilt database answers it from the narrow table. The
+    # deferred-lookup shape below is kept either way, so the sort never holds wide rows.
     if requires_full_loci_table(params, ot):
         filter_table = "loci"
     elif app.config.get("HAS_SKINNY", False):
@@ -1503,12 +1666,16 @@ def build_api_query(params):
                         f"JOIN ({inner}) pick ON loci.LocusId = pick.LocusId{order_by}")
         count_query = f"SELECT COUNT(*) FROM {filter_table} AS loci WHERE {where}"
         motif_count_query = f"SELECT {motif_count_col}, COUNT(*) as count FROM {filter_table} AS loci WHERE {where} GROUP BY {motif_count_col} ORDER BY count DESC"
-        gene_region_count_query = f"SELECT gene_region, COUNT(*) as count FROM {filter_table} AS loci WHERE {where} GROUP BY gene_region"
+        gene_region_count_query = (
+            f"SELECT gene_region, COUNT(*) as count FROM {filter_table} AS loci WHERE {where} GROUP BY gene_region"
+            if has_gene_region else None)
     else:
         select_query = f"SELECT * FROM loci WHERE {where}{order_by} LIMIT ? OFFSET ?"
         count_query = f"SELECT COUNT(*) FROM loci WHERE {where}"
         motif_count_query = f"SELECT {motif_count_col}, COUNT(*) as count FROM loci WHERE {where} GROUP BY {motif_count_col} ORDER BY count DESC"
-        gene_region_count_query = f"SELECT gene_region, COUNT(*) as count FROM loci WHERE {where} GROUP BY gene_region"
+        gene_region_count_query = (
+            f"SELECT gene_region, COUNT(*) as count FROM loci WHERE {where} GROUP BY gene_region"
+            if has_gene_region else None)
 
     sql_params_with_pagination = sql_params + [params["page_size"], (params["page"] - 1) * params["page_size"]]
     return select_query, count_query, motif_count_query, gene_region_count_query, sql_params, sql_params_with_pagination
@@ -1578,7 +1745,7 @@ def parse_outlier_samples(outlier_string, sample_lookup, affected_lookup, analys
         # which mirrors this). Fall back to affected_lookup when the sample has no
         # usable raw status.
         affected_raw = str(sample_row.get("affected_status") or "").strip()
-        if affected_raw.lower() in ("", "nan"):
+        if affected_raw.lower() in BLANK_STATUS_VALUES:
             affected_raw = affected_lookup.get(sample_id, "unknown") or "unknown"
         if affected_raw.lower() == "affected":
             affected_display = "Affected"
@@ -1936,6 +2103,7 @@ def index():
     return template.render(
         db_labels=app.config["DB_LABELS"],
         default_source=app.config["DB_LABELS"][0],
+        has_mendelian=app.config.get("HAS_MENDELIAN", False),
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
         outlier_warnings_by_source={app.config["DB_LABELS"][0]: app.config.get("OUTLIER_WARNINGS", {})},
     )
@@ -1948,6 +2116,7 @@ def swim():
     return template.render(
         db_labels=app.config["DB_LABELS"],
         default_source=app.config["DB_LABELS"][0],
+        has_mendelian=app.config.get("HAS_MENDELIAN", False),
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
         outlier_warnings_by_source={app.config["DB_LABELS"][0]: app.config.get("OUTLIER_WARNINGS", {})},
     )
@@ -1960,6 +2129,7 @@ def sample_qc():
     return template.render(
         db_labels=app.config["DB_LABELS"],
         default_source=app.config["DB_LABELS"][0],
+        has_mendelian=app.config.get("HAS_MENDELIAN", False),
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
         outlier_warnings_by_source={app.config["DB_LABELS"][0]: app.config.get("OUTLIER_WARNINGS", {})},
     )
@@ -1976,6 +2146,7 @@ def qc2():
                         status=404, mimetype="text/plain")
     template = jinja2_env.get_template("qc2_template.html")
     return template.render(
+        has_mendelian=True,
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
         outlier_warnings_by_source={app.config["DB_LABELS"][0]: app.config.get("OUTLIER_WARNINGS", {})},
     )
@@ -2102,7 +2273,8 @@ def get_loci():
         total = conn.execute(count_query, sql_params).fetchone()[0]
         rows = conn.execute(select_query, sql_params_with_pagination).fetchall()
         motif_rows = conn.execute(motif_count_query, sql_params).fetchall()
-        gene_region_rows = conn.execute(gene_region_count_query, sql_params).fetchall()
+        gene_region_rows = (conn.execute(gene_region_count_query, sql_params).fetchall()
+                            if gene_region_count_query else [])
     finally:
         conn.close()
 
@@ -2567,6 +2739,15 @@ def get_swim_plot_data():
 
     if motif_raw:
         motifs = [m.strip() for m in motif_raw.split(",") if m.strip()]
+        # This endpoint parses its own parameters rather than going through validate_params, so it
+        # repeats the IUPAC check here; without it compute_canonical_motif raises KeyError -> 500.
+        invalid_motifs = [m for m in motifs if not VALID_MOTIF_PATTERN.match(m)]
+        if invalid_motifs:
+            return jsonify({
+                "error": "Invalid parameter",
+                "detail": f"motif must contain only IUPAC bases ({''.join(sorted(COMPLEMENT))}); "
+                          f"got '{invalid_motifs[0]}'",
+            }), 400
         if motifs:
             canonical_motifs = {compute_canonical_motif(m, include_reverse_complement=True) for m in motifs}
             extra_clauses.append(f"CanonicalMotif IN ({','.join('?' * len(canonical_motifs))})")
@@ -2626,16 +2807,17 @@ def get_swim_plot_data():
     vc_filter_max = None
     if max_variation_cluster_size_diff:
         try:
-            max_vc_diff = int(max_variation_cluster_size_diff)
+            max_vc_diff = parse_sqlite_int(max_variation_cluster_size_diff)
         except ValueError:
             return jsonify({
                 "error": "Invalid parameter",
                 "detail": "max_variation_cluster_size_diff must be an integer number of base pairs, "
                           f"got '{max_variation_cluster_size_diff}'",
             }), 400
-        # The lookup reads loci, not swim_plot, so the guard checks the loci column set rather
-        # than source_columns above. Without the column the filter cannot be answered, so match
-        # nothing instead of raising "no such column", the same choice build_api_query makes.
+        # source_columns is the loci column set (configure_app fills DB_COLUMNS_SET from
+        # "SELECT * FROM loci LIMIT 1"), and VariationClusterSizeDiff is only ever read from loci,
+        # so the same set guards this filter. Without the column the filter cannot be answered, so
+        # match nothing instead of raising "no such column", the same choice build_api_query makes.
         if not source_columns or "VariationClusterSizeDiff" in source_columns:
             # This endpoint runs one query per motif category, so an inline subquery over loci
             # would re-scan that table 25 times for a single chart. Materialize the matching
@@ -2679,7 +2861,7 @@ def get_swim_plot_data():
 
     if min_expansion:
         try:
-            min_expansion_value = int(min_expansion)
+            min_expansion_value = parse_sqlite_int(min_expansion)
             if min_expansion_value < 0:
                 raise ValueError
         except ValueError:
@@ -3237,6 +3419,17 @@ def main():
             print(f"Note: database missing optional column: {col} (using fallback)")
     print(f"Skinny fast-path: {'ON' if app.config['HAS_SKINNY'] else 'OFF (run the skinny-table build step)'}")
     print(f"Mendelian QC page: {'available' if app.config['HAS_MENDELIAN'] else 'hidden (no mendelian_violations table)'}")
+
+    app.config["BIND_HOST"] = args.host
+    app.config["ALLOW_REMOTE_WRITES"] = args.allow_remote_writes
+    if args.host not in LOOPBACK_HOSTS:
+        if args.allow_remote_writes:
+            print(f"\nWARNING: bound to {args.host} with --allow-remote-writes: anyone who can "
+                  f"reach this port can read the results and edit notes and tags.")
+        else:
+            print(f"\nNOTE: bound to {args.host}, so other machines can read the results. Notes "
+                  f"and tags can only be edited from this machine; pass --allow-remote-writes to "
+                  f"lift that (there is no authentication).")
 
     print(f"\nStarting server on {args.host}:{args.port}")
     print(f"Web UI: http://{args.host}:{args.port}/")

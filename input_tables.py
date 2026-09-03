@@ -32,6 +32,7 @@ import gzip
 import pandas
 
 import analysis_columns
+import locus_annotations
 
 
 # Allowed normalized values for sample-metadata status columns. A value outside
@@ -290,12 +291,13 @@ def read_sample_metadata(path):
     for logical_name, actual_column in matches.items():
         df[logical_name] = raw_df[actual_column]
 
-    # sample_id must not contain ':'.
-    bad_sample_ids = [s for s in df["sample_id"] if ":" in str(s)]
+    # sample_id must not contain ':' or ',': entries are packed as "{allele}x:{sample_id}" and
+    # joined with ",", so either character corrupts the parse.
+    bad_sample_ids = [s for s in df["sample_id"] if ":" in str(s) or "," in str(s)]
     if bad_sample_ids:
         raise ValueError(
-            f"sample_id values must not contain ':' (breaks OutlierSampleIds parsing): "
-            f"{bad_sample_ids[:10]}"
+            f"sample_id values must not contain ':' or ',' (both are OutlierSampleIds "
+            f"delimiters): {bad_sample_ids[:10]}"
         )
 
     # Normalize analysis_status.
@@ -352,11 +354,11 @@ def _validate_status_column(df, column, allowed_set):
 
 
 def _normalize_affected_status_for_logic(value):
-    """Lowercase + collapse 'possibly affected' to 'affected'; None for blanks."""
-    if _is_blank(value):
-        return None
-    normalized = str(value).strip().lower()
-    return "affected" if normalized == "possibly affected" else normalized
+    """Lowercase + collapse 'possibly affected' to 'affected'; None for blanks.
+
+    Delegates to locus_annotations so the build and the server share one definition.
+    """
+    return locus_annotations.normalize_affected_status_for_logic(value)
 
 
 def read_phenotypes(path):
@@ -416,18 +418,35 @@ def read_gene_table(path):
     if path is None:
         return {}
 
-    df = pandas.read_table(path)
+    # Missing markers: pandas' defaults ("", "NA", "N/A", "null", "nan", ...) plus TRails' own
+    # ".", which the rest of the pipeline honors (see _coerce_annotation_value). Without it a "."
+    # in pLI_v2/pLI_v4 arrives as the literal string and analysis_columns.add_gene_columns dies on
+    # float(".").
+    df = pandas.read_table(path, na_values=["."])
     if "gene_id" not in df.columns:
         raise ValueError(
             f"Gene table {path} is missing a required 'gene_id' column; "
             f"found columns: {list(df.columns)[:10]}"
         )
 
-    columns_to_keep = [c for c in [
+    # Matched with match_columns rather than by exact name, so this reader honors the
+    # case/underscore-insensitive rule the module docstring states for every input table: a header
+    # spelled "PLI_V4" or "gene symbol" would otherwise be silently dropped.
+    matches = match_columns(df, [
         "gene_id", "gene_symbol", "gene_aliases", "pLI_v2", "pLI_v4",
         "lof_oe_ci_upper_v4", "hgnc_gene_id", "inheritance", "disease_category",
         "LLM_phenotype_summary", "sources",
-    ] if c in df.columns]
+    ])
+    df = df.rename(columns={actual: logical for logical, actual in matches.items()})
+    columns_to_keep = list(matches)
+
+    if "hgnc_gene_id" in columns_to_keep:
+        # A single blank cell upcasts this numeric-looking id column to float64, which would write
+        # "1100.0" into GeneTableHgncGeneId. Render it back as an id string; blanks stay NaN so
+        # analysis_columns._is_missing still normalizes them to None.
+        df["hgnc_gene_id"] = df["hgnc_gene_id"].apply(
+            lambda value: value if _is_blank(value)
+            else str(int(value)) if isinstance(value, float) else str(value))
 
     return df[columns_to_keep].set_index("gene_id").to_dict(orient="index")
 

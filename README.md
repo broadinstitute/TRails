@@ -147,11 +147,10 @@ your own copy only if you have an OMIM API key. If absent, the dependent annotat
   `trails.py`):
   - `flask` — the local web server
   - `pandas`, `numpy` — the analysis pipeline
-  - `tqdm` — progress bars
-  - `msgpack` — the server's startup cache
   - `intervaltree` — interval overlap lookups
-  - `pyhpo` — HPO term similarity (phenotype scoring)
-  - `requests` — fetching public reference data (e.g. STRchive)
+  - `pyhpo` — HPO term similarity (phenotype scoring; optional, falls back to Jaccard)
+  - `requests` — only for the opt-in STRchive network fetch (optional; the reference-data
+    download uses the standard library)
 
   TRails is otherwise self-contained — it has no other third-party runtime dependency (the
   motif and locus-id utilities are built in, not pulled from an external package).

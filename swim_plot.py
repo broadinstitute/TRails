@@ -24,6 +24,7 @@ The reference re-split the raw outlier entry to recover purity/methylation; here
 literal ``"."`` mapped to None), so this module consumes them directly.
 """
 
+from locus_annotations import BLANK_STATUS_VALUES
 from analysis_columns import (
     OUTLIER_TYPES,
     is_above_unaffected,
@@ -80,10 +81,15 @@ def _compute_motif_category(motif_size):
         motif_size: The locus motif size in bp (int-like), or a missing value.
 
     Returns:
-        ``"Unknown"`` if the motif size is missing, ``"{size}bp"`` for sizes
-        <= 24, else ``"25+bp"``.
+        ``"Unknown"`` if the motif size is missing or non-positive, ``"{size}bp"``
+        for sizes <= 24, else ``"25+bp"``.
+
+    A blank motif cell gives MotifSize 0 (``len("")``), which is a supported input
+    class. Binning it as ``"0bp"`` would hide those rows: the swim-plot endpoint
+    queries only ``1bp``..``24bp``, ``25+bp`` and ``Unknown``, so it would never
+    ask for them.
     """
-    if _is_missing(motif_size):
+    if _is_missing(motif_size) or int(motif_size) <= 0:
         return "Unknown"
     if int(motif_size) <= 24:
         return f"{int(motif_size)}bp"
@@ -107,7 +113,9 @@ def _normalize_affected_status(raw_affected):
         return "Affected"
     if normalized == "unaffected":
         return "Unaffected"
-    if not normalized:  # whitespace-only value strips to empty -> treat as missing
+    # "", "NA", "N/A", "null", ... all mean "nothing was recorded"; without this they would be
+    # title-cased into the display values "Na", "N/A" and "Null" and become extra facet categories.
+    if normalized in BLANK_STATUS_VALUES:
         return "Unknown"
     return str(raw_affected).strip().title()
 
@@ -131,7 +139,9 @@ def _normalize_analysis_status(raw_analysis):
         return "Unsolved"
     if normalized == "unaffected":
         return "Unaffected"
-    return str(raw_analysis).strip().title() if raw_analysis else "Unknown"
+    if normalized in BLANK_STATUS_VALUES:
+        return "Unknown"
+    return str(raw_analysis).strip().title()
 
 
 def _parse_stat_value(raw_value):

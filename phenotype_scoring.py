@@ -354,6 +354,14 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
         if gene_id and gene_id in gene_lookup:
             gene_symbol = gene_lookup[gene_id].get("gene_symbol")
 
+        # Set every aggregate to None up front (as analysis_columns.add_all_outlier_columns does
+        # for its own columns), so an outlier type with no qualifying samples leaves the key
+        # present-and-None rather than absent. The loci writer derives its column set from the
+        # records, so an omitted key would drop the column for the whole build.
+        for outlier_type in OUTLIER_TYPES:
+            row.setdefault(f"MaxGenePhenoSim_{outlier_type}", None)
+            row.setdefault(f"SumPairwiseSim_{outlier_type}", None)
+
         for outlier_type in OUTLIER_TYPES:
             qualifying = get_qualifying_samples(
                 row, outlier_type, affected_lookup, analysis_lookup, participant_to_hpo

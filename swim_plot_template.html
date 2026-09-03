@@ -462,7 +462,7 @@ const STATUS_COLORS = {
 };
 
 function statusColor(status) {
-    if (status === 'Affected') return STATUS_COLORS['Affected'];
+    if (isAffectedStatus(status)) return STATUS_COLORS['Affected'];
     if (status === 'Unaffected') return STATUS_COLORS['Unaffected'];
     return STATUS_COLORS['Unknown'];
 }
@@ -717,7 +717,7 @@ function renderSwimChart(data) {
 function updateSwimLegend(data) {
     let affected = 0, unaffected = 0, unknown = 0;
     data.forEach(item => {
-        if (item.affected_status === 'Affected') affected++;
+        if (isAffectedStatus(item.affected_status)) affected++;
         else if (item.affected_status === 'Unaffected') unaffected++;
         else unknown++;
     });
@@ -732,8 +732,14 @@ function updateSwimLegend(data) {
     $('#swim-legend').show();
 }
 
+// Monotonic sequence for the one shared detail modal. The two fetches below are async, so a slow
+// response for an earlier dot must not render into the modal after the user has opened another one
+// (which would show one sample's details while the modal's save actions target a different one).
+let swimDetailSeq = 0;
+
 // Show detail modal for a clicked point (fetches full detail from API)
 function showDotDetail(item) {
+    const seq = ++swimDetailSeq;
     const locusId = escapeHtml(item.LocusId || '');
     const geneSymbol = escapeHtml(item.GeneTableGeneSymbol || '');
     const headerText = geneSymbol ? locusId + ' &mdash; ' + geneSymbol : locusId;
@@ -753,9 +759,11 @@ function showDotDetail(item) {
 
     Promise.all([detailPromise, statsPromise])
         .then(([detail, stats]) => {
+            if (seq !== swimDetailSeq) return;  // a newer dot already owns the modal
             renderDotDetailContent(item, detail, stats, params);
         })
         .catch(err => {
+            if (seq !== swimDetailSeq) return;
             console.error('Detail load error:', err);
             $('#dot-detail-content').html('<p style="color: red;">Failed to load details: ' + escapeHtml(err.message) + '</p>');
         });
@@ -1055,21 +1063,6 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
     html += '<tr><td>Known Disease Motif</td><td>' + (locus.IsKnownMotif ? 'Yes' : 'No') + '</td></tr>';
     html += '</table>';
 
-    if (annotations.omim_overlaps && annotations.omim_overlaps.length > 0) {
-        html += '<div style="font-weight: 600; color: #555; margin-top: 8px; margin-bottom: 4px;">Overlapping OMIM Linkage Regions</div>';
-        html += '<table class="detail-table">';
-        html += '<tr><td style="font-weight:600; color:#555;">Phenotype</td><td style="font-weight:600; color:#555;">MIM#</td><td style="font-weight:600; color:#555;">Region</td><td style="font-weight:600; color:#555;">Size (Mb)</td></tr>';
-        annotations.omim_overlaps.forEach(omim => {
-            html += '<tr>';
-            html += '<td style="white-space: normal;">' + escapeHtml(omim.phenotype_description || '') + '</td>';
-            html += '<td>' + escapeHtml(String(omim.phenotype_mim_number || '')) + '</td>';
-            html += '<td>' + escapeHtml(omim.region_coords || '') + '</td>';
-            html += '<td>' + escapeHtml(String(omim.region_size_mb != null ? omim.region_size_mb : '')) + '</td>';
-            html += '</tr>';
-        });
-        html += '</table>';
-    }
-
     // Section 10: TRExplorer (from locusDetail.locus)
     if (locus.TRExplorerLocusId) {
         const jaccardDisplay = (locus.TRExplorerLocusJaccardSimilarity != null) ? Number(locus.TRExplorerLocusJaccardSimilarity).toFixed(3) : '';
@@ -1132,7 +1125,7 @@ $(document).ready(function() {
         .then(r => r.json())
         .then(data => {
             const values = (data.sample_ids || []).map(id => ({ name: id, value: id }));
-            $('#swim-sample-id-filter').dropdown('setup menu', { values: values });
+            setupDropdownMenu($('#swim-sample-id-filter'), values);
         })
         .catch(e => console.error('Populate sample IDs error:', e));
 
@@ -1146,10 +1139,10 @@ $(document).ready(function() {
     fetch(SWIM_API_BASE + '/annotations/tags')
         .then(r => r.json())
         .then(data => {
-            // Use all_tags (user tags + system tags like "readviz"/"readviz pending") so the
-            // supported system-tag filters are selectable, not just user-defined tags.
+            // all_tags is what /annotations/tags reports; the single-DB server returns no
+            // system tags, so today this is exactly the set of user-defined tags.
             const values = (data.all_tags || []).map(t => ({ name: t, value: t }));
-            $('#swim-tag-filter').dropdown('setup menu', { values: values });
+            setupDropdownMenu($('#swim-tag-filter'), values);
         })
         .catch(e => console.error('Populate tags error:', e));
 
@@ -1232,6 +1225,23 @@ function refreshSwimModal() {
     if (_currentModalItem) showDotDetail(_currentModalItem);
 }
 
+// The chart encodes a "true"/"candidate" tag as a star (see renderSwimChart), and it reads those
+// tags off swimRawData rather than off the modal. Refreshing the tag menus and the modal alone
+// would therefore leave the plotted shapes disagreeing with the tags the user just edited, until
+// the whole plot is reloaded. The add/remove endpoints return the locus's updated tag list, so
+// push it back into every matching row and redraw.
+function applySwimTagUpdate(result) {
+    if (!result || !result.locus_id) return;
+    var changed = false;
+    swimRawData.forEach(function(item) {
+        if (item.LocusId === result.locus_id) {
+            item.tags = result.tags || [];
+            changed = true;
+        }
+    });
+    if (changed) renderSwimChart(swimRawData);
+}
+
 // Modal action button handlers
 $(document).on('click', '.swim-edit-note-btn', function() {
     if (!_currentModalItem) return;
@@ -1251,11 +1261,11 @@ function refreshSwimTags() {
         .then(function(d) {
             window._allTagsList = d.tags || [];  // user tags only — used for the add-tag hint
             var selected = $('#swim-tag-filter').dropdown('get value');
-            // Include system tags (e.g. "readviz") in the filter dropdown, not just user tags.
+            // all_tags, matching the initial population above.
             var values = (d.all_tags || []).map(function(t) {
                 return { name: t, value: t, selected: t === selected };
             });
-            $('#swim-tag-filter').dropdown('setup menu', { values: values });
+            setupDropdownMenu($('#swim-tag-filter'), values);
             if (selected) $('#swim-tag-filter').dropdown('set selected', selected);
         })
         .catch(function(e) { console.error('Refresh tags error:', e); });
@@ -1268,7 +1278,8 @@ $(document).on('click', '.swim-add-tag-btn', function() {
     var hint = allTags.length > 0 ? 'Existing tags: ' + allTags.join(', ') + '\n\nEnter tag:' : 'Enter tag:';
     var tag = prompt(hint);
     if (tag === null || !tag.trim()) return;
-    swimAddTag(locusId, tag.trim()).then(function() {
+    swimAddTag(locusId, tag.trim()).then(function(result) {
+        applySwimTagUpdate(result);
         // Refresh tag cache
         refreshSwimTags();
         refreshSwimModal();
@@ -1296,7 +1307,8 @@ $(document).on('click', '.swim-inline-add-tag', function() {
     var hint = allTags.length > 0 ? 'Existing tags: ' + allTags.join(', ') + '\n\nEnter tag:' : 'Enter tag:';
     var tag = prompt(hint);
     if (tag === null || !tag.trim()) return;
-    swimAddTag(locusId, tag.trim()).then(function() {
+    swimAddTag(locusId, tag.trim()).then(function(result) {
+        applySwimTagUpdate(result);
         refreshSwimTags();
         refreshSwimModal();
     }).catch(function(e) { alert('Failed: ' + e.message); });
@@ -1305,9 +1317,16 @@ $(document).on('click', '.swim-inline-add-tag', function() {
 $(document).on('click', '.swim-remove-tag-btn', function() {
     var locusId = $(this).data('locus-id');
     var tag = $(this).data('tag');
-    swimRemoveTag(locusId, tag).then(function() {
+    swimRemoveTag(locusId, tag).then(function(result) {
+        applySwimTagUpdate(result);
         refreshSwimTags();
         refreshSwimModal();
+        // The plotted points were filtered server-side by the active tag, so once this locus no
+        // longer carries it, its dots do not belong on the chart. Updating the shapes in place
+        // cannot remove them; reload so the server reapplies the filter.
+        if (swimLoadedParams && swimLoadedParams.tag === tag) {
+            loadSwimPlot();
+        }
     }).catch(function(e) { alert('Failed: ' + e.message); });
 });
 </script>

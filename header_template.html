@@ -4,7 +4,7 @@
       href="https://cdnjs.cloudflare.com/ajax/libs/semantic-ui/2.5.0/semantic.min.css">
 <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/semantic-ui/2.5.0/semantic.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
 <style>
 /* === Page Layout === */
@@ -220,34 +220,6 @@ body {
 .modal-tag-badge .delete-modal-tag:hover {
     opacity: 1;
 }
-.badge-system-tag {
-    background: #bbdefb;
-    color: #0d47a1;
-    border: 1px solid #1976d2;
-    cursor: pointer;
-    text-decoration: none;
-    display: inline-block;
-    padding: 1px 5px;
-    border-radius: 2px;
-    font-size: 0.8em;
-    font-weight: 600;
-    margin-right: 3px;
-}
-.badge-system-tag:hover {
-    background: #90caf9;
-    color: #0d47a1;
-}
-.badge-system-tag-pending {
-    background: #ff9800;
-    color: white;
-    cursor: default;
-    display: inline-block;
-    padding: 1px 5px;
-    border-radius: 2px;
-    font-size: 0.8em;
-    font-weight: 600;
-    margin-right: 3px;
-}
 .note-indicator { font-size: 0.85em; margin-left: 4px; cursor: pointer; }
 .note-indicator:hover { opacity: 0.7; }
 .annotation-section {
@@ -317,15 +289,6 @@ body {
     justify-content: space-between;
 }
 
-/* === Gene Info === */
-.gene-info { color: #333; font-size: 0.92em; }
-.gene-inheritance { color: #1565c0; font-weight: 600; }
-.gene-pli { color: #e65100; }
-.gene-phenotype { color: #555; font-style: italic; font-size: 0.9em; }
-
-/* === OMIM & Color-Coded Values === */
-.omim-line { color: #6a1b9a; font-size: 0.92em; }
-
 /* Invisible tables for vertical alignment */
 .invisible-table {
     border-collapse: collapse;
@@ -337,10 +300,6 @@ body {
     padding: 1px 8px 1px 0;
     vertical-align: top;
 }
-/* OMIM table columns */
-.omim-table .omim-linkage { white-space: nowrap; }
-.omim-table .omim-phenotype { }
-.omim-table .omim-mim { white-space: nowrap; }
 /* Affected Unsolved table columns */
 .affected-unsolved-table .aff-allele { white-space: nowrap; }
 .affected-unsolved-table .aff-sample { white-space: nowrap; }
@@ -358,7 +317,10 @@ body {
     border-collapse: collapse;
     margin-top: 6px;
 }
-.sample-subtable thead th {
+/* The per-sample sub-table is rendered inside #results-table's tbody, so these rules have to
+   out-specify the #results-table ones above (an ID beats a class); without the #results-table
+   prefix the nested header would inherit the main table's sticky positioning and colors. */
+#results-table .sample-subtable thead th {
     background: #f0f0f0;
     font-size: 0.9em;
     color: #666;
@@ -367,8 +329,8 @@ body {
     font-weight: 600;
     position: static;
 }
-.sample-subtable tr { border-bottom: 1px solid #f0f0f0; }
-.sample-subtable td { padding: 2px 6px; white-space: nowrap; }
+#results-table .sample-subtable tr { border-bottom: 1px solid #f0f0f0; }
+#results-table .sample-subtable td { padding: 2px 6px; white-space: nowrap; }
 
 /* Row coloring by affected/analysis status */
 .sample-affected-unsolved { color: #c62828; font-weight: 600; }
@@ -451,8 +413,8 @@ body {
                 <a id="header-title" href="/" style="color: white; text-decoration: none;">TR Outlier Analysis:</a>
                 <a href="/" style="color: #7fbaff; font-size: 1.05em; margin-left: 43px; text-decoration: none;">Home</a>
                 <a href="/swim" style="color: #7fbaff; font-size: 1.05em; margin-left: 31px; text-decoration: none;">Swim Plot</a>
-                <a href="/sample_qc" style="color: #7fbaff; font-size: 1.05em; margin-left: 31px; text-decoration: none;">Sample QC1,</a>
-                <a href="/qc2" style="color: #7fbaff; font-size: 1.05em; margin-left: 5px; text-decoration: none;">QC2</a>
+                <a href="/sample_qc" style="color: #7fbaff; font-size: 1.05em; margin-left: 31px; text-decoration: none;">Sample QC1{% if has_mendelian %},{% endif %}</a>
+                {% if has_mendelian %}<a href="/qc2" style="color: #7fbaff; font-size: 1.05em; margin-left: 5px; text-decoration: none;">QC2</a>{% endif %}
             </div>
         </div>
         <div class="one wide column"></div>

@@ -269,7 +269,12 @@ function createChartsForSection(containerId, data, bins) {
     // Group data by bin
     const binData = {};
     bins.forEach(bin => { binData[bin] = []; });
-    data.forEach(item => {
+    // A bin with total === 0 had no informative loci for that trio. The API reports it as
+    // fraction 0 (violations / total if total > 0 else 0), which is indistinguishable from a
+    // measured 0% violation rate, so drop it rather than plotting a dot and folding it into the
+    // box statistics, percentiles and shared scale below.
+    const measured = data.filter(item => item.total > 0);
+    measured.forEach(item => {
         if (binData[item.bin] !== undefined) {
             binData[item.bin].push({
                 sample_id: item.sample_id,
@@ -281,7 +286,7 @@ function createChartsForSection(containerId, data, bins) {
     });
 
     // Compute global max across all bins for shared y-axis (round up to nearest 5%)
-    const allFractions = data.map(d => d.fraction);
+    const allFractions = measured.map(d => d.fraction);
     const maxFraction = allFractions.length > 0 ? Math.max(...allFractions) : 0;
     const globalMax = Math.ceil(maxFraction / 0.05) * 0.05 || 0.05;  // Round up to nearest 5%
 
@@ -443,7 +448,10 @@ function createCenterChartsForSection(containerId, data, bins) {
     // Group data by bin
     const binData = {};
     bins.forEach(bin => { binData[bin] = []; });
-    data.forEach(item => {
+    // Same zero-denominator exclusion as createChartsForSection: a center with no informative
+    // loci in a bin is not a measured 0%.
+    const measured = data.filter(item => item.total > 0);
+    measured.forEach(item => {
         if (binData[item.bin] !== undefined) {
             binData[item.bin].push({
                 center: item.center,
@@ -456,7 +464,7 @@ function createCenterChartsForSection(containerId, data, bins) {
     });
 
     // Compute global max across all bins for shared y-axis (round up to nearest 5%)
-    const allFractions = data.map(d => d.fraction);
+    const allFractions = measured.map(d => d.fraction);
     const maxFraction = allFractions.length > 0 ? Math.max(...allFractions) : 0;
     const globalMax = Math.ceil(maxFraction / 0.05) * 0.05 || 0.05;  // Round up to nearest 5%
 

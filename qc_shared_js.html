@@ -16,6 +16,45 @@ function escapeHtml(str) {
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
+// True for the affected_status display values the pipeline treats as affected. The server
+// preserves "Possibly Affected" for display (results_server.parse_outlier_samples) while
+// collapsing it to "affected" for analysis logic, and README.md documents it as treated as
+// affected, so every UI that branches on affected_status has to accept both spellings.
+function isAffectedStatus(status) {
+    const normalized = String(status || '').trim().toLowerCase();
+    return normalized === 'affected' || normalized === 'possibly affected';
+}
+
+// Populate a Semantic UI dropdown's menu from values that came out of the database (tags,
+// sample ids), which are arbitrary user-supplied strings.
+//
+// Semantic UI's 'setup menu' builds its markup by string concatenation
+// ('<div class="item" data-value="' + value + '">' + name + '</div>'), so an unescaped value
+// containing markup executes, and one containing a double quote breaks out of the attribute.
+// Escaping both fixes that, but leaves the escaped text sitting in data-value, so this then
+// writes the raw strings back with .attr()/.data()/.text(), which assign literally rather than
+// parsing HTML. The menu is therefore safe to build AND dropdown('get value') still returns the
+// value exactly as stored, so the filter it sends matches the database.
+//
+// `items` is an array of {name, value} objects holding the raw, unescaped strings.
+function setupDropdownMenu($dropdown, items) {
+    $dropdown.dropdown('setup menu', {
+        values: items.map(function(item) {
+            return {
+                name: escapeHtml(item.name),
+                value: escapeHtml(item.value),
+                selected: item.selected,
+            };
+        }),
+    });
+    $dropdown.find('.menu > .item').each(function(index) {
+        if (!items[index]) return;
+        $(this).attr('data-value', items[index].value)
+               .data('value', items[index].value)
+               .text(items[index].name);
+    });
+}
+
 // Helper function to render warning icon if sample has warnings.
 // Mendelian-violation warnings are source-independent; outlier (99th-percentile) warnings are
 // per-source, so the outlier part is only included for the page's currently-selected `source`
@@ -42,7 +81,7 @@ function renderMendelianWarning(sampleId, source) {
     return `<i class="warning sign icon mendelian-warning-icon"
                title="${tooltip}"
                data-warning='${JSON.stringify(w).replace(/'/g, "&apos;")}'
-               data-sample-id="${sampleId}"></i>`;
+               data-sample-id="${escapeHtml(sampleId)}"></i>`;
 }
 
 // Compute box plot statistics for an array of values

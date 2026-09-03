@@ -17,7 +17,6 @@ simply skipped. See docs/INPUT_FORMATS.md.
 
 Note: this orchestrates build_database.build() — the ported analysis engine that reads the
 TSVs and populates the DB directly, with no intermediate files — and results_server.py (serve).
-Both land during bootstrap (see the refactor plan, step 0).
 """
 
 import argparse
@@ -32,9 +31,18 @@ import trails_setup
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# import names of the runtime deps in requirements.txt.
-REQUIRED_MODULES = ["flask", "pandas", "numpy", "tqdm", "msgpack", "intervaltree",
-                    "pyhpo", "requests"]
+# import names of the runtime deps in requirements.txt that the code actually imports.
+REQUIRED_MODULES = ["flask", "pandas", "numpy", "intervaltree"]
+
+# Neither of these is needed on any default code path, so a missing one is a warning, not an exit:
+#   pyhpo    - ontology-aware phenotype similarity; phenotype_scoring falls back to Jaccard.
+#   requests - imported only inside locus_annotations.fetch_strchive_loci, the opt-in network
+#              fetch; trails_setup downloads reference data with urllib instead.
+OPTIONAL_MODULES = ["pyhpo", "requests"]
+
+# Written after the one optional-dependency install attempt, so a package that will not build here
+# does not make every later run re-try (and re-wait for) the same failing pip invocation.
+OPTIONAL_INSTALL_MARKER = os.path.join(SCRIPT_DIR, ".trails_optional_deps_attempted")
 
 
 def _has_module(name):
@@ -46,15 +54,38 @@ def _has_module(name):
 
 
 def ensure_dependencies():
-    """pip-install requirements.txt if any runtime dependency is missing."""
-    if all(_has_module(m) for m in REQUIRED_MODULES):
-        return
-    print("Installing Python dependencies (requirements.txt) ...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "-r",
-                    os.path.join(SCRIPT_DIR, "requirements.txt")], check=True)
-    still_missing = [m for m in REQUIRED_MODULES if not _has_module(m)]
-    if still_missing:
-        sys.exit(f"ERROR: dependencies still missing after install: {', '.join(still_missing)}")
+    """pip-install the runtime dependencies if any are missing.
+
+    The required set is installed with check=True: without it nothing can run. The optional set
+    lives in its own requirements file and is installed with check=False, because pip fails the
+    whole invocation if any listed package cannot be built, which would turn a soft dependency
+    into a hard one.
+    """
+    if not all(_has_module(m) for m in REQUIRED_MODULES):
+        print("Installing Python dependencies (requirements.txt) ...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-r",
+                        os.path.join(SCRIPT_DIR, "requirements.txt")], check=True)
+        still_missing = [m for m in REQUIRED_MODULES if not _has_module(m)]
+        if still_missing:
+            sys.exit(f"ERROR: dependencies still missing after install: {', '.join(still_missing)}")
+
+    missing_optional = [m for m in OPTIONAL_MODULES if not _has_module(m)]
+    if missing_optional and not os.path.exists(OPTIONAL_INSTALL_MARKER):
+        print(f"Installing optional Python dependencies ({', '.join(missing_optional)}) ...")
+        subprocess.run([sys.executable, "-m", "pip", "install"] + missing_optional, check=False)
+        # Record the attempt either way. These packages are optional and one of them may simply
+        # not build on this machine; retrying the install on every invocation would make every run
+        # pay for a failure that is not going to resolve itself. Delete the marker to retry.
+        try:
+            with open(OPTIONAL_INSTALL_MARKER, "w") as f:
+                f.write(" ".join(OPTIONAL_MODULES) + "\n")
+        except OSError:
+            pass
+        missing_optional = [m for m in OPTIONAL_MODULES if not _has_module(m)]
+    if missing_optional:
+        print(f"NOTE: optional dependencies not installed: {', '.join(missing_optional)}. "
+              f"Phenotype scoring falls back to Jaccard similarity without pyhpo; the opt-in "
+              f"STRchive fetch needs requests. Delete {OPTIONAL_INSTALL_MARKER} to retry.")
 
 
 def hash_file(path):
@@ -68,26 +99,15 @@ def hash_file(path):
     return digest.hexdigest()
 
 
-def trails_git_sha():
-    """Return the TRails git commit, or 'unknown' outside a git checkout."""
-    try:
-        return subprocess.run(["git", "-C", SCRIPT_DIR, "rev-parse", "HEAD"],
-                              capture_output=True, text=True, check=True).stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return "unknown"
-
-
 def trails_code_version():
     """Return a fingerprint of the TRails code for the build manifest.
 
-    Uses the git commit in a checkout; outside a checkout (a tarball install,
-    where ``trails_git_sha()`` is the constant 'unknown') it falls back to a
-    sha256 over the TRails Python sources, so re-running after a code update
-    correctly triggers a rebuild instead of reusing a stale database.
+    A sha256 over the TRails Python sources, so re-running after a code update
+    correctly triggers a rebuild instead of reusing a stale database. The git
+    commit is deliberately not used: it does not change when the working tree is
+    edited, so in a checkout (the normal case while developing) an uncommitted
+    change to the pipeline would silently reuse the database built by the old code.
     """
-    sha = trails_git_sha()
-    if sha != "unknown":
-        return sha
     digest = hashlib.sha256()
     for name in sorted(os.listdir(SCRIPT_DIR)):
         if name.endswith(".py"):
@@ -114,8 +134,12 @@ def build_manifest(inputs, flags):
         inputs: {label: path} for every file whose contents affect the built DB.
         flags: {name: value} for every build flag that affects the DB.
     """
+    # phenotype_scoring silently falls back to Jaccard similarity when pyhpo is missing, which
+    # produces different scores from the same inputs. Record which backend was used, so installing
+    # or removing pyhpo invalidates the cached database instead of leaving stale scores in place.
     return {"inputs": {label: hash_file(path) for label, path in inputs.items()},
             "flags": flags,
+            "phenotype_backend": "pyhpo" if _has_module("pyhpo") else "jaccard",
             "trails_sha": trails_code_version()}
 
 
@@ -147,7 +171,13 @@ def run_build(args, db_path, genes_to_phenotype, known_loci_json, strchive_loci_
 def serve(db_path, args, known_loci_json=None, strchive_loci_json=None):
     """Start results_server.py against the single built DB (forwarding optional reference inputs)."""
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "results_server.py"), "--db", db_path]
+    # The server defaults --annotations-db to the bare name "annotations.db", which sqlite3
+    # resolves against the server's cwd, so notes would follow the launch directory. Derive it from
+    # the full database filename instead: anchoring on the directory alone would make every result
+    # database in that directory share one note/tag store, and notes are keyed by LocusId only.
+    annotations_db = os.path.abspath(db_path) + ".annotations.db"
     for flag, value in [("--sample-table", args.sample_metadata_tsv),
+                        ("--annotations-db", annotations_db),
                         ("--known-loci-json", known_loci_json),
                         ("--strchive-loci-json", strchive_loci_json),
                         ("--port", args.port),

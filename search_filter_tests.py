@@ -217,8 +217,19 @@ class SearchQueryTests(unittest.TestCase):
             results_server.app.config["DB_COLUMNS_SET"] = original - {"GeneTableGeneSymbol"}
             self.assertEqual(self._search("FMR1"), set())
             self.assertEqual(self._search("FMR1, 2-200-209-AAG"), {"2-200-209-AAG"})
+        finally:
+            results_server.app.config["DB_COLUMNS_SET"] = original
+
+    def test_variation_cluster_filter_passes_everything_without_the_column(self):
+        # This filter is the exception to the rule above: its clause deliberately keeps loci whose
+        # VariationClusterSizeDiff is NULL or "", so a database with no such column at all is the
+        # same situation for every locus and every locus passes. Matching nothing instead would
+        # contradict how the filter treats missing data when the column is present.
+        original = results_server.app.config["DB_COLUMNS_SET"]
+        try:
             results_server.app.config["DB_COLUMNS_SET"] = original - {"VariationClusterSizeDiff"}
-            self.assertEqual(self._query(max_variation_cluster_size_diff=20), set())
+            self.assertEqual(self._query(max_variation_cluster_size_diff=20),
+                             self._query())
         finally:
             results_server.app.config["DB_COLUMNS_SET"] = original
 

@@ -8,20 +8,30 @@ in-memory repeat-copy-numbers matrix (the ``locus_rows`` produced by
 ``input_tables.read_repeat_copy_numbers``) plus the trio relationships from the
 sample-metadata table.
 
-Everything else -- ``check_violation``, ``allele_matches_any``,
-``get_chrom_category``, ``get_motif_size_category``, ``MOTIF_SIZE_CATEGORIES``,
-the per-chromosome dispatch (chrY uses child+father, chrM uses child+mother,
-autosome/chrX uses all three), the "require at least 2 distinct allele sizes"
-filter, and the two output-table schemas -- is a faithful, verbatim port of the
-original behavior.
+Everything else -- ``allele_matches_any``, ``get_chrom_category``,
+``get_motif_size_category``, ``MOTIF_SIZE_CATEGORIES``, the per-chromosome
+dispatch (chrY uses child+father, chrM uses child+mother, autosome/chrX uses all
+three), the "require at least 2 distinct allele sizes" filter, and the two
+output-table schemas -- is a faithful, verbatim port of the original behavior.
 
-Two TRails-specific additions handle the fact that a matrix cell can be a
+Three TRails-specific deviations. Two handle the fact that a matrix cell can be a
 no-call (the per-sample LPS files never were):
   * ``parse_genotype`` returns ``None`` for empty / ``.`` / ``./.`` cells (and
     for malformed cells), and such loci are skipped for the affected member.
   * The matrix is the single source of genotypes, so the "filter mother to loci
     present in the child" step of the original is automatic (we iterate the
     child's genotypes per locus).
+
+The third is in ``check_violation``: the original required a single-allele child
+call to come from the mother, which is right for a hemizygous son on chrX but
+wrong on an autosome, where a one-allele call may have come from either parent.
+It therefore takes a ``chrom_category`` argument and applies the mother-only rule
+only for chrX.
+
+A fourth: the "at least 2 distinct allele sizes" filter is not applied to a
+haploid chrY (or chrM) comparison, where it would mean "the two disagree" and
+would leave only discordant loci in the denominator, making
+``chrY_violations / chrY_total`` something other than a violation rate.
 
 All functions are pure -- they take their inputs as arguments and return values
 without mutating shared module state.
@@ -94,7 +104,7 @@ def allele_matches_any(allele, genotype, threshold):
     return any(abs(allele - other_allele) < threshold for other_allele in genotype)
 
 
-def check_violation(child_genotype, mother_genotype, father_genotype, threshold):
+def check_violation(child_genotype, mother_genotype, father_genotype, threshold, chrom_category):
     """Return True if the child's genotype violates Mendelian inheritance.
 
     A genotype is consistent with Mendelian inheritance if the child could have
@@ -103,11 +113,15 @@ def check_violation(child_genotype, mother_genotype, father_genotype, threshold)
     repeats.
 
     Handles hemizygous calls (1-element tuples) for sex chromosomes:
-      * Hemizygous child (e.g. a son on chrX): the single allele must come from
-        the mother.
+      * Hemizygous child on chrX (a son): the single allele must come from the
+        mother.
       * Hemizygous father on chrX: a daughter inherits his single allele.
     (chrY and chrM are handled by the per-chromosome dispatch in
     ``compute_mendelian_violations`` and never reach this function.)
+
+    A single-allele child call on an autosome means something different: the
+    caller only reported one allele, and it could have come from either parent,
+    so ``chrom_category`` decides which rule applies.
 
     Args:
         child_genotype: Tuple of alleles for the child (1 or 2 elements).
@@ -115,15 +129,21 @@ def check_violation(child_genotype, mother_genotype, father_genotype, threshold)
         father_genotype: Tuple of alleles for the father (1 or 2 elements).
         threshold: Alleles match if they differ by strictly fewer than this many
             repeats.
+        chrom_category: The locus's chromosome category, as returned by
+            ``get_chrom_category`` -- "chrX" or "autosome" here.
 
     Returns:
         True if the genotype is a Mendelian violation, False otherwise.
     """
-    # Case 1: the child is hemizygous (a son on chrX; chrY is handled separately
-    # and never reaches here), so the single X allele is inherited from the
-    # mother regardless of the mother's ploidy.
+    # Case 1: the child has a single allele. On chrX that means a hemizygous son,
+    # whose one X allele comes from the mother regardless of her ploidy. On an
+    # autosome it is just a one-allele call, which either parent could have
+    # supplied. (chrY is handled separately and never reaches here.)
     if len(child_genotype) == 1:
-        return not allele_matches_any(child_genotype[0], mother_genotype, threshold)
+        if chrom_category == "chrX":
+            return not allele_matches_any(child_genotype[0], mother_genotype, threshold)
+        return not (allele_matches_any(child_genotype[0], mother_genotype, threshold)
+                    or allele_matches_any(child_genotype[0], father_genotype, threshold))
 
     # Case 2: the child is diploid.
     first_child_allele, second_child_allele = child_genotype
@@ -350,7 +370,13 @@ def _process_trio(child_id, mother_id, father_id, locus_rows, threshold):
             father_genotype = parse_genotype(genotypes.get(father_id))
             if father_genotype is None:
                 continue
-            if len(set(child_genotype) | set(father_genotype)) < 2:
+            # The "at least 2 distinct alleles" variability filter degenerates on a haploid
+            # comparison: with one allele on each side, "2 distinct" is exactly "father and son
+            # disagree", so applying it would leave only discordant loci in the denominator and
+            # violations/total would stop being a violation rate. Keep it only when at least one
+            # side is diploid, where it still means what it does on the autosomes.
+            if (len(child_genotype) > 1 or len(father_genotype) > 1) \
+                    and len(set(child_genotype) | set(father_genotype)) < 2:
                 continue
             is_violation = any(
                 not allele_matches_any(child_allele, father_genotype, threshold)
@@ -362,7 +388,9 @@ def _process_trio(child_id, mother_id, father_id, locus_rows, threshold):
             mother_genotype = parse_genotype(genotypes.get(mother_id))
             if mother_genotype is None:
                 continue
-            if len(set(child_genotype) | set(mother_genotype)) < 2:
+            # Same haploid caveat as chrY above.
+            if (len(child_genotype) > 1 or len(mother_genotype) > 1) \
+                    and len(set(child_genotype) | set(mother_genotype)) < 2:
                 continue
             is_violation = any(
                 not allele_matches_any(child_allele, mother_genotype, threshold)
@@ -379,7 +407,8 @@ def _process_trio(child_id, mother_id, father_id, locus_rows, threshold):
                 continue
             _tally(
                 stats, per_motif_stats, chrom_category, motif_size_category, canonical_motif,
-                check_violation(child_genotype, mother_genotype, father_genotype, threshold),
+                check_violation(child_genotype, mother_genotype, father_genotype, threshold,
+                                chrom_category),
             )
 
     return stats, per_motif_stats
@@ -452,11 +481,10 @@ def compute_mendelian_violations(locus_rows, sample_lookup, sample_df, threshold
         locus_rows: The in-memory matrix rows from
             ``input_tables.read_repeat_copy_numbers`` (each with ``trid``,
             ``motif`` and a ``genotypes`` dict).
-        sample_lookup: The sample_id -> metadata-dict lookup (unused for the
-            computation itself, accepted for a uniform call signature alongside
-            the other build stages).
-        sample_df: The cleaned sample-metadata DataFrame (or the sample_lookup
-            dict) used by ``find_trios`` to discover trios.
+        sample_lookup: The sample_id -> metadata-dict lookup. Used as the trio
+            source when ``sample_df`` is None; ``find_trios`` accepts either shape.
+        sample_df: The cleaned sample-metadata DataFrame used by ``find_trios`` to
+            discover trios. When None, ``sample_lookup`` is used instead.
         threshold: Alleles match if they differ by strictly fewer than this many
             repeats. Defaults to 2. The "match" test is strict
             (``abs(a - b) < threshold``), so a difference of exactly ``threshold``
@@ -472,32 +500,44 @@ def compute_mendelian_violations(locus_rows, sample_lookup, sample_df, threshold
     if not trios:
         return [], []
 
+    # The column names come from the two helpers rather than being rebuilt here, so the schema has
+    # one definition. The value lists below walk the same categories in the same order.
+    per_sample_column_names = per_sample_columns()
+    per_motif_column_names = per_motif_columns()
+
     per_sample_rows = []
     per_motif_rows = []
     for child_id, mother_id, father_id in trios:
         stats, per_motif_stats = _process_trio(
             child_id, mother_id, father_id, locus_rows, threshold)
 
-        per_sample_row = {"sample_id": child_id}
+        per_sample_values = [child_id]
         total_violations = 0
         total_loci = 0
         for chrom_category in ["autosome", "chrX", "chrY", "chrM"]:
-            per_sample_row[f"{chrom_category}_violations"] = stats["by_chrom"][chrom_category]["violations"]
-            per_sample_row[f"{chrom_category}_total"] = stats["by_chrom"][chrom_category]["total"]
+            per_sample_values.append(stats["by_chrom"][chrom_category]["violations"])
+            per_sample_values.append(stats["by_chrom"][chrom_category]["total"])
             total_violations += stats["by_chrom"][chrom_category]["violations"]
             total_loci += stats["by_chrom"][chrom_category]["total"]
         for motif_size_category in MOTIF_SIZE_CATEGORIES:
-            safe_category = motif_size_category.replace("-", "_").replace("+", "plus")
-            per_sample_row[f"motif_{safe_category}_violations"] = stats["by_motif_size"][motif_size_category]["violations"]
-            per_sample_row[f"motif_{safe_category}_total"] = stats["by_motif_size"][motif_size_category]["total"]
-        per_sample_row["total_violations"] = total_violations
-        per_sample_row["total_loci"] = total_loci
-        per_sample_rows.append(per_sample_row)
+            per_sample_values.append(stats["by_motif_size"][motif_size_category]["violations"])
+            per_sample_values.append(stats["by_motif_size"][motif_size_category]["total"])
+        per_sample_values.append(total_violations)
+        per_sample_values.append(total_loci)
 
-        per_motif_row = {"sample_id": child_id}
+        per_motif_values = [child_id]
         for motif in ALL_CANONICAL_MOTIFS:
-            per_motif_row[f"mv_{motif}"] = per_motif_stats[motif]["violations"]
-            per_motif_row[f"total_{motif}"] = per_motif_stats[motif]["total"]
-        per_motif_rows.append(per_motif_row)
+            per_motif_values.append(per_motif_stats[motif]["violations"])
+            per_motif_values.append(per_motif_stats[motif]["total"])
+
+        if (len(per_sample_values) != len(per_sample_column_names)
+                or len(per_motif_values) != len(per_motif_column_names)):
+            raise AssertionError(
+                "Mendelian row values and column names have drifted: "
+                f"{len(per_sample_values)} vs {len(per_sample_column_names)} per-sample, "
+                f"{len(per_motif_values)} vs {len(per_motif_column_names)} per-motif")
+
+        per_sample_rows.append(dict(zip(per_sample_column_names, per_sample_values)))
+        per_motif_rows.append(dict(zip(per_motif_column_names, per_motif_values)))
 
     return per_sample_rows, per_motif_rows

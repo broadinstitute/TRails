@@ -9,10 +9,11 @@
 # What it does, in order:
 #   1. If not run from a checkout, downloads + extracts TRails into ./TRails (curl + tar,
 #      no git). Re-running seamlessly UPDATES to the latest $TRAILS_VERSION; an up-to-date
-#      copy is reused. Resumable (curl -C -) and idempotent.
+#      copy is reused. Idempotent (a partial download is discarded and refetched).
 #   2. Installs Python deps (requirements.txt).
 #   3. Downloads PUBLIC (class-A) reference data into reference_data/ (skips files already
-#      present; resumable). Licensed/controlled (class B) and your own (class C) data are
+#      present at the currently pinned version; a download is atomic, not resumable, and a
+#      failure is non-fatal). Licensed/controlled (class B) and your own (class C) data are
 #      NEVER fetched — TRails runs without them; supply your own via CLI flags.
 #      See docs/INPUT_FORMATS.md.
 #
@@ -62,7 +63,7 @@ fi
 # + python3 (no git, no jq). Idempotent, resumable, and self-updating:
 #   - an existing up-to-date copy is reused (no work);
 #   - if the remote $TRAILS_VERSION has advanced, it is re-downloaded seamlessly;
-#   - a partial tarball download is resumed via curl -C -;
+#   - a partial tarball from an interrupted run is discarded and refetched;
 #   - TRAILS_FORCE=1 forces a fresh re-download.
 # The installed commit is recorded in $INSTALL_DIR/.trails_version.
 if [[ -z "$TRAILS_DIR" ]]; then
@@ -97,15 +98,42 @@ except Exception: pass" 2>/dev/null || true)"
     if [[ -n "$remote_sha" ]]; then
       tarball_url="https://github.com/${TRAILS_REPO}/archive/${remote_sha}.tar.gz"
     else
-      tarball_url="https://github.com/${TRAILS_REPO}/archive/refs/heads/${TRAILS_VERSION}.tar.gz"
+      # TRAILS_VERSION may be a branch, a tag or a commit, and GitHub resolves all three under
+      # /archive/<ref>.tar.gz. The refs/heads/ form would 404 for a tag or commit.
+      tarball_url="https://github.com/${TRAILS_REPO}/archive/${TRAILS_VERSION}.tar.gz"
     fi
     echo "Downloading TRails ($TRAILS_REPO@${ref_for_tarball}) -> $INSTALL_DIR ..."
-    # Per-version tarball name so curl -C - only resumes the SAME version's partial.
-    _tarball="$INSTALL_DIR/.trails_src.${ref_for_tarball}.tar.gz"
-    curl -fL -C - --retry 3 -o "$_tarball" "$tarball_url"
-    tar -xz -f "$_tarball" -C "$INSTALL_DIR" --strip-components=1
+    # GitHub's archive endpoint does not honor HTTP byte ranges, so `curl -C -` fails with exit 56
+    # ("Cannot resume") whenever a partial file is present, which under `set -e` would make one
+    # interrupted download a permanent install failure. Discard any partial and fetch afresh.
+    # The ref is sanitized because a branch name may contain "/" (e.g. feature/foo), which
+    # would otherwise make this a path into a directory that does not exist.
+    _safe_ref="$(printf '%s' "$ref_for_tarball" | tr -c 'A-Za-z0-9._-' '_')"
+    _tarball="$INSTALL_DIR/.trails_src.${_safe_ref}.tar.gz"
+    rm -f "$_tarball"
+    curl -fL --retry 3 -o "$_tarball" "$tarball_url"
+    # Stage the new tree, then replace the old one, so a file the new revision no longer
+    # ships does not survive. The prune is gated on .trails_version so it only ever runs
+    # against a directory this installer created, never an arbitrary path.
+    _staging="$INSTALL_DIR/.trails_src_staging"
+    rm -rf "$_staging"
+    mkdir -p "$_staging"
+    tar -xz -f "$_tarball" -C "$_staging" --strip-components=1
+    if [[ -f "$VERSION_FILE" ]]; then
+      # reference_data/ is the download cache, not part of the source tree, so it stays.
+      find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 \
+          ! -name 'reference_data' ! -name '.trails_src_staging' \
+          ! -name '.trails_src.*' ! -name '.trails_version' -exec rm -rf {} +
+    fi
+    (cd "$_staging" && tar -cf - .) | (cd "$INSTALL_DIR" && tar -xf -)
+    rm -rf "$_staging"
     rm -f "$INSTALL_DIR"/.trails_src.*.tar.gz   # clean up only after a successful extract
     printf '%s\n' "${remote_sha:-$TRAILS_VERSION}" > "$VERSION_FILE"
+  elif [[ -z "$remote_sha" ]]; then
+    # The API lookup above is best-effort; with no remote SHA we never compared anything, so say
+    # the check failed rather than reporting an unverified copy as current.
+    echo "Could not reach the GitHub API to check for updates; keeping the existing install at" \
+         "$INSTALL_DIR (${installed_sha:-$TRAILS_VERSION}). Re-run with TRAILS_FORCE=1 to refetch."
   else
     echo "TRails is up to date at $INSTALL_DIR (${installed_sha:-$TRAILS_VERSION})."
   fi
@@ -120,7 +148,13 @@ mkdir -p "$REF_DIR"
 
 # --- Python dependencies ------------------------------------------------------------
 echo "Installing Python dependencies..."
-python3 -m pip install -r "$TRAILS_DIR/requirements.txt"   # Flask, pandas, numpy, str-analysis, pyhpo, ...
+python3 -m pip install -r "$TRAILS_DIR/requirements.txt"   # flask, pandas, numpy, intervaltree, requests
+# pyhpo only sharpens phenotype scoring (phenotype_scoring falls back to Jaccard without it), so a
+# failure here must not abort the install the way a required dependency would. Installed by name
+# rather than from a requirements file, so it cannot fail the required set alongside it.
+python3 -m pip install pyhpo requests \
+  || echo "  note: optional packages not installed; phenotype scoring will use Jaccard
+          similarity and the opt-in STRchive fetch will be unavailable"
 echo ""
 
 # --- Public (class-A) reference data ------------------------------------------------

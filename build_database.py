@@ -94,6 +94,16 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
         locus_rows = locus_rows[:n_loci]
     print(f"  {len(locus_rows):,} loci, {len(sample_id_list):,} samples")
 
+    # The OutlierSampleIds_* strings encode entries as "{allele}x:{sample_id}[:...]", so a ':' in a
+    # sample id truncates it everywhere downstream and can silently merge two samples into one.
+    # read_sample_metadata rejects it on its side; reject it here too, otherwise a cohort with such
+    # ids just moves onto the no-metadata path and builds a quietly wrong database.
+    bad_sample_ids = [s for s in sample_id_list if ":" in str(s) or "," in str(s)]
+    if bad_sample_ids:
+        raise ValueError(
+            f"Sample column headers in {repeat_copy_numbers_tsv} must not contain ':' or ',' "
+            f"(both are OutlierSampleIds delimiters): {bad_sample_ids[:10]}")
+
     # Stage 2: read the sample metadata and build the lookups.
     print(f"Reading sample metadata: {sample_metadata_tsv}")
     sample_lookup, affected_lookup, analysis_lookup, sample_df = (
@@ -157,9 +167,9 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
         print("  no known-loci catalog supplied; KnownDiseaseLocus / IsKnownMotif left NULL/0")
 
     for record in records:
-        # When a catalog is supplied it is authoritative; otherwise preserve any
-        # KnownDiseaseLocus / IsKnownMotif value the input matrix already provided
-        # (promoted from extra_columns above) rather than clobbering it with NULL/0.
+        # When a catalog or gene table is supplied it is authoritative; otherwise preserve any
+        # KnownDiseaseLocus / IsKnownMotif / IsInMendelianGene value the input matrix already
+        # provided (promoted from extra_columns above) rather than clobbering it with NULL/0.
         if interval_trees or strchive_trees:
             record["KnownDiseaseLocus"] = locus_annotations.matches_disease_locus(
                 record["LocusId"], interval_trees, strchive_trees)
@@ -170,8 +180,11 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
                 record["CanonicalMotif"], known_canonical_motifs)
         else:
             record.setdefault("IsKnownMotif", 0)
-        record["IsInMendelianGene"] = locus_annotations.is_in_mendelian_gene(
-            record.get("gene_id"), gene_lookup)
+        if gene_lookup:
+            record["IsInMendelianGene"] = locus_annotations.is_in_mendelian_gene(
+                record.get("gene_id"), gene_lookup)
+        else:
+            record.setdefault("IsInMendelianGene", 0)
 
     # Stage 8: gene-derived pLI / inheritance columns.
     print("Adding gene columns ...")

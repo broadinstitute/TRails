@@ -58,40 +58,48 @@ class CheckViolationTests(unittest.TestCase):
 
     def test_autosomal_consistent(self):
         # child (10, 20): 10 from mother (10,11), 20 from father (20,21).
-        self.assertFalse(check_violation((10, 20), (10, 11), (20, 21), 2))
+        self.assertFalse(check_violation((10, 20), (10, 11), (20, 21), 2, "autosome"))
 
     def test_autosomal_consistent_swapped_assignment(self):
         # child (20, 10): 20 from father, 10 from mother (assignment 2).
-        self.assertFalse(check_violation((20, 10), (10, 11), (20, 21), 2))
+        self.assertFalse(check_violation((20, 10), (10, 11), (20, 21), 2, "autosome"))
 
     def test_autosomal_violation(self):
         # child (50, 60): neither allele can come from a parent.
-        self.assertTrue(check_violation((50, 60), (10, 11), (20, 21), 2))
+        self.assertTrue(check_violation((50, 60), (10, 11), (20, 21), 2, "autosome"))
+
+    def test_autosomal_single_allele_child_can_come_from_either_parent(self):
+        # A one-allele call on an autosome is not a hemizygous son: the allele may have come
+        # from the father, so 30 matching the father (30, 31) is consistent, not a violation.
+        self.assertFalse(check_violation((30,), (10, 11), (30, 31), 2, "autosome"))
+        self.assertFalse(check_violation((10,), (10, 11), (30, 31), 2, "autosome"))
+        # Matching neither parent is still a violation.
+        self.assertTrue(check_violation((50,), (10, 11), (30, 31), 2, "autosome"))
 
     def test_chrx_hemizygous_child_consistent(self):
         # hemizygous son: single X allele must come from mother.
-        self.assertFalse(check_violation((15,), (15, 30), (40,), 2))
+        self.assertFalse(check_violation((15,), (15, 30), (40,), 2, "chrX"))
 
     def test_chrx_hemizygous_child_violation(self):
-        self.assertTrue(check_violation((15,), (30, 40), (15,), 2))
+        self.assertTrue(check_violation((15,), (30, 40), (15,), 2, "chrX"))
 
     def test_chrx_hemizygous_father_daughter_consistent(self):
         # daughter (12, 20): 12 from father's single allele, 20 from mother.
-        self.assertFalse(check_violation((12, 20), (20, 21), (12,), 2))
+        self.assertFalse(check_violation((12, 20), (20, 21), (12,), 2, "chrX"))
 
     def test_chrx_hemizygous_father_daughter_violation(self):
-        self.assertTrue(check_violation((50, 60), (20, 21), (12,), 2))
+        self.assertTrue(check_violation((50, 60), (20, 21), (12,), 2, "chrX"))
 
     def test_hemizygous_mother_consistent(self):
         # child (5, 30): 5 from mother's single allele, 30 from father.
-        self.assertFalse(check_violation((5, 30), (5,), (30, 31), 2))
+        self.assertFalse(check_violation((5, 30), (5,), (30, 31), 2, "autosome"))
 
     def test_threshold_strictness_diff_equals_threshold_is_violation(self):
         # child allele 12 vs only possible source 10: diff == 2 == threshold,
         # which is NOT a match (strict <), so it's a violation.
-        self.assertTrue(check_violation((12,), (10,), (99,), 2))
+        self.assertTrue(check_violation((12,), (10,), (99,), 2, "chrX"))
         # diff == 1 < threshold: a match, no violation.
-        self.assertFalse(check_violation((11,), (10,), (99,), 2))
+        self.assertFalse(check_violation((11,), (10,), (99,), 2, "chrX"))
 
 
 class ChromCategoryTests(unittest.TestCase):
@@ -287,6 +295,22 @@ class ComputeMendelianViolationsTests(unittest.TestCase):
         self.assertEqual(per_sample[0]["chrY_total"], 1)
         self.assertEqual(per_sample[0]["chrY_violations"], 1)
         self.assertEqual(per_sample[0]["autosome_total"], 0)
+
+    def test_chry_concordant_locus_counts_toward_the_denominator(self):
+        # A son whose chrY allele matches his father's is the normal case, and it has to be in
+        # the denominator or chrY_violations / chrY_total is not a violation rate.
+        locus_rows = [{
+            "trid": "chrY-1-10-A", "motif": "A",
+            "genotypes": {"child": "10", "mom": "5,6", "dad": "10"},
+        }]
+        sample_df = pandas.DataFrame([
+            {"sample_id": "child", "maternal_id": "mom", "paternal_id": "dad"},
+            {"sample_id": "mom", "maternal_id": "", "paternal_id": ""},
+            {"sample_id": "dad", "maternal_id": "", "paternal_id": ""},
+        ])
+        per_sample, _ = compute_mendelian_violations(locus_rows, {}, sample_df, threshold=2)
+        self.assertEqual(per_sample[0]["chrY_total"], 1)
+        self.assertEqual(per_sample[0]["chrY_violations"], 0)
 
     def test_chrm_uses_mother_only(self):
         # chrM locus: child + mother, father irrelevant. Child matches mother

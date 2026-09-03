@@ -388,7 +388,9 @@ def collect_samples_single_pass(outlier_entries, sample_lookup, affected_lookup,
         outlier_entries: A list of ``(allele_size, sample_id, purity, methylation)``
             tuples sorted descending by allele size.
         sample_lookup: Mapping of sample_id -> sample row dict (carries family_id
-            and phenotype_description). A sample id absent here is skipped.
+            and phenotype_description). A sample id absent here is still ranked
+            (treated as Unknown); it is only left out of the family-level ranking,
+            because it has no family_id.
         affected_lookup: Mapping of sample_id -> affected_status.
         analysis_lookup: Mapping of sample_id -> analysis_status.
 
@@ -608,7 +610,11 @@ def add_gene_columns(records, gene_lookup):
         else:
             record["pLI"] = None
 
-        record["inheritance"] = gene_row.get("inheritance")
+        # read_gene_table does not pass keep_default_na=False, so a blank cell arrives as a float
+        # NaN. Normalize it the same way pLI above and the GeneTable* columns below do, otherwise
+        # a NaN reaches the loci table in a column everything else treats as string-or-None.
+        inheritance = gene_row.get("inheritance")
+        record["inheritance"] = None if _is_missing(inheritance) else inheritance
 
         # Populate the 10 GeneTable* output columns from the gene row so they
         # exist in the loci table (the server filters/selects them directly).

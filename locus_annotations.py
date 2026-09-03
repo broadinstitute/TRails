@@ -177,6 +177,35 @@ def _build_strchive_trees(loci):
     return dict(interval_trees)
 
 
+# Cell values that mean "nothing was recorded" in an affected_status / analysis_status column
+# (matches input_tables._is_blank).
+BLANK_STATUS_VALUES = {"", "nan", "none", "na", "n/a", "null"}
+
+
+def normalize_affected_status_for_logic(value):
+    """Normalize an affected-status cell so comparisons don't depend on its spelling.
+
+    Both the build (input_tables.read_sample_metadata) and the server compare affected statuses,
+    and they must agree on what "Possibly Affected" means, so this is the one definition.
+
+    Args:
+        value: An affected-status cell, which may be None, NaN or any of the blank spellings in
+            BLANK_STATUS_VALUES.
+
+    Returns:
+        None for a blank value, "affected" for "possibly affected", and the lower-cased stripped
+        value otherwise.
+    """
+    if value is None:
+        return None
+    if isinstance(value, float) and value != value:  # NaN
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in BLANK_STATUS_VALUES:
+        return None
+    return "affected" if normalized == "possibly affected" else normalized
+
+
 def load_known_disease_loci(filepath=None, fetch_strchive=False, strchive_filepath=None,
                             build_locus_lookup=False):
     """Load known disease loci into chrom -> IntervalTree(s) for matching.
@@ -290,7 +319,13 @@ def matches_disease_locus(locus_id, interval_trees, strchive_trees=None):
             if compute_jaccard(start, end, interval.begin, interval.end) <= 0.66:
                 continue
             locus_data = interval.data
-            for strchive_motif in locus_data.get("reference_motif_reference_orientation", []):
+            # A STRchive locus lists the reference motif and, separately, the motif(s) seen in
+            # the pathogenic allele, which for several loci differ (e.g. an interrupted reference
+            # unit expanding as a pure one). Matching only the reference motif would miss exactly
+            # the expansions this tool exists to surface, so consider both.
+            strchive_motifs = (locus_data.get("reference_motif_reference_orientation", [])
+                               + locus_data.get("pathogenic_motif_reference_orientation", []))
+            for strchive_motif in strchive_motifs:
                 if motifs_match(motif, strchive_motif):
                     return locus_data.get("locus_id", locus_data.get("id"))
 
@@ -334,7 +369,9 @@ def collect_known_disease_canonical_motifs(interval_trees, strchive_trees=None):
         for interval in tree:
             if not interval.data:
                 continue
-            for motif in interval.data.get("reference_motif_reference_orientation", []):
+            # Both motif lists, for the same reason as matches_disease_locus above.
+            for motif in (interval.data.get("reference_motif_reference_orientation", [])
+                          + interval.data.get("pathogenic_motif_reference_orientation", [])):
                 if "N" in motif:
                     continue
                 known_canonical_motifs.add(
@@ -393,7 +430,11 @@ def add_derived_locus_columns(locus_records, source_label=""):
                 (record["End1Based"] - record["Start0Based"]) // record["MotifSize"]
                 if record["MotifSize"] else None)
 
-        record["Source"] = source_label
+        # A Source column in the input matrix is a recognized pass-through annotation
+        # (input_tables.ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED), so keep what it supplied and
+        # fall back to the build-wide --source-label, matching the two columns above.
+        if record.get("Source") is None:
+            record["Source"] = source_label
 
         record["CanonicalMotif"] = compute_canonical_motif(
             record["Motif"], include_reverse_complement=True)

@@ -98,38 +98,3 @@ class EmptyLociTableTests(unittest.TestCase):
         connection.close()
 
 
-class PermissiveSampleTableTests(unittest.TestCase):
-    """X1 / X12: the server's load_sample_table accepts minimal metadata."""
-
-    def _write(self, text):
-        handle = tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False)
-        handle.write(text)
-        handle.close()
-        self.addCleanup(os.remove, handle.name)
-        return handle.name
-
-    def test_only_sample_id_does_not_crash(self):
-        path = self._write("sample_id\nS1\nS2\n")
-        sample_rows, affected_lookup, analysis_lookup = results_server.load_sample_table(path)
-        self.assertEqual(set(sample_rows), {"S1", "S2"})
-        self.assertEqual(analysis_lookup["S1"], "unknown")
-        # Absent affected_status is falsy (treated as not-unaffected downstream).
-        self.assertFalse(affected_lookup["S1"])
-
-    def test_case_insensitive_id_and_extra_columns_preserved(self):
-        path = self._write("Sample ID\tancestry\nS1\tEUR\n")
-        sample_rows, _affected, _analysis = results_server.load_sample_table(path)
-        self.assertIn("S1", sample_rows)
-        self.assertEqual(sample_rows["S1"]["ancestry"], "EUR")  # extra column preserved
-
-    def test_phenotype_strips_only_leading_na_prefix(self):
-        path = self._write(
-            "sample_id\taffected_status\tphenotype_description\n"
-            "S1\tAffected\tNA; seizures; NA; ataxia\n")
-        sample_rows, _affected, _analysis = results_server.load_sample_table(path)
-        # Only the leading 'NA; ' is removed (matches the build), not the inner one.
-        self.assertEqual(sample_rows["S1"]["phenotype_description"], "seizures; NA; ataxia")
-
-
-if __name__ == "__main__":
-    unittest.main()

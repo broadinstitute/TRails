@@ -12,7 +12,6 @@ from motif_utilities import (
     _alphabetically_first_motif_under_shift,
     compute_canonical_motif,
     generate_all_canonical_motifs,
-    parse_interval,
     reverse_complement,
 )
 
@@ -107,21 +106,6 @@ class ComputeCanonicalMotifTests(unittest.TestCase):
         # An N-containing motif still canonicalizes (N complements to N).
         self.assertEqual(compute_canonical_motif("AN"), "AN")
         self.assertEqual(compute_canonical_motif("NA"), "AN")
-
-
-class ParseIntervalTests(unittest.TestCase):
-
-    def test_basic(self):
-        self.assertEqual(parse_interval("chr1:100-200"), ("chr1", 100, 200))
-
-    def test_no_chr_prefix(self):
-        self.assertEqual(parse_interval("X:5-15"), ("X", 5, 15))
-
-    def test_supercontig_with_colon(self):
-        self.assertEqual(parse_interval("HLA:1:100-200"), ("HLA:1", 100, 200))
-
-    def test_malformed_raises(self):
-        self.assertRaises(ValueError, lambda: parse_interval("chr1-100-200"))
 
 
 class GenerateAllCanonicalMotifsTests(unittest.TestCase):

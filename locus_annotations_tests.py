@@ -8,6 +8,7 @@ import unittest
 import intervaltree
 
 import locus_annotations
+import results_server
 
 
 class ComputeJaccardTests(unittest.TestCase):
@@ -214,6 +215,28 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
         finally:
             os.remove(strchive_path)
 
+    def test_strchive_pathogenic_motif_is_matched_and_collected(self):
+        # Several STRchive loci expand as a motif that differs from the reference unit. Matching
+        # only reference_motif_reference_orientation would miss exactly those expansions.
+        strchive = [{
+            "locus_id": "STR_B", "disease": "Some Disease", "chrom": "chr2",
+            "start_hg38": 500, "stop_hg38": 530,
+            "reference_motif_reference_orientation": ["CAG"],
+            "pathogenic_motif_reference_orientation": ["CCG"],
+        }]
+        strchive_path = _make_catalog_file(strchive)
+        try:
+            _trees, strchive_trees, _lookup = locus_annotations.load_known_disease_loci(
+                self.catalog_path, strchive_filepath=strchive_path)
+            self.assertEqual(
+                locus_annotations.matches_disease_locus("chr2-499-530-CCG", {}, strchive_trees),
+                "STR_B")
+            self.assertIn(
+                locus_annotations.compute_canonical_motif("CCG", include_reverse_complement=True),
+                locus_annotations.collect_known_disease_canonical_motifs({}, strchive_trees))
+        finally:
+            os.remove(strchive_path)
+
 
 class MatchesDiseaseLocusTests(unittest.TestCase):
 
@@ -342,3 +365,22 @@ class KnownMotifAndMendelianGeneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PathogenicMotifsNullTests(unittest.TestCase):
+    """WS2: PathogenicMotifs explicitly null must not raise TypeError."""
+
+    def test_null_pathogenic_motifs_does_not_crash(self):
+        tree = intervaltree.IntervalTree()
+        tree.addi(100, 110, data={
+            "RepeatUnit": "AT",
+            "PathogenicMotifs": None,   # explicit null in the catalog JSON
+            "LocusId": "DISEASE_AT",
+            "Diseases": [{"Name": "DiseaseX"}],
+        })
+        lookups = {"locus": {}, "disease_trees": {"1": tree}, "strchive_trees": {}}
+        row = {"LocusId": "q", "Chrom": "chr1", "Start0Based": 100,
+               "End1Based": 110, "Motif": "AT"}
+        result = results_server.compute_known_disease_info(row, lookups)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["locus_id"], "DISEASE_AT")

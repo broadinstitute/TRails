@@ -95,10 +95,11 @@ def build_skinny_table(connection, outlier_type, loci_columns):
     builds (e.g. VCF vs. LPS inputs) carry slightly different column sets, so the
     intersection keeps the build robust.
 
-    For the ``HemizygousAlleles`` table, the hemizygous filter checks
-    ``HemizygousAlleleHistogram IS NOT NULL``. Rather than copy that (potentially
-    large) blob, a tiny ``1``/``NULL`` marker column of the same name is stored so
-    the exact ``IS NOT NULL`` clause still works against the skinny table.
+    For the ``HemizygousAlleles`` table, the hemizygous filter checks that
+    ``HemizygousAlleleHistogram`` is neither NULL nor the empty string the build writes
+    for a locus with no hemizygous alleles. Rather than copy that (potentially large)
+    blob, a tiny ``1``/``NULL`` marker column of the same name is stored so the same
+    clause still selects exactly the loci that have hemizygous data.
 
     The table is dropped and recreated, so this is idempotent. No indexes are
     created (see the module docstring for why).
@@ -118,7 +119,8 @@ def build_skinny_table(connection, outlier_type, loci_columns):
     ]
     if outlier_type == "HemizygousAlleles" and "HemizygousAlleleHistogram" in loci_columns:
         select_expressions.append(
-            "CASE WHEN HemizygousAlleleHistogram IS NOT NULL THEN 1 END AS HemizygousAlleleHistogram")
+            "CASE WHEN HemizygousAlleleHistogram IS NOT NULL AND HemizygousAlleleHistogram != ''"
+            " THEN 1 END AS HemizygousAlleleHistogram")
 
     connection.execute(f"DROP TABLE IF EXISTS {table_name}")
     start_time = time.time()

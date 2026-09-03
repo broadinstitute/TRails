@@ -389,7 +389,8 @@ def write_mendelian_tables(connection, per_sample_rows, per_motif_rows):
 
 
 def _write_mendelian_table(connection, table_name, rows):
-    """Writes one Mendelian table with ``sample_id`` first as INTEGER-typed PK.
+    """Writes one Mendelian table: ``sample_id`` first as a TEXT primary key, every other
+    column declared INTEGER.
 
     Args:
         connection: An open sqlite3 connection.

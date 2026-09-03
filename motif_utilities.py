@@ -7,8 +7,8 @@ no external dependency on ``str_analysis`` and inserts nothing onto ``sys.path``
 The behavior here is a faithful port of:
   * ``str_analysis/utils/canonical_repeat_unit.py`` (the doubling-rotation +
     reverse-complement-minimum canonicalization algorithm), and
-  * ``str_analysis/utils/misc_utils.py`` (``reverse_complement``, the full IUPAC
-    ``COMPLEMENT`` table, and ``parse_interval``).
+  * ``str_analysis/utils/misc_utils.py`` (``reverse_complement`` and the full
+    IUPAC ``COMPLEMENT`` table).
 
 Plus a small TRails-specific helper (``generate_all_canonical_motifs``) used
 elsewhere in the build pipeline.
@@ -107,29 +107,6 @@ def compute_canonical_motif(motif, include_reverse_complement=True):
             return minimal_motif_reverse_complement
 
     return minimal_motif
-
-
-def parse_interval(interval_string):
-    """Parse a ``"chrom:start-end"`` interval string into a 3-tuple.
-
-    Supports super-contig names that themselves contain ``:`` by treating only
-    the final ``:``-delimited field as the coordinate range (matching the
-    original ``str_analysis`` implementation).
-
-    Args:
-        interval_string: A string like ``"chr1:100-200"``.
-
-    Returns:
-        A 3-tuple ``(chrom, start, end)`` where ``start`` and ``end`` are ints.
-    """
-    try:
-        tokens = interval_string.split(":")
-        chrom = ":".join(tokens[:-1])
-        start, end = map(int, tokens[-1].split("-"))
-    except Exception as exception:
-        raise ValueError(f"Unable to parse interval: '{interval_string}': {exception}")
-
-    return chrom, start, end
 
 
 def generate_all_canonical_motifs(max_size=6):

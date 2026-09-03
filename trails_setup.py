@@ -9,23 +9,28 @@ CLI:
 """
 
 import argparse
+import json
 import os
 import urllib.request
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_REFERENCE_DIR = os.path.join(SCRIPT_DIR, "reference_data")
 
-# Pinned public sources — bump these versions deliberately.
+# Pinned public sources — bump these versions deliberately. Every URL below resolves to an
+# immutable ref (a release tag or a commit sha) so that two installs made at different times build
+# the same database from the same cohort; a "main" URL would silently change the annotations.
 HPO_RELEASE = "v2025-05-06"   # Human Phenotype Ontology annotation release tag
+STR_ANALYSIS_COMMIT = "15c642927de66703dcaf5ec92fb08ee8249dc745"   # broadinstitute/str-analysis
+STRCHIVE_COMMIT = "d7961b2c3bbc13cbcb256c19ddbf8779f7e76ca6"       # dashnowlab/STRchive
 
 # (local filename, public URL) — one class-A file per entry.
 REFERENCE_FILES = [
     ("genes_to_phenotype.txt",
      f"https://github.com/obophenotype/human-phenotype-ontology/releases/download/{HPO_RELEASE}/genes_to_phenotype.txt"),
     ("variant_catalog_without_offtargets.GRCh38.json",
-     "https://raw.githubusercontent.com/broadinstitute/str-analysis/main/str_analysis/variant_catalogs/variant_catalog_without_offtargets.GRCh38.json"),
+     f"https://raw.githubusercontent.com/broadinstitute/str-analysis/{STR_ANALYSIS_COMMIT}/str_analysis/variant_catalogs/variant_catalog_without_offtargets.GRCh38.json"),
     ("STRchive-loci.json",
-     "https://raw.githubusercontent.com/dashnowlab/STRchive/refs/heads/main/data/STRchive-loci.json"),
+     f"https://raw.githubusercontent.com/dashnowlab/STRchive/{STRCHIVE_COMMIT}/data/STRchive-loci.json"),
 ]
 
 
@@ -39,10 +44,27 @@ def _download(url, dest):
     os.replace(tmp, dest)
 
 
+# Records which URL each cached reference file came from. Without it, bumping a pin above would
+# leave every existing install on its old copy (the filenames do not change), which is exactly the
+# reproducibility the pins are meant to provide.
+CACHE_MANIFEST_NAME = ".reference_versions.json"
+
+
+def _read_cache_manifest(dest_dir):
+    """Return {filename: source url} for the cached reference files, or {} if unknown."""
+    try:
+        with open(os.path.join(dest_dir, CACHE_MANIFEST_NAME)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
 def fetch_reference_data(dest_dir=DEFAULT_REFERENCE_DIR, remote=False, force=False):
     """Ensure every class-A reference file is present in dest_dir; return {name: path}.
 
-    Idempotent: a file already present (and non-empty) is left as-is unless force=True.
+    Idempotent: a file already present, non-empty, and recorded as having come from the currently
+    pinned URL is left as-is unless force=True. A file whose pin has since been bumped is
+    re-downloaded, so an existing install picks up a deliberate version change.
 
     Args:
         dest_dir: directory the reference files are cached in (created if missing).
@@ -50,13 +72,21 @@ def fetch_reference_data(dest_dir=DEFAULT_REFERENCE_DIR, remote=False, force=Fal
         force: re-download even when a file is already present.
     """
     os.makedirs(dest_dir, exist_ok=True)
+    cached_urls = _read_cache_manifest(dest_dir)
     paths = {}
     for name, url in REFERENCE_FILES:
         dest = os.path.join(dest_dir, name)
         if remote:
             print(f"  [remote] {name} -> {url}")
             paths[name] = dest
-        elif not force and os.path.exists(dest) and os.path.getsize(dest) > 0:
+        elif (not force and os.path.exists(dest) and os.path.getsize(dest) > 0
+                and cached_urls.get(name, url) == url):
+            # A cached file with no manifest entry predates version tracking. Accept it and record
+            # the current pin rather than re-downloading on every run: an install that has never
+            # written a manifest would otherwise never converge, and offline it would lose the
+            # reference entirely. A recorded entry that differs from the pin does re-download.
+            if name not in cached_urls:
+                cached_urls[name] = url
             print(f"  [skip] {name} already present")
             paths[name] = dest
         else:
@@ -68,10 +98,24 @@ def fetch_reference_data(dest_dir=DEFAULT_REFERENCE_DIR, remote=False, force=Fal
             try:
                 _download(url, dest)
                 paths[name] = dest
+                cached_urls[name] = url
             except Exception as e:  # noqa: BLE001 - any network/IO failure is non-fatal here
-                print(f"  [WARN] could not fetch {name} ({type(e).__name__}: {e}); "
-                      f"continuing without it. Pass a local copy on the trails.py "
-                      f"command line, or re-run trails_setup.py later to retry.")
+                if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                    print(f"  [WARN] could not fetch {name} ({type(e).__name__}: {e}); "
+                          f"using the copy already in {dest_dir}, which may predate the "
+                          f"currently pinned version.")
+                    paths[name] = dest
+                else:
+                    print(f"  [WARN] could not fetch {name} ({type(e).__name__}: {e}); "
+                          f"continuing without it. Pass a local copy on the trails.py "
+                          f"command line, or re-run trails_setup.py later to retry.")
+    if not remote:
+        try:
+            with open(os.path.join(dest_dir, CACHE_MANIFEST_NAME), "w") as f:
+                json.dump(cached_urls, f, indent=2, sort_keys=True)
+        except OSError as e:
+            print(f"  [WARN] could not record reference versions ({type(e).__name__}: {e}); "
+                  f"a future pin bump may not trigger a re-download.")
     return paths
 
 

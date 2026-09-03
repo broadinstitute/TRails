@@ -218,3 +218,73 @@ class ReadGeneDiseasePhenotypesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _write(text, suffix=".tsv"):
+    handle = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False)
+    handle.write(text)
+    handle.close()
+    return handle.name
+
+
+class CoerceAnnotationValueTests(unittest.TestCase):
+    """DP1: '.'/'NA'-style missing markers must not survive as strings."""
+
+    def test_missing_markers_become_none(self):
+        for marker in ("", ".", "NA", "N/A", "NaN", "nan", "none", "NULL", " . "):
+            self.assertIsNone(
+                input_tables._coerce_annotation_value(marker),
+                msg=f"marker {marker!r} should coerce to None")
+
+    def test_numeric_and_string_values_preserved(self):
+        self.assertEqual(input_tables._coerce_annotation_value("30"), 30)
+        self.assertEqual(input_tables._coerce_annotation_value("3.5"), 3.5)
+        self.assertEqual(input_tables._coerce_annotation_value("CAG"), "CAG")
+
+    def test_dot_in_population_column_does_not_survive(self):
+        path = _write(
+            "trid\tmotif\tHPRC256_99thPercentile\tS1\n"
+            "chr1-100-115-CAG\tCAG\t.\t12,40\n")
+        self.addCleanup(os.remove, path)
+        locus_rows, _ = input_tables.read_repeat_copy_numbers(path)
+        # A '.' population-stat cell must not reach the numeric downstream as a str.
+        self.assertIsNone(locus_rows[0]["extra_columns"]["HPRC256_99thPercentile"])
+
+
+class InheritanceHPOTermsTests(unittest.TestCase):
+    """DP3: non-Mendelian inheritance HPO terms must not enter the inheritance set."""
+
+    def test_unmapped_inheritance_term_dropped(self):
+        path = _write(
+            "ncbi_gene_id\tgene_symbol\thpo_id\thpo_name\tfrequency\tdisease_id\n"
+            "1\tADD1\tHP:0001426\tNon-Mendelian\t-\tOMIM:145500\n"   # unmapped -> dropped
+            "1\tADD1\tHP:0000006\tAD\t-\tOMIM:145500\n"             # mapped -> AD
+            "1\tADD1\tHP:0004972\tphenotype\t-\tOMIM:145500\n",     # phenotype
+            suffix=".txt")
+        self.addCleanup(os.remove, path)
+        data = input_tables.read_gene_disease_phenotypes(path)
+        entry = data["ADD1"]["OMIM:145500"]
+        self.assertEqual(entry["inheritance"], {"AD"})
+        self.assertNotIn("HP:0001426", entry["inheritance"])
+        self.assertEqual(entry["phenotypes"], {"HP:0004972"})
+
+
+class AnnotationColumnPrefixTests(unittest.TestCase):
+    """DP4: a sample column named like a cohort must not be swallowed as annotation."""
+
+    def test_bare_cohort_sample_ids_are_samples(self):
+        self.assertIsNone(input_tables._is_annotation_column("AoU_0001"))
+        self.assertIsNone(input_tables._is_annotation_column("HG002"))
+
+    def test_real_cohort_stat_columns_still_recognized(self):
+        for column in ("HPRC256_99thPercentile", "AoU1027_MaxAllele",
+                       "TenK10K_MaxAllele", "TRExplorerMotif"):
+            self.assertEqual(input_tables._is_annotation_column(column), column)
+
+    def test_aou_sample_column_kept_as_sample(self):
+        path = _write(
+            "trid\tmotif\tAoU_0001\tHG002\n"
+            "chr1-100-115-CAG\tCAG\t5,60\t5,6\n")
+        self.addCleanup(os.remove, path)
+        _, sample_id_list = input_tables.read_repeat_copy_numbers(path)
+        self.assertEqual(sample_id_list, ["AoU_0001", "HG002"])

@@ -173,7 +173,7 @@
     <!-- Sigma Percentile and Tag Filters (inline) -->
     <div style="display: flex; align-items: flex-end; gap: 2em;">
         <div class="field">
-            <label style="display: inline;">σ Percentile ≥</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="Keeps only the <b>most variable loci</b> &mdash; those whose allele-size spread (&sigma;) is among the largest across people.<br /><br />Enter a percentile from 0 to 1. The value is a cutoff on how high a locus ranks for variability: <b>0.95</b> keeps the top 5% most variable loci, <b>0.99</b> keeps the top 1%, <b>0</b> keeps everything.<br /><br />A locus is kept if it ranks that high in <b>either</b> the HPRC256 or the AoU1027 population dataset. Loci with no variability data in a dataset are not matched on it."></i>
+            <label style="display: inline;">σ Percentile ≥</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="Keeps only the <b>most variable loci</b> &mdash; those whose allele-size spread (&sigma;) is among the largest across people.<br /><br />Enter a percentile from 0 to 1. The value is a cutoff on how high a locus ranks for variability: <b>0.95</b> keeps the top 5% most variable loci and <b>0.99</b> keeps the top 1%. Any value, including <b>0</b>, restricts results to loci that have variability data &mdash; leave the box empty to keep everything.<br /><br />A locus is kept if it ranks that high in <b>either</b> the HPRC256 or the AoU1027 population dataset. Loci with no variability data in a dataset are not matched on it."></i>
             <input type="text" name="min_sigma_percentile"
                    placeholder="e.g., 0.95"
                    style="width: 100px; display: block;"
@@ -425,6 +425,10 @@
     </div>
 </div>
 
+{# Shared QC helpers (escapeHtml, renderMendelianWarning, the box-plot stats and the
+   Mendelian-warning popup). Included rather than copied so a fix reaches every page. #}
+{% include "qc_shared_js.html" %}
+
 <script>
 // =========================================================================
 // Task 5: Semantic UI Initialization
@@ -526,7 +530,7 @@ $(document).ready(function() {
     // committing it to currentState (that only happens in readStateFromUI on Search).
     function updateTotalLociCount(source) {
         source = source || currentState.source;
-        fetch(`${API_BASE_URL}/schema?source=${source}`)
+        fetch(`${API_BASE_URL}/schema?source=${encodeURIComponent(source)}`)
             .then(r => r.json())
             .then(data => {
                 const label = data.available_sources.length > 1
@@ -595,34 +599,6 @@ const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
 // Per-source 99th-percentile outlier warnings (keyed by source, then sample_id).
 const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
 
-// Helper function to render warning icon if sample has warnings.
-// Mendelian-violation warnings are source-independent; outlier (99th-percentile) warnings are
-// per-source, so the outlier part is only included for the currently-selected `source`.
-function renderMendelianWarning(sampleId, source) {
-    if (!sampleId) return '';
-    const mendelian = MENDELIAN_WARNINGS[sampleId];
-    const outlierMap = (source && typeof OUTLIER_WARNINGS_BY_SOURCE !== 'undefined')
-        ? OUTLIER_WARNINGS_BY_SOURCE[source] : null;
-    const outlier = outlierMap ? outlierMap[sampleId] : undefined;
-    if (!mendelian && !outlier) return '';
-    const w = Object.assign({}, mendelian || {}, outlier || {});
-    // Determine tooltip text based on warning types
-    const hasMendelian = w.autosome_rate !== undefined;
-    const hasOutlier = w.outlier_bins !== undefined;
-    let tooltip = '';
-    if (hasMendelian && hasOutlier) {
-        tooltip = 'High Mendelian violation rate; TR outlier';
-    } else if (hasMendelian) {
-        tooltip = 'High Mendelian violation rate';
-    } else if (hasOutlier) {
-        tooltip = '99th percentile TR outlier';
-    }
-    return `<i class="warning sign icon mendelian-warning-icon"
-               title="${tooltip}"
-               data-warning='${JSON.stringify(w).replace(/'/g, "&apos;")}'
-               data-sample-id="${sampleId}"></i>`;
-}
-
 const DEFAULT_STATE = {
     outlier_type: 'all',
     require_above_unaffected: '',
@@ -668,14 +644,18 @@ function buildStateHash() {
             params[key] = value;
         }
     }
-    return '#' + $.param(params);
+    // An empty fragment has to be '' rather than '#': window.location.hash reports '' for both a
+    // missing fragment and a bare '#', so returning '#' here would never compare equal to it and
+    // every default-state search would push another history entry, trapping the Back button.
+    const query = $.param(params);
+    return query ? '#' + query : '';
 }
 
 // Push the current state as a new history entry.
 function writeStateToUrl() {
     const hash = buildStateHash();
     if (window.location.hash !== hash) {
-        window.history.pushState(null, '', hash);
+        window.history.pushState(null, '', hash || window.location.pathname + window.location.search);
     }
 }
 
@@ -685,7 +665,7 @@ function writeStateToUrl() {
 function replaceStateInUrl() {
     const hash = buildStateHash();
     if (window.location.hash !== hash) {
-        window.history.replaceState(null, '', hash);
+        window.history.replaceState(null, '', hash || window.location.pathname + window.location.search);
     }
 }
 
@@ -1081,13 +1061,14 @@ $('#filter-panel input[type="text"], #filter-panel input[type="number"]').on('ke
 
 // 7.4 Export function (D5) - triggers server-side export
 async function performExport(format) {
-    // readStateFromUI() resets currentState.page to 1 as a side effect. Export does not
-    // paginate and does not re-render the results table, so letting that reset stand would
-    // desync the visible page from currentState.page (Prev/Next would then jump to the
-    // wrong page). Preserve and restore the page the user is currently viewing.
-    const savedPage = currentState.page;
+    // readStateFromUI() commits EVERY live filter control into currentState, not just the page.
+    // Export does not re-render the results table, so letting those edits stand would desync the
+    // visible rows from currentState: expanding a row or paging would then use filter values the
+    // user changed but never searched for. Export from the freshly read state, then put the state
+    // the table is actually showing back (restored in the finally block below).
+    const savedState = JSON.parse(JSON.stringify(currentState));
     readStateFromUI();
-    currentState.page = savedPage;
+    currentState.page = savedState.page;
     $('.export-dropdown').addClass('loading disabled');
 
     try {
@@ -1147,6 +1128,9 @@ async function performExport(format) {
     } catch (e) {
         alert('Export failed: ' + e.message);
     } finally {
+        // The export parameters have already been built from the UI, so hand currentState back to
+        // the results table exactly as it was; the table on screen still matches it.
+        currentState = savedState;
         setTimeout(() => $('.export-dropdown').removeClass('loading disabled'), 1000);
     }
 }
@@ -1198,13 +1182,6 @@ $('#clear-all-filters').on('click', function() {
     applyStateToUI();
     performSearch();
 });
-
-// 7.6 HTML Escaping Helper (Security)
-function escapeHtml(str) {
-    if (str == null) return '';
-    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-}
 
 // =========================================================================
 // Summary Charts (Motifs and Gene Regions)
@@ -1308,7 +1285,8 @@ function renderGeneRegionChart(regionCounts) {
     // Define order for gene regions
     const regionOrder = ['CDS', 'exon', 'intron', "5' UTR", "3' UTR", 'promoter', 'intergenic'];
 
-    // Build labels and data in order (include all regions even if count is 0)
+    // Build labels and data in regionOrder order, charting only the regions the result set
+    // actually contains: a region with no loci gets no bar rather than a zero-height one.
     const labels = [];
     const data = [];
     const colors = [];
@@ -1515,14 +1493,13 @@ function renderLocusRow(locus, rowIndex) {
     }
     // Tag badges (user tags only)
     const userTagBadges = (locus.tags || []).map(t => `<span class="badge badge-tag">${escapeHtml(t)}</span>`).join(' ');
-    // System tags (e.g. readviz) are not produced by the single-DB server, so no system badges.
-    const systemTagBadges = '';
     const noteIcon = locus.has_note ? '<span class="note-indicator" title="Has note"><i class="sticky note outline icon"></i></span>' : '';
-    // Combine badges: user tags + system tags + known motif + note icon (all on same row)
+    // Combine badges: user tags + known motif + note icon (all on same row). There are no
+    // system-tag badges: /api/v1/annotations/tags always returns an empty system_tags list.
     // Wrap user tags + note icon in span.annotation-badges for easy refresh
     const dynamicBadges = (userTagBadges || noteIcon) ? `<span class="annotation-badges">${userTagBadges}${noteIcon}</span>` : '';
-    const badgesRow = (dynamicBadges || systemTagBadges || knownBadge || knownLocusBadge)
-        ? `<div class="cell-sub badges-row">${dynamicBadges}${systemTagBadges}${knownBadge}${knownLocusBadge}</div>`
+    const badgesRow = (dynamicBadges || knownBadge || knownLocusBadge)
+        ? `<div class="cell-sub badges-row">${dynamicBadges}${knownBadge}${knownLocusBadge}</div>`
         : '';
     // Edit Tags and Edit Notes buttons (always visible)
     const addButtons = `<div class="cell-sub"><button class="ui mini basic button add-tag-btn" data-locus-id="${escapeHtml(locus.LocusId)}" style="padding: 2px 6px; font-size: 0.75em;"><i class="tag icon"></i>Edit Tags</button> <button class="ui mini basic button add-note-btn" data-locus-id="${escapeHtml(locus.LocusId)}" style="padding: 2px 6px; font-size: 0.75em;"><i class="pencil icon"></i>Edit Notes</button></div>`;
@@ -1598,8 +1575,10 @@ function renderLocusRow(locus, rowIndex) {
     const sigmaAou = getSigmaRankText(locus.AoU1027_Stdev, locus.AoU1027_StdevRankByMotif, locus.AoU1027_StdevRankTotalNumberByMotif);
 
     // UCSC link
+    const ucscUrl = 'https://genome.ucsc.edu/cgi-bin/hgTracks?db=hg38&position='
+        + encodeURIComponent(locus.Chrom + ':' + (locus.Start0Based + 1) + '-' + locus.End1Based);
     const ucscLink = (locus.Chrom && locus.Start0Based != null && locus.End1Based != null)
-        ? `<a href="https://genome.ucsc.edu/cgi-bin/hgTracks?db=hg38&position=${locus.Chrom}:${locus.Start0Based + 1}-${locus.End1Based}" target="_blank" title="UCSC Genome Browser" style="color: #999; font-size: 0.8em;">UCSC</a>`
+        ? `<a href="${escapeHtml(ucscUrl)}" target="_blank" title="UCSC Genome Browser" style="color: #999; font-size: 0.8em;">UCSC</a>`
         : '';
 
     // TRExplorer link (standalone; shares trexHref with the linked locus id above)
@@ -1661,92 +1640,15 @@ $(document).on('click', '.motif-truncated', function(e) {
     // Dismissal is handled by the single persistent document click listener below.
 });
 
-// Warning icon click handler — show violation rates and/or outlier info popup
-$(document).on('click', '.mendelian-warning-icon', function(e) {
-    e.stopPropagation();
-    const sampleId = $(this).data('sample-id');
-    const warning = $(this).data('warning');
-    if (!warning) return;
-
-    // Remove any existing popup
-    $('.mendelian-warning-popup').remove();
-
-    // Format percentage with color coding
-    const formatRate = (rate, threshold = 0.10) => {
-        const pct = (rate * 100).toFixed(1) + '%';
-        return rate > threshold ? `<span class="high-rate">${pct}</span>` : pct;
-    };
-
-    // Determine warning types
-    const hasMendelian = warning.autosome_rate !== undefined;
-    const hasOutlier = warning.outlier_bins !== undefined;
-
-    // Build popup HTML
-    let html = '<div class="mendelian-warning-popup">';
-    html += `<div style="font-size: 0.9em; color: #666; margin-bottom: 6px;">Sample: <b>${escapeHtml(sampleId)}</b></div>`;
-
-    // Mendelian violation section
-    if (hasMendelian) {
-        html += `<div class="popup-header">⚠️ High Mendelian Violation Rate</div>`;
-        html += '<table class="invisible-table">';
-        html += `<tr><td style="font-weight:600;color:#555;">Autosome</td><td style="text-align:right;">${formatRate(warning.autosome_rate)}</td><td style="color:#888;">(${warning.autosome_violations.toLocaleString()} / ${warning.autosome_total.toLocaleString()})</td></tr>`;
-        html += `<tr><td style="font-weight:600;color:#555;">chrX</td><td style="text-align:right;">${formatRate(warning.chrX_rate)}</td><td style="color:#888;">(${warning.chrX_violations.toLocaleString()} / ${warning.chrX_total.toLocaleString()})</td></tr>`;
-        html += `<tr><td style="font-weight:600;color:#555;">chrY</td><td style="text-align:right;">${formatRate(warning.chrY_rate, 1.0)}</td><td style="color:#888;">(${warning.chrY_violations.toLocaleString()} / ${warning.chrY_total.toLocaleString()})</td></tr>`;
-        html += '</table>';
-
-        // Motif size breakdown for Mendelian
-        if (warning.motif_rates && Object.keys(warning.motif_rates).length > 0) {
-            html += '<div class="motif-section">';
-            html += '<div class="motif-section-header">By Motif Size</div>';
-            html += '<div class="motif-grid">';
-            const motifLabels = {
-                '1bp': '1bp', '2bp': '2bp', '3bp': '3bp', '4bp': '4bp',
-                '5bp': '5bp', '6bp': '6bp', '7_24bp': '7-24bp', '25plusbp': '25+bp'
-            };
-            for (const [cat, data] of Object.entries(warning.motif_rates)) {
-                const label = motifLabels[cat] || cat;
-                html += `<div class="motif-item"><span>${label}:</span><span>${formatRate(data.rate, 1.0)}</span></div>`;
-            }
-            html += '</div></div>';
-        }
-    }
-
-    // Outlier section
-    if (hasOutlier) {
-        if (hasMendelian) html += '<hr style="margin: 10px 0; border: none; border-top: 1px solid #ddd;">';
-        html += `<div class="popup-header">⚠️ 99th Percentile TR Outlier</div>`;
-        html += '<table class="invisible-table">';
-        html += '<tr><th style="font-weight:600;color:#555;">Bin</th><th style="text-align:right;font-weight:600;color:#555;padding-right:8px;">Count</th><th style="text-align:left;color:#888;">Threshold</th></tr>';
-        const binOrder = ['1bp', '2bp', '3-6bp', '7-24bp', '25+bp'];
-        for (const bin of binOrder) {
-            if (warning.outlier_bins[bin]) {
-                const data = warning.outlier_bins[bin];
-                html += `<tr><td style="font-weight:600;color:#555;">${bin}</td><td style="text-align:right;padding-right:8px;"><span class="high-rate">${data.count}</span></td><td style="text-align:left;color:#888;">&ge; ${data.threshold}</td></tr>`;
-            }
-        }
-        html += '</table>';
-    }
-    html += '</div>';
-
-    const $popup = $(html);
-    $('body').append($popup);
-    const rect = this.getBoundingClientRect();
-    $popup.css({ top: rect.bottom + window.scrollY + 4, left: rect.left + window.scrollX });
-    // Dismissal is handled by the single persistent document click listener below.
-});
-
-// Dismiss popups on any click that lands outside the popup and outside its trigger. A
+// Dismiss the motif popup on any click that lands outside it and outside its trigger. A
 // single persistent listener (instead of a per-popup $(document).one(...)) avoids the bug
 // where opening a second popup immediately re-fired the previous popup's dismiss handler
-// and removed the just-opened popup. Clicks inside a popup (or on its trigger) are ignored
-// so its text stays selectable, mirroring the shared handler in qc_shared_js.html.
+// and removed the just-opened popup. Clicks inside the popup (or on its trigger) are ignored
+// so its text stays selectable. The Mendelian-warning popup is dismissed by the equivalent
+// listener in qc_shared_js.html, which this page now includes.
 $(document).on('click', function(e) {
-    const $t = $(e.target);
-    if (!$t.closest('.motif-truncated, .motif-popup').length) {
+    if (!$(e.target).closest('.motif-truncated, .motif-popup').length) {
         $('.motif-popup').remove();
-    }
-    if (!$t.closest('.mendelian-warning-icon, .mendelian-warning-popup').length) {
-        $('.mendelian-warning-popup').remove();
     }
 });
 
@@ -1778,7 +1680,7 @@ $(document).on('click', '.col-expand', async function() {
     refreshCollapseAllButton();
 
     try {
-        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${currentState.source}`);
+        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${encodeURIComponent(currentState.source)}`);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const detail = await response.json();
         const html = renderLocusDetail(detail, currentState.outlier_type);
@@ -1798,7 +1700,6 @@ function renderLocusDetail(detail, outlierType) {
     const annotations = detail.annotations || {};
     const popThresholds = annotations.population_thresholds || {};
     const knownDisease = annotations.known_disease_locus;
-    const omimOverlaps = annotations.omim_overlaps || [];
     const locus = detail.locus;
 
     // Sort samples by allele_size descending
@@ -1942,8 +1843,8 @@ function renderLocusDetail(detail, outlierType) {
 
         // Row CSS class by status
         let rowClass = 'sample-unknown';
-        if (s.affected_status === 'Affected' && s.analysis_status === 'Unsolved') rowClass = 'sample-affected-unsolved';
-        else if (s.affected_status === 'Affected') rowClass = 'sample-affected-solved';
+        if (isAffectedStatus(s.affected_status) && s.analysis_status === 'Unsolved') rowClass = 'sample-affected-unsolved';
+        else if (isAffectedStatus(s.affected_status)) rowClass = 'sample-affected-solved';
         else if (s.affected_status === 'Unaffected') rowClass = 'sample-unaffected';
 
         // D10: Expandable phenotype text in detail panel
@@ -1969,6 +1870,17 @@ function renderLocusDetail(detail, outlierType) {
         if (hasPurity) html += `<td>${s.purity != null ? s.purity.toFixed(2) : ''}</td>`;
         if (hasMethylation) html += `<td>${s.methylation != null ? s.methylation.toFixed(2) : ''}</td>`;
         html += '</tr>';
+    }
+
+    // A threshold below every listed allele never fires inside the loop above. Emit the leftovers
+    // at the bottom, still in descending order, so the population stats and the pathogenic /
+    // first-unaffected lines stay visible instead of disappearing exactly when every outlier
+    // sample is above them.
+    for (const t of thresholds) {
+        if (!t.fired) {
+            html += t.html;
+            t.fired = true;
+        }
     }
 
     html += '</tbody></table>';
@@ -2032,21 +1944,8 @@ function renderLocusDetail(detail, outlierType) {
         html += '</div>';
     }
 
-    // OMIM overlaps
-    if (omimOverlaps.length > 0) {
-        html += '<div style="margin-top: 10px;">';
-        html += '<table class="invisible-table omim-table"><tbody>';
-        for (const o of omimOverlaps) {
-            const linkageText = `OMIM ${o.region_size_mb}Mb linkage${o.region_coords ? ' [' + escapeHtml(o.region_coords) + ']' : ''}:`;
-            const mimText = o.phenotype_mim_number ? `(MIM#${o.phenotype_mim_number})` : '';
-            html += `<tr class="omim-line"><td class="omim-linkage">${linkageText}</td><td class="omim-phenotype">${escapeHtml(o.phenotype_description)}</td><td class="omim-mim">${mimText}</td></tr>`;
-        }
-        html += '</tbody></table>';
-        html += '</div>';
-    }
-
     // C6: Affected-unsolved summary
-    const affUnsolved = samples.filter(s => s.affected_status === 'Affected' && s.analysis_status === 'Unsolved');
+    const affUnsolved = samples.filter(s => isAffectedStatus(s.affected_status) && s.analysis_status === 'Unsolved');
     if (affUnsolved.length > 0) {
         html += '<div style="margin-top: 8px; padding: 6px 10px; background: #fff5f5; border-left: 4px solid #c62828; border-radius: 3px;">';
         html += '<div style="font-weight: 600; font-size: 0.92em; color: #c62828; margin-bottom: 4px;">Affected Unsolved Summary:</div>';
@@ -2341,7 +2240,7 @@ async function refreshDetailPanel(locusId) {
     if ($detailRow.length === 0) return;
 
     try {
-        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${currentState.source}`);
+        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${encodeURIComponent(currentState.source)}`);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const detail = await response.json();
         const html = renderLocusDetail(detail, currentState.outlier_type);
@@ -2398,17 +2297,14 @@ async function populateTagDropdown() {
         // Build menu items for div-based dropdown
         const values = [];
 
-        // Add system tags first with special prefix
-        (data.system_tags || []).forEach(tag => {
-            values.push({ name: `[System] ${tag}`, value: tag });
-        });
-
-        // Add user tags
+        // Raw, unescaped strings — setupDropdownMenu (qc_shared_js.html) is what makes them
+        // safe to render while keeping data-value equal to the stored tag. Only user tags:
+        // /api/v1/annotations/tags always returns an empty system_tags list.
         (data.tags || []).forEach(tag => {
             values.push({ name: tag, value: tag });
         });
 
-        $dropdown.dropdown('setup menu', { values: values });
+        setupDropdownMenu($dropdown, values);
         if (currentVal) $dropdown.dropdown('set selected', currentVal);
     } catch (e) {
         console.error('Populate tags error:', e);
@@ -2421,15 +2317,17 @@ async function populateSampleIdDropdown() {
         const response = await fetch(`${API_BASE_URL}/schema`);
         if (!response.ok) return;
         const data = await response.json();
-        const values = (data.sample_ids || []).map(id => ({
-            name: id,
-            value: id,
-        }));
-        $('#sample-id-filter').dropdown('setup menu', { values: values });
+        const values = (data.sample_ids || []).map(id => ({ name: id, value: id }));
+        setupDropdownMenu($('#sample-id-filter'), values);
     } catch (e) {
         console.error('Populate sample IDs error:', e);
     }
 }
+
+// Monotonic sequence for the note modal. There is one shared modal, one shared textarea and one
+// shared locus-id, so a slow annotation fetch for an earlier locus must not overwrite them after
+// the user has opened a different locus: only the newest click commits its response.
+let noteModalSeq = 0;
 
 // Click handler for Edit Notes button and note icon
 $(document).on('click', '.add-note-btn, .note-indicator', async function() {
@@ -2438,15 +2336,16 @@ $(document).on('click', '.add-note-btn, .note-indicator', async function() {
     const $textarea = $('#note-textarea');
     const $existingSection = $('#existing-note-section');
     const $updatedAt = $('#note-updated-at');
-
-    // Store locusId on modal for save handler
-    $modal.data('locus-id', locusId);
+    const seq = ++noteModalSeq;
 
     // Fetch existing note for this locus
     try {
         const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}`);
         const data = response.ok ? await response.json() : {};
+        if (seq !== noteModalSeq) return;  // a newer click already owns the modal
 
+        // Store locusId on modal for save handler, together with the text it belongs to.
+        $modal.data('locus-id', locusId);
         if (data.note && data.note.note_text) {
             $textarea.val(data.note.note_text);
             $updatedAt.text(data.note.updated_at || '');
@@ -2456,6 +2355,8 @@ $(document).on('click', '.add-note-btn, .note-indicator', async function() {
             $existingSection.hide();
         }
     } catch (e) {
+        if (seq !== noteModalSeq) return;
+        $modal.data('locus-id', locusId);
         $textarea.val('');
         $existingSection.hide();
     }
@@ -2463,7 +2364,7 @@ $(document).on('click', '.add-note-btn, .note-indicator', async function() {
     // Show the modal
     $modal
         .modal({
-            onApprove: async function() {
+            onApprove: function() {
                 const noteText = $textarea.val().trim();
                 const currentLocusId = $modal.data('locus-id');
 
@@ -2472,19 +2373,22 @@ $(document).on('click', '.add-note-btn, .note-indicator', async function() {
                     return true;
                 }
 
-                try {
-                    await saveNote(currentLocusId, noteText);
+                // Semantic UI reads this return value synchronously, and an async function hands
+                // it a Promise, which is truthy: the modal would close before the save resolved,
+                // onHidden would clear the textarea, and a failed save would silently discard
+                // what the user typed. Hold the modal open and close it once the save succeeds.
+                saveNote(currentLocusId, noteText).then(function() {
                     refreshRowAnnotations(currentLocusId);
                     // Refresh detail panel if open
                     const $detailRow = $(`tr.locus-row[data-locus-id="${currentLocusId}"]`).next('.locus-detail-row');
                     if ($detailRow.length) {
                         refreshDetailPanel(currentLocusId);
                     }
-                } catch (e) {
+                    $modal.modal('hide');
+                }).catch(function(e) {
                     alert('Failed to save note: ' + e.message);
-                    return false; // prevent close on error
-                }
-                return true;
+                });
+                return false;
             },
             onHidden: function() {
                 $textarea.val('');
@@ -2521,14 +2425,16 @@ $(document).on('click', '#delete-note-btn', async function() {
     }
 });
 
+// Same stale-response guard as the note modal: one shared tag modal, an awaited fetch, so a
+// slow response for an earlier locus must not repopulate it after a newer locus was opened.
+let tagModalSeq = 0;
+
 $(document).on('click', '.add-tag-btn', async function() {
     const locusId = $(this).data('locus-id');
     const allTags = window._allTagsList || [];
     const $addTagDropdown = $('#add-tag-dropdown');
     const $modal = $('#add-tag-modal');
-
-    // Store locusId on modal for delete handlers
-    $modal.data('locus-id', locusId);
+    const seq = ++tagModalSeq;
 
     // Helper to fully reset dropdown state
     function resetDropdown() {
@@ -2540,11 +2446,15 @@ $(document).on('click', '.add-tag-btn', async function() {
 
     // Fetch existing tags for this locus and display them
     const existingTags = await fetchLocusTags(locusId);
+    if (seq !== tagModalSeq) return;  // a newer click already owns the modal
+
+    // Store locusId on modal for delete handlers, together with the tags it belongs to
+    $modal.data('locus-id', locusId);
     renderExistingTagsInModal(existingTags, locusId);
 
     // Populate the dropdown with existing tags
     const values = allTags.map(tag => ({ name: tag, value: tag }));
-    $addTagDropdown.dropdown('setup menu', { values: values });
+    setupDropdownMenu($addTagDropdown, values);
     resetDropdown();
 
     // Add Enter key handler for the search input
@@ -2644,6 +2554,13 @@ $(document).on('click', '.delete-modal-tag', async function() {
         // Update tag filter dropdown (in case tag is now unused)
         populateTagDropdown();
 
+        // If the tag just removed is the one the results are filtered by, this locus no longer
+        // belongs in them. Repainting the badges alone would leave it sitting in a list it no
+        // longer matches, so re-run the search and let the server decide.
+        if (currentState.tag && currentState.tag === tag) {
+            performSearch();
+        }
+
     } catch (e) {
         alert('Failed to remove tag: ' + e.message);
     }
@@ -2669,7 +2586,7 @@ $(document).on('click', '.badge-known-locus', async function(e) {
     const locusId = $(this).data('locus-id');
 
     try {
-        const response = await fetch(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${currentState.source}`);
+        const response = await fetch(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${encodeURIComponent(currentState.source)}`);
         if (!response.ok) throw new Error('Failed to fetch locus details');
         const data = await response.json();
         const knownDisease = data.annotations?.known_disease_locus;

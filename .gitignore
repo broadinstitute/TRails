@@ -238,3 +238,9 @@ snapshot_pre_refactor/
 .memory/
 .code_review_local/
 
+# TRails runtime artifacts (created by install.sh / trails.py, never source)
+.trails_version
+.trails_src.*.tar.gz
+.trails_src_staging/
+.trails_optional_deps_attempted
+reference_data/.reference_versions.json

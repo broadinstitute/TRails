@@ -19,6 +19,7 @@ import tempfile
 import unittest
 
 import results_server
+import swim_plot
 
 
 def _build_minimal_db(path):
@@ -84,37 +85,41 @@ def _build_minimal_db(path):
     conn.execute(f"CREATE INDEX {results_server.REFERENCE_REGION_INDEX} "
                  f"ON loci(Chrom, Start0Based, End1Based)")
 
-    conn.execute("""CREATE TABLE swim_plot (
-        outlier_type TEXT,
-        outlier_rank INTEGER,
-        motif_category TEXT,
-        allele_size INTEGER,
-        sample_id TEXT,
-        family_id TEXT,
-        affected_status TEXT,
-        analysis_status TEXT,
-        sex TEXT,
-        phenotype_description TEXT,
-        purity TEXT,
-        methylation TEXT,
-        FirstUnaffectedAlleleSize INTEGER,
-        is_above_first_unaffected INTEGER,
-        LocusId TEXT,
-        Motif TEXT,
-        CanonicalMotif TEXT,
-        MotifSize INTEGER,
-        gene_region TEXT,
-        GeneTableGeneSymbol TEXT
-    )""")
+    # Build the fixture's swim_plot from the real column list rather than a hand-picked subset,
+    # so a filter that reads a column the build actually writes is exercised here instead of
+    # failing with "no such column" only in a real deployment.
+    swim_columns = swim_plot.SWIM_PLOT_COLUMNS
+    conn.execute("CREATE TABLE swim_plot (%s)" % ", ".join(
+        "%s TEXT" % column for column in swim_columns))
+
+    def _swim_row(**values):
+        """Return a full-width swim_plot row, defaulting every unnamed column to NULL."""
+        unknown = set(values) - set(swim_columns)
+        assert not unknown, "swim_plot has no column(s): %s" % sorted(unknown)
+        return tuple(values.get(column) for column in swim_columns)
+
     conn.executemany(
-        "INSERT INTO swim_plot VALUES (" + ",".join("?" * 20) + ")",
+        "INSERT INTO swim_plot VALUES (%s)" % ",".join("?" * len(swim_columns)),
         [
-            ("AllAlleles", 1, "2bp", 6, "sampleA", "famA", "Affected", "Unsolved",
-             "male", "seizures", None, None, 4, 1, "chr1-100-110-AT", "AT", "AT", 2, "CDS", "GENE1"),
-            ("AllAlleles", 2, "2bp", 5, "sampleB", "famB", "Unaffected", "Unaffected",
-             "female", None, None, None, 4, 0, "chr1-100-110-AT", "AT", "AT", 2, "CDS", "GENE1"),
-            ("AllAlleles", 1, "3bp", 4, "sampleC", "famC", "Affected", "Unsolved",
-             "male", "ataxia", None, None, None, 1, "chr2-200-209-AAG", "AAG", "AAG", 3, "intron", "GENE2"),
+            _swim_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp",
+                      allele_size=6, sample_id="sampleA", family_id="famA",
+                      affected_status="Affected", analysis_status="Unsolved", sex="male",
+                      phenotype_description="seizures", FirstUnaffectedAlleleSize=4,
+                      is_above_first_unaffected=1, LocusId="chr1-100-110-AT", Motif="AT",
+                      CanonicalMotif="AT", MotifSize=2, gene_region="CDS",
+                      GeneTableGeneSymbol="GENE1"),
+            _swim_row(outlier_type="AllAlleles", outlier_rank=2, motif_category="2bp",
+                      allele_size=5, sample_id="sampleB", family_id="famB",
+                      affected_status="Unaffected", analysis_status="Unaffected", sex="female",
+                      FirstUnaffectedAlleleSize=4, is_above_first_unaffected=0,
+                      LocusId="chr1-100-110-AT", Motif="AT", CanonicalMotif="AT", MotifSize=2,
+                      gene_region="CDS", GeneTableGeneSymbol="GENE1"),
+            _swim_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="3bp",
+                      allele_size=4, sample_id="sampleC", family_id="famC",
+                      affected_status="Affected", analysis_status="Unsolved", sex="male",
+                      phenotype_description="ataxia", is_above_first_unaffected=1,
+                      LocusId="chr2-200-209-AAG", Motif="AAG", CanonicalMotif="AAG", MotifSize=3,
+                      gene_region="intron", GeneTableGeneSymbol="GENE2"),
         ],
     )
     conn.commit()
@@ -391,6 +396,119 @@ class ResultsServerTests(unittest.TestCase):
         finally:
             conn.close()
         self.assertIn(results_server.REFERENCE_REGION_INDEX, plan)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+def _build_db_with_unknown_category(path):
+    """Minimal loci + swim_plot DB with a normal row and an 'Unknown' motif row."""
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE loci (LocusId TEXT, Motif TEXT, KnownDiseaseLocus TEXT)")
+    conn.executemany("INSERT INTO loci VALUES (?, ?, ?)", [
+        ("chr1-100-110-AT", "AT", ""),
+        ("chrX-1-9-CTTTTT", "CTTTTT", ""),
+    ])
+    conn.execute("""CREATE TABLE swim_plot (
+        outlier_type TEXT, motif_category TEXT, allele_size INTEGER, sample_id TEXT,
+        family_id TEXT, affected_status TEXT, analysis_status TEXT, sex TEXT,
+        phenotype_description TEXT, purity TEXT, methylation TEXT, LocusId TEXT,
+        Motif TEXT, gene_region TEXT, GeneTableGeneSymbol TEXT)""")
+    conn.executemany(
+        "INSERT INTO swim_plot (outlier_type, motif_category, allele_size, sample_id, "
+        "LocusId, Motif) VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            ("AllAlleles", "2bp", 6, "sampleA", "chr1-100-110-AT", "AT"),
+            ("AllAlleles", "Unknown", 99, "sampleZ", "chrX-1-9-CTTTTT", "CTTTTT"),
+        ])
+    conn.commit()
+    conn.close()
+
+
+class AffectedStatusDisplayTests(unittest.TestCase):
+    """WS5: 'possibly affected' must be preserved for display, not collapsed."""
+
+    def test_possibly_affected_preserved(self):
+        sample_lookup = {"sA": {"affected_status": "possibly affected",
+                                "family_id": "f1", "sex": "male"}}
+        affected_lookup = {"sA": "affected"}  # collapsed for analysis logic only
+        analysis_lookup = {"sA": "unsolved"}
+        parsed = results_server.parse_outlier_samples(
+            "60x:sA", sample_lookup, affected_lookup, analysis_lookup)
+        self.assertEqual(parsed[0]["affected_status"], "Possibly Affected")
+
+    def test_falls_back_to_lookup_when_row_missing(self):
+        parsed = results_server.parse_outlier_samples(
+            "60x:sB", {}, {"sB": "affected"}, {"sB": "unsolved"})
+        self.assertEqual(parsed[0]["affected_status"], "Affected")
+
+
+class SchemaAndUnknownCategoryTests(unittest.TestCase):
+    """WS3 + WS4: schema sample_ids fall back to swim_plot; Unknown rows served."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.db_path = os.path.join(cls.tmpdir, "results.db")
+        cls.annotations_db = os.path.join(cls.tmpdir, "annotations.db")
+        _build_db_with_unknown_category(cls.db_path)
+        # No sample_table -> the sample dropdown must fall back to swim_plot IDs.
+        results_server.configure_app(cls.db_path, annotations_db=cls.annotations_db)
+        results_server.app.config["TESTING"] = True
+        cls.client = results_server.app.test_client()
+
+    @classmethod
+    def tearDownClass(cls):
+        for name in os.listdir(cls.tmpdir):
+            os.remove(os.path.join(cls.tmpdir, name))
+        os.rmdir(cls.tmpdir)
+
+    def test_schema_sample_ids_from_swim_plot(self):
+        data = self.client.get("/api/v1/schema").get_json()
+        self.assertEqual(data["sample_ids"], ["sampleA", "sampleZ"])
+
+    def test_unknown_motif_category_returned(self):
+        data = self.client.get("/api/v1/swim_plot_data?outlier_type=all").get_json()
+        self.assertIn("Unknown", data["categories"])
+        self.assertIn("sampleZ", {entry["sample_id"] for entry in data["data"]})
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class PermissiveSampleTableTests(unittest.TestCase):
+    """X1 / X12: the server's load_sample_table accepts minimal metadata."""
+
+    def _write(self, text):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False)
+        handle.write(text)
+        handle.close()
+        self.addCleanup(os.remove, handle.name)
+        return handle.name
+
+    def test_only_sample_id_does_not_crash(self):
+        path = self._write("sample_id\nS1\nS2\n")
+        sample_rows, affected_lookup, analysis_lookup = results_server.load_sample_table(path)
+        self.assertEqual(set(sample_rows), {"S1", "S2"})
+        self.assertEqual(analysis_lookup["S1"], "unknown")
+        # Absent affected_status is falsy (treated as not-unaffected downstream).
+        self.assertFalse(affected_lookup["S1"])
+
+    def test_case_insensitive_id_and_extra_columns_preserved(self):
+        path = self._write("Sample ID\tancestry\nS1\tEUR\n")
+        sample_rows, _affected, _analysis = results_server.load_sample_table(path)
+        self.assertIn("S1", sample_rows)
+        self.assertEqual(sample_rows["S1"]["ancestry"], "EUR")  # extra column preserved
+
+    def test_phenotype_strips_only_leading_na_prefix(self):
+        path = self._write(
+            "sample_id\taffected_status\tphenotype_description\n"
+            "S1\tAffected\tNA; seizures; NA; ataxia\n")
+        sample_rows, _affected, _analysis = results_server.load_sample_table(path)
+        # Only the leading 'NA; ' is removed (matches the build), not the inner one.
+        self.assertEqual(sample_rows["S1"]["phenotype_description"], "seizures; NA; ataxia")
 
 
 if __name__ == "__main__":
