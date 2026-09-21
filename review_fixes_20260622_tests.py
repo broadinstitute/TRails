@@ -9,13 +9,13 @@ harness in this repo and is verified by inspection only.
 """
 
 import os
-import sqlite3
 import tempfile
 import unittest
 
 import intervaltree
 
 import build_database
+import duckdb_compat
 import input_tables
 import locus_annotations
 import mendelian_qc
@@ -50,7 +50,7 @@ class StrchiveOnlyBuildTests(unittest.TestCase):
         self.matrix_path = os.path.join(self.directory, "matrix.tsv")
         self.metadata_path = os.path.join(self.directory, "samples.tsv")
         self.strchive_path = os.path.join(self.directory, "strchive.json")
-        self.db_path = os.path.join(self.directory, "result.db")
+        self.db_path = os.path.join(self.directory, "result.duckdb")
 
         with open(self.matrix_path, "w") as handle:
             handle.write("trid\tmotif\tS1\tS2\n"
@@ -75,7 +75,7 @@ class StrchiveOnlyBuildTests(unittest.TestCase):
         build_database.build(
             self.matrix_path, self.metadata_path, self.db_path,
             strchive_loci_json=self.strchive_path)
-        connection = sqlite3.connect(self.db_path)
+        connection = duckdb_compat.connect(self.db_path)
         try:
             value = connection.execute(
                 "SELECT KnownDiseaseLocus FROM loci WHERE LocusId = 'chr2-499-530-CAG'"
@@ -85,3 +85,5 @@ class StrchiveOnlyBuildTests(unittest.TestCase):
         self.assertEqual(value, "STR_A")
 
 
+if __name__ == "__main__":
+    unittest.main()

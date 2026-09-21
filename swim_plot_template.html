@@ -83,18 +83,6 @@
                                 <input type="radio" name="swim_outlier_type" value="hemi">
                                 <label>Hemizygous</label>
                             </div>
-
-                            {% if db_labels | length > 1 %}
-                            <span style="margin-left: 10px; border-left: 1px solid #ccc; padding-left: 15px;">
-                                <label style="margin-right: 10px;">Source</label>
-                                {% for label in db_labels %}
-                                <div class="ui radio checkbox" style="margin-right: 10px;">
-                                    <input type="radio" name="swim_source" value="{{ label }}" {{ 'checked' if loop.first else '' }}>
-                                    <label>{{ label }}</label>
-                                </div>
-                                {% endfor %}
-                            </span>
-                            {% endif %}
                         </div>
                     </div>
 
@@ -312,7 +300,7 @@
     <div class="header" id="dot-detail-header"></div>
     <div class="scrolling content" id="dot-detail-content"></div>
     <div class="actions">
-        <button class="ui basic button swim-edit-note-btn" style="float: left;"><i class="edit icon"></i>Edit Note</button>
+        <button class="ui basic button disabled swim-edit-note-btn" style="float: left;" disabled><i class="edit icon"></i>Edit Note</button>
         <button class="ui basic button swim-add-tag-btn" style="float: left; margin-left: 6px;"><i class="tag icon"></i>Add Tag</button>
         <div class="ui cancel button">Close</div>
     </div>
@@ -359,8 +347,7 @@ function yToLabel(y) {
 // Get current control values
 function getSwimParams() {
     const outlierType = $('input[name="swim_outlier_type"]:checked').val() || 'all';
-    const source = $('input[name="swim_source"]:checked').val() || SWIM_DEFAULT_SOURCE;
-    const params = { outlier_type: outlierType, source: source };
+    const params = { outlier_type: outlierType, source: SWIM_DEFAULT_SOURCE };
 
     // Boolean checkboxes
     if ($('#swim_require_affected_above_unaffected').is(':checked')) params.require_affected_above_unaffected = '1';
@@ -732,6 +719,20 @@ function updateSwimLegend(data) {
     $('#swim-legend').show();
 }
 
+// The footer's Edit Note button takes the note's current text out of the rendered modal
+// content, so it is only safe to click once that content is on the page. showDotDetail turns it
+// off before the fetches below start and leaves it off if they fail, so the editor can never open
+// empty over a stored note and overwrite it on save. The inline Add/Edit Note buttons need no
+// such flag: they are part of the rendered content, so they do not exist while it is loading.
+let swimDetailLoaded = false;
+
+function setSwimNoteEditingEnabled(enabled) {
+    swimDetailLoaded = enabled;
+    // Both the class (Semantic UI styles it and drops pointer events) and the property (the
+    // browser suppresses the click event, which is what stops the delegated handler).
+    $('.swim-edit-note-btn').toggleClass('disabled', !enabled).prop('disabled', !enabled);
+}
+
 // Monotonic sequence for the one shared detail modal. The two fetches below are async, so a slow
 // response for an earlier dot must not render into the modal after the user has opened another one
 // (which would show one sample's details while the modal's save actions target a different one).
@@ -745,11 +746,12 @@ function showDotDetail(item) {
     const headerText = geneSymbol ? locusId + ' &mdash; ' + geneSymbol : locusId;
     $('#dot-detail-header').html(headerText);
     $('#dot-detail-content').html('<div class="ui active centered inline loader" style="margin: 30px auto;"></div>');
+    setSwimNoteEditingEnabled(false);
     $('#dot-detail-modal').modal('show');
 
     // Use the params the chart was actually loaded with, not the live controls — the user may
-    // have changed source / outlier_type radios without reloading, which would otherwise fetch
-    // detail from a different source than the plotted dot belongs to (wrong details or 404).
+    // have changed the outlier-type radio without reloading, which would otherwise fetch detail
+    // for a different outlier type than the plotted dot belongs to (wrong details or 404).
     const params = swimLoadedParams || getSwimParams();
     const detailUrl = `${SWIM_API_BASE}/loci/${encodeURIComponent(item.LocusId)}?source=${encodeURIComponent(params.source)}`;
     const statsUrl = `${SWIM_API_BASE}/sample_outlier_stats?sample_id=${encodeURIComponent(item.sample_id)}&locus_id=${encodeURIComponent(item.LocusId)}&outlier_type=${encodeURIComponent(params.outlier_type)}&source=${encodeURIComponent(params.source)}`;
@@ -761,11 +763,14 @@ function showDotDetail(item) {
         .then(([detail, stats]) => {
             if (seq !== swimDetailSeq) return;  // a newer dot already owns the modal
             renderDotDetailContent(item, detail, stats, params);
+            setSwimNoteEditingEnabled(true);
         })
         .catch(err => {
             if (seq !== swimDetailSeq) return;
             console.error('Detail load error:', err);
             $('#dot-detail-content').html('<p style="color: red;">Failed to load details: ' + escapeHtml(err.message) + '</p>');
+            // Left disabled on purpose: the locus's stored note is still unknown, and an empty
+            // editor here would overwrite it.
         });
 }
 
@@ -776,9 +781,9 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
     const outlierSamples = locusDetail.outlier_samples;
 
     // Derive source / outlier_type from the params the chart was loaded with (passed in by
-    // showDotDetail), NOT the live radios: the user may have changed the radios without
-    // reloading, which would otherwise render Mendelian warnings and phenotype-similarity
-    // scores for a different source / outlier type than the plotted dot belongs to.
+    // showDotDetail), NOT the live radios: the user may have changed the outlier-type radio
+    // without reloading, which would otherwise render Mendelian warnings and phenotype-similarity
+    // scores for a different outlier type than the plotted dot belongs to.
     const swimSource = (params && params.source) || SWIM_DEFAULT_SOURCE;
     const swimOutlierType = (params && params.outlier_type) || 'all';
 
@@ -1185,13 +1190,22 @@ showDotDetail = function(item) {
     _originalShowDotDetail(item);
 };
 
+// The annotation write routes explain every failure in the response body: a "detail" field for
+// the read-only-server 403 (the results_server.restrict_writes before_request hook) and an "error" field for the
+// validation failures, so surface that text instead of a bare status number. The callers show
+// err.message in an alert.
+async function swimAnnotationError(response) {
+    const body = await response.json().catch(() => ({}));
+    return new Error(body.detail || body.error || `HTTP ${response.status}`);
+}
+
 async function swimSaveNote(locusId, noteText) {
     const response = await fetch(SWIM_API_BASE + '/annotations/' + encodeURIComponent(locusId) + '/note', {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({note_text: noteText}),
     });
-    if (!response.ok) throw new Error('HTTP ' + response.status);
+    if (!response.ok) throw await swimAnnotationError(response);
     return response.json();
 }
 
@@ -1199,7 +1213,7 @@ async function swimDeleteNote(locusId) {
     const response = await fetch(SWIM_API_BASE + '/annotations/' + encodeURIComponent(locusId) + '/note', {
         method: 'DELETE',
     });
-    if (!response.ok) throw new Error('HTTP ' + response.status);
+    if (!response.ok) throw await swimAnnotationError(response);
     return response.json();
 }
 
@@ -1209,7 +1223,7 @@ async function swimAddTag(locusId, tag) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({tag: tag}),
     });
-    if (!response.ok) throw new Error('HTTP ' + response.status);
+    if (!response.ok) throw await swimAnnotationError(response);
     return response.json();
 }
 
@@ -1217,7 +1231,7 @@ async function swimRemoveTag(locusId, tag) {
     const response = await fetch(SWIM_API_BASE + '/annotations/' + encodeURIComponent(locusId) + '/tags/' + encodeURIComponent(tag), {
         method: 'DELETE',
     });
-    if (!response.ok) throw new Error('HTTP ' + response.status);
+    if (!response.ok) throw await swimAnnotationError(response);
     return response.json();
 }
 
@@ -1244,7 +1258,7 @@ function applySwimTagUpdate(result) {
 
 // Modal action button handlers
 $(document).on('click', '.swim-edit-note-btn', function() {
-    if (!_currentModalItem) return;
+    if (!_currentModalItem || !swimDetailLoaded) return;
     var locusId = _currentModalItem.LocusId;
     var existing = $('#dot-detail-content .note-text').text() || '';
     var noteText = prompt('Enter note:', existing);
@@ -1316,7 +1330,10 @@ $(document).on('click', '.swim-inline-add-tag', function() {
 
 $(document).on('click', '.swim-remove-tag-btn', function() {
     var locusId = $(this).data('locus-id');
-    var tag = $(this).data('tag');
+    // .attr(), not .data(): jQuery's .data() converts an attribute that looks like a boolean,
+    // null or a number, so a tag literally named "true" or "1" would arrive here as a boolean
+    // or a number and fail the strict comparison against swimLoadedParams.tag below.
+    var tag = $(this).attr('data-tag');
     swimRemoveTag(locusId, tag).then(function(result) {
         applySwimTagUpdate(result);
         refreshSwimTags();

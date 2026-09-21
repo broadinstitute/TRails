@@ -224,7 +224,11 @@ __marimo__/
 reference_data/*
 !reference_data/.gitkeep
 # Licensed / controlled-access (class-B) and user (class-C) data.
+# *.db covers databases built by the SQLite-era version; the current build writes *.duckdb,
+# plus a *.duckdb.wal sidecar while a writer is open and a *.annotations.duckdb beside it.
 *.db
+*.duckdb
+*.duckdb.wal
 *.tsv.gz
 *.json.gz
 *.build_manifest.json

@@ -216,9 +216,6 @@ class ReadGeneDiseasePhenotypesTests(unittest.TestCase):
         self.assertEqual(data["FMR1"]["OMIM:1"]["inheritance"], {"AD"})
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 def _write(text, suffix=".tsv"):
     handle = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False)
@@ -288,3 +285,7 @@ class AnnotationColumnPrefixTests(unittest.TestCase):
         self.addCleanup(os.remove, path)
         _, sample_id_list = input_tables.read_repeat_copy_numbers(path)
         self.assertEqual(sample_id_list, ["AoU_0001", "HG002"])
+
+
+if __name__ == "__main__":
+    unittest.main()

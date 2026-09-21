@@ -103,18 +103,6 @@
                 Each bin has its own y-axis scale.
             </p>
 
-            {% if db_labels|length > 1 %}
-            <!-- Database source selector (only shown when more than one source is loaded) -->
-            <div style="margin-bottom: 18px;">
-                <label for="qc-source-select" style="font-weight: 600; color: #555; margin-right: 8px;">Database source:</label>
-                <select id="qc-source-select">
-                    {% for label in db_labels %}
-                    <option value="{{ label }}"{% if label == default_source %} selected{% endif %}>{{ label }}</option>
-                    {% endfor %}
-                </select>
-            </div>
-            {% endif %}
-
             <!-- Loading indicator -->
             <div id="qc-loading">
                 <div class="ui small active inline loader"></div>
@@ -159,12 +147,14 @@ const DEFAULT_SOURCE = {{ default_source | tojson }};
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
 const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
 // Per-source 99th-percentile outlier warnings; renderMendelianWarning() is passed the
-// currently-selected source so it only shows outlier warnings for the source being viewed.
+// page's source so it only shows outlier warnings for the source being viewed.
 const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
 
 
-// Category order for bins
+// Category order for bins. UNKNOWN_MOTIF_BIN is the bin results_server.compute_sample_qc_data
+// emits for loci whose MotifSize is NULL or <= 0; it is appended only when the data has it.
 const MOTIF_BINS = ['1bp', '2bp', '3-6bp', '7-24bp', '25+bp'];
+const UNKNOWN_MOTIF_BIN = 'Unknown';
 
 
 // Create a single bin chart (box plot with scatter overlay)
@@ -248,22 +238,19 @@ function createSingleBinChart(canvasId, binData, binLabel) {
     return chart;
 }
 
-// Charts created per section, kept so they can be destroyed before re-rendering. Chart.js
-// holds a strong reference to every chart in its registry until destroy() is called, so
-// without this the prior charts leak on every DB-source switch.
-const sectionCharts = {};
-
 // Create all charts for a section (rank1 or top10)
 function createChartsForSection(containerId, data) {
     const container = document.getElementById(containerId);
-    // Destroy the previous render's charts before detaching their canvases (see sectionCharts).
-    (sectionCharts[containerId] || []).forEach(c => c.destroy());
-    sectionCharts[containerId] = [];
     container.innerHTML = '';  // Clear any existing content
+
+    // The server bins loci with a missing or non-positive motif size as UNKNOWN_MOTIF_BIN, so
+    // show that bin whenever the data has rows in it (and leave it out otherwise).
+    const bins = MOTIF_BINS.slice();
+    if (data.some(item => item.bin === UNKNOWN_MOTIF_BIN)) bins.push(UNKNOWN_MOTIF_BIN);
 
     // Group data by bin
     const binData = {};
-    MOTIF_BINS.forEach(bin => { binData[bin] = []; });
+    bins.forEach(bin => { binData[bin] = []; });
     data.forEach(item => {
         if (binData[item.bin] !== undefined) {
             binData[item.bin].push({ sample_id: item.sample_id, count: item.count });
@@ -271,7 +258,7 @@ function createChartsForSection(containerId, data) {
     });
 
     // Create a chart for each bin
-    MOTIF_BINS.forEach((bin, idx) => {
+    bins.forEach((bin, idx) => {
         const chartWrapper = document.createElement('div');
         chartWrapper.className = 'qc-chart-container';
 
@@ -313,7 +300,7 @@ function createChartsForSection(containerId, data) {
             const tbody = document.createElement('tbody');
             top20.forEach(item => {
                 const tr = document.createElement('tr');
-                tr.innerHTML = `<td title="${escapeHtml(item.sample_id)}">${renderMendelianWarning(item.sample_id, (document.getElementById('qc-source-select')?.value || DEFAULT_SOURCE))}${escapeHtml(item.sample_id)}</td><td>${item.count}</td>`;
+                tr.innerHTML = `<td title="${escapeHtml(item.sample_id)}">${renderMendelianWarning(item.sample_id, DEFAULT_SOURCE)}${escapeHtml(item.sample_id)}</td><td>${item.count}</td>`;
                 tbody.appendChild(tr);
             });
             table.appendChild(tbody);
@@ -324,30 +311,20 @@ function createChartsForSection(containerId, data) {
 
         container.appendChild(chartWrapper);
 
-        // Create the chart after adding to DOM, tracking it for destruction on re-render
-        const chart = createSingleBinChart(canvasId, binData[bin], bin);
-        if (chart) sectionCharts[containerId].push(chart);
+        // Create the chart after adding to DOM
+        createSingleBinChart(canvasId, binData[bin], bin);
     });
 }
 
-// Monotonic request id so a slower earlier fetch can't overwrite the charts after the user
-// has already switched to a different source (the change handler fires a fresh load each time).
-let qcRequestSeq = 0;
-
 // Fetch data and render charts
 async function loadSampleQCData() {
-    const requestId = ++qcRequestSeq;
     try {
-        const sourceSelect = document.getElementById('qc-source-select');
-        const source = sourceSelect ? sourceSelect.value : DEFAULT_SOURCE;
-        const response = await fetch(`${QC_API_BASE}/sample_qc_data?source=${encodeURIComponent(source)}`);
-        if (requestId !== qcRequestSeq) return;  // superseded by a newer source selection
+        const response = await fetch(`${QC_API_BASE}/sample_qc_data?source=${encodeURIComponent(DEFAULT_SOURCE)}`);
         if (!response.ok) {
             const errData = await response.json().catch(() => ({}));
             throw new Error(errData.detail || `HTTP ${response.status}`);
         }
         const data = await response.json();
-        if (requestId !== qcRequestSeq) return;  // superseded while parsing the response
 
         // Hide loading, show sections
         document.getElementById('qc-loading').style.display = 'none';
@@ -359,7 +336,6 @@ async function loadSampleQCData() {
         createChartsForSection('top10-charts-row', data.top10 || []);
 
     } catch (err) {
-        if (requestId !== qcRequestSeq) return;  // stale failure - don't clobber the current source's UI
         console.error('Sample QC load error:', err);
         document.getElementById('qc-loading').style.display = 'none';
         document.getElementById('qc-error').style.display = 'block';
@@ -370,17 +346,6 @@ async function loadSampleQCData() {
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', function() {
-    const sourceSelect = document.getElementById('qc-source-select');
-    if (sourceSelect) {
-        sourceSelect.addEventListener('change', function() {
-            // Reset to the loading state and reload charts for the newly selected source
-            document.getElementById('qc-error').style.display = 'none';
-            document.getElementById('section-rank1').style.display = 'none';
-            document.getElementById('section-top10').style.display = 'none';
-            document.getElementById('qc-loading').style.display = 'block';
-            loadSampleQCData();
-        });
-    }
     loadSampleQCData();
 });
 </script>

@@ -5,11 +5,11 @@ the consolidated review findings.
 """
 
 import os
-import sqlite3
 import tempfile
 import unittest
 
 import analysis_columns
+import duckdb_compat
 import input_tables
 import locus_annotations
 import result_database
@@ -88,13 +88,17 @@ class EmptyLociTableTests(unittest.TestCase):
     """X2: an empty record set still writes a valid loci table."""
 
     def test_empty_records_create_full_schema(self):
-        connection = sqlite3.connect(":memory:")
-        row_count, present_columns = result_database.write_loci_table(
+        connection = duckdb_compat.connect(":memory:")
+        row_count = result_database.write_loci_table(
             connection, [], analysis_columns.OUTPUT_COLUMNS)
         self.assertEqual(row_count, 0)
-        self.assertEqual(present_columns, list(analysis_columns.OUTPUT_COLUMNS))
-        # The table exists and is queryable (no 'CREATE TABLE loci ()' crash).
+        # With no records to take the column list from, the full schema is written, so the
+        # table exists and is queryable (no 'CREATE TABLE loci ()' crash).
+        self.assertEqual(duckdb_compat.table_columns(connection, "loci"),
+                         set(analysis_columns.OUTPUT_COLUMNS))
         self.assertEqual(connection.execute("SELECT COUNT(*) FROM loci").fetchone()[0], 0)
         connection.close()
 
 
+if __name__ == "__main__":
+    unittest.main()

@@ -30,9 +30,12 @@ curl -fsSL https://raw.githubusercontent.com/broadinstitute/TRails/main/install.
 ```
 
 It installs the Python dependencies and fetches the public reference data. It is
-**resumable and self-updating** — re-run the same line any time to update (an up-to-date
-install is a no-op; an interrupted download resumes). Optional environment variables: `TRAILS_INSTALL_DIR` (install
-location; default `./TRails`), `TRAILS_FORCE=1` (force re-download).
+**self-updating** and always safe to re-run: re-run the same line any time to update (an
+up-to-date install is a no-op; an interrupted download is discarded and restarts from the
+beginning). Updating only replaces the files the installer itself shipped, so your databases,
+input tables and `reference_data/` cache stay in place. Optional environment variables:
+`TRAILS_INSTALL_DIR` (install location; default `./TRails`), `TRAILS_FORCE=1` (force
+re-download).
 
 From an existing checkout, `./install.sh` does the same minus the self-download. You can also
 skip `install.sh` entirely — `trails.py` installs anything missing on first run.
@@ -49,7 +52,7 @@ python3 trails.py \
 ```
 
 It: (1) installs any missing dependencies, (2) downloads any missing
-public reference data, (3) builds the local SQLite database (or reuses it if your inputs are
+public reference data, (3) builds the local DuckDB database (or reuses it if your inputs are
 unchanged — pass `--rebuild` to force), and (4) starts the local server. Open the printed
 URL in your web browser to begin your analysis using TRails interface. 
 
@@ -101,12 +104,12 @@ PMGRC-1-2-1    Unaffected        Unaffected        FAM1                         
 
 | Column | Required? | Enables / notes |
 |--------|-----------|-----------------|
-| `sample_id` | **required** | joins to the sample columns of the repeat-copy-numbers TSV |
+| `sample_id` | **required** | joins to the sample columns of the repeat-copy-numbers TSV; may not contain `:` or `,`, which are the delimiters of the packed outlier-sample strings (either character aborts the build) |
 | `affected_status` | optional | affected-vs-unaffected outlier comparison + affected-unsolved prioritization. Values: `Affected`, `Possibly Affected` (treated as `Affected`), `Unaffected`, `Unknown`. Absent → treated as unknown |
 | `analysis_status` | optional | solved/unsolved filtering + counts. Values: `Solved`, `Unsolved`, `Unknown`, … Absent → unknown |
 | `family_id` | optional | distinct-family outlier counts; pairs with the parent ids for trio QC |
 | `maternal_id`, `paternal_id` | optional | Mendelian-violation QC (needs trios) |
-| `sex` | optional | sex-aware handling of hemizygous loci. Values: `Male`, `Female`, `Unknown` |
+| `sex` | optional | displayed only: shown in the sample tables (the swim plot shows it for chrX/chrY loci). Nothing filters or computes on it. Values: `Male`, `Female`, `Unknown` |
 | `phenotype_description` | optional | free-text shown in the UI |
 
 Any extra columns are ignored.
@@ -126,7 +129,7 @@ PMGRC-1-1-0      HP:0001250    Seizure
 |--------|-----------|-------|
 | `participant_id` | **required if file given** | must match `sample_id` |
 | `term_id` | **required if file given** | HPO id, e.g. `HP:0000175` |
-| `hpo_description` | optional | human-readable term; looked up from the HPO ontology if absent |
+| `hpo_description` | optional | **accepted and ignored.** TRails matches phenotypes on `term_id` alone and never displays a term name; keep the column if it helps you read the file |
 
 Extra columns (e.g. `age_of_onset`, `modifier`) are accepted and ignored.
 
@@ -143,20 +146,33 @@ your own copy only if you have an OMIM API key. If absent, the dependent annotat
 
 - **python3** (3.8+) and **pip**. The one-line installer additionally needs **curl** and
   **tar** (standard on macOS/Linux). No other system packages are required.
-- **Python packages** (installed automatically from `requirements.txt` by `install.sh` /
-  `trails.py`):
+- **Required Python packages**: the contents of `requirements.txt`, installed by `install.sh`
+  and by `trails.py` on first run. If any of them is still missing after the install, the run
+  stops with an error.
   - `flask` — the local web server
   - `pandas`, `numpy` — the analysis pipeline
   - `intervaltree` — interval overlap lookups
-  - `pyhpo` — HPO term similarity (phenotype scoring; optional, falls back to Jaccard)
-  - `requests` — only for the opt-in STRchive network fetch (optional; the reference-data
-    download uses the standard library)
+  - `duckdb` (>= 1.0), the result-database engine (only `duckdb_compat.py` imports it)
+- **Optional Python packages**: **not** in `requirements.txt`. `install.sh` and `trails.py`
+  install them separately, by name, and a failure here is only a printed note, never an error:
+  - `pyhpo` — HPO term similarity (phenotype scoring falls back to Jaccard without it)
+  - `requests` — only for the opt-in STRchive network fetch (the reference-data download uses
+    the standard library)
+
+  `trails.py` attempts the optional install once and then writes a
+  `.trails_optional_deps_attempted` marker file next to itself, so a package that will not build
+  on your machine does not make every later run re-try it. Delete that file to retry.
 
   TRails is otherwise self-contained — it has no other third-party runtime dependency (the
   motif and locus-id utilities are built in, not pulled from an external package).
 
 You normally never install these by hand — `install.sh` and `trails.py` do it for you. To
-install manually: `python3 -m pip install -r requirements.txt`.
+install manually, do what they do (the second line is optional):
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m pip install pyhpo requests
+```
 
 ## License
 

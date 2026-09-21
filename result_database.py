@@ -1,28 +1,28 @@
-"""Pure SQLite writer for the TRails result database.
+"""Writer for the TRails DuckDB result database.
 
 This module is the persistence layer of the TRails build pipeline. It owns every
-table that ends up in the single ``*.db`` file the results server reads, and
+table that ends up in the single ``*.duckdb`` file the results server reads, and
 nothing else: each function here takes already-computed Python data (lists of
 record dicts produced by the in-memory analysis stages) plus an open
-``sqlite3.Connection``, and turns it into tables and indexes. No analysis, no
-TSV reading, no networking happens here — the orchestrator (``build_database``)
-calls these writers in order.
+``duckdb_compat`` connection, and turns it into tables. No analysis, no TSV
+reading, no networking happens here: the orchestrator (``build_database``) calls
+these writers in order.
 
 The whole database is built into a temporary path (``<final>.tmp``) and then
 atomically moved into place with ``os.replace`` so that a reader never observes
 a half-written file and a failed build never clobbers a previous good database.
 
-Tables written (mirroring the reference ``analyze_results.py`` SQLite output):
+Tables written:
 
 - ``loci``: the wide per-locus table, one row per locus, columns written in
   ``output_columns`` order (only the columns actually present in the records).
-- ``swim_plot``: one row per outlier allele, with its 13 supporting indexes.
-- ``sk_AllAlleles`` / ``sk_ShortAlleles`` / ``sk_HemizygousAlleles``: the narrow
-  per-outlier-type sort/filter projections (delegated to ``skinny_tables``).
+- ``swim_plot``: one row per outlier allele.
 - ``per_outlier_phenotype_scores`` / ``per_locus_phenotype_scores``: optional,
   written only when phenotype scoring produced rows.
 - ``mendelian_violations`` / ``mendelian_violations_per_motif``: optional,
   written into this same database only when at least one complete trio existed.
+- ``metadata``: a small key/value table of build-time facts, currently just the
+  number of samples the database was built from.
 
 Column order for the secondary tables is taken from the insertion order of the
 keys of the first row dict (Python dicts preserve insertion order), so the
@@ -34,56 +34,155 @@ the filesystem move).
 """
 
 import os
-import sqlite3
 
-import skinny_tables
+import duckdb_compat
 
 
 # The three outlier types, in the canonical order used throughout TRails.
 OUTLIER_TYPES = ("AllAlleles", "ShortAlleles", "HemizygousAlleles")
 
+# The key/value metadata table and the key the sample count is stored under. The
+# results server reads it through ``read_sample_count`` to show "N loci, N samples".
+METADATA_TABLE = "metadata"
+SAMPLE_COUNT_KEY = "num_samples"
+
+# Columns that hold numbers rather than text. DuckDB columns are statically typed, so
+# ``write_table_from_dicts`` reads each column's type off the values it is handed; this
+# set decides the type only for a column whose rows are all NULL, where there is nothing
+# to read. That case is routine rather than exotic: a build run without a gene table
+# still writes ``pLI`` and the ``GeneTable*`` columns, all NULL, and the results server
+# compares ``pLI`` to a number. Comparing a number against a VARCHAR column is a binder
+# error in DuckDB, where SQLite's untyped column simply matched nothing. Any real value
+# in the column overrides this set.
+#
+# The generated names are a superset of the schema (there is no
+# ``ThirdUnaffectedAlleleSize_*``, and only AoU1027 carries the OE_* statistics), which
+# keeps the patterns readable and costs nothing: a name no column ever uses is never
+# looked up. The cohort-statistic patterns also cover the ``HPRC256_Mode`` /
+# ``HPRC256_Median`` / ``HPRC256_90thPercentile`` style columns an input matrix can
+# supply outside ``OUTPUT_COLUMNS``.
+NUMERIC_COLUMNS = frozenset(
+    [
+        "IsKnownMotif", "IsInMendelianGene", "Start0Based", "End1Based", "MotifSize",
+        "gene_region_rank", "NumRepeatsInReference", "pLI",
+        "GeneTablepLI_v2", "GeneTablepLI_v4", "GeneTableLoeuf",
+        "TRExplorerLocusJaccardSimilarity", "TRExplorerReferenceRepeatPurity",
+        # swim_plot's own numeric columns. Its table is created empty (all columns, no
+        # rows) when a build finds no outlier alleles, so it hits the same case.
+        "outlier_rank", "allele_size", "purity", "methylation",
+        "FirstUnaffectedAlleleSize", "is_above_first_unaffected",
+    ]
+    + [f"{prefix}AffectedAlleleSize_{outlier_type}{by_family}"
+       for prefix in ("First", "Second", "Third")
+       for outlier_type in OUTLIER_TYPES
+       for by_family in ("", "_ByFamily")]
+    + [f"{prefix}UnaffectedAlleleSize_{outlier_type}{by_family}"
+       for prefix in ("First", "Second")
+       for outlier_type in OUTLIER_TYPES
+       for by_family in ("", "_ByFamily")]
+    + [f"{name}_{outlier_type}"
+       for name in ("NumAffectedUnsolvedSamplesAboveUnaffected",
+                    "NumAffectedUnsolvedFamiliesAboveUnaffected",
+                    "MaxGenePhenoSim", "SumPairwiseSim")
+       for outlier_type in OUTLIER_TYPES]
+    + [f"{cohort}_{statistic}"
+       for cohort in ("AoU1027", "HPRC256", "TenK10K")
+       for statistic in ("99thPercentile", "90thPercentile", "MaxAllele", "Mode",
+                         "Median", "Stdev", "StdevPercentile", "StdevRankByMotif",
+                         "StdevRankTotalNumberByMotif", "OE_Length",
+                         "OE_LengthPercentile")])
+
 
 def open_new_database(db_path):
-    """Opens a fresh SQLite database at a temporary sibling of ``db_path``.
+    """Opens a fresh DuckDB database at a temporary sibling of ``db_path``.
 
     The database is created at ``db_path + '.tmp'`` (removing any stale temp
     file first) so the final path is only ever populated by an atomic move in
-    ``finalize_database``.
+    ``finalize_database``. The temp file's ``.wal`` sidecar goes with it: a build
+    killed part way through leaves one behind, and it belongs to a database that
+    no longer exists.
 
     Args:
         db_path: The final database path the build is targeting.
 
     Returns:
-        A ``(connection, tmp_path)`` tuple: an open sqlite3 connection to the
-        temporary database and the temporary path it lives at.
+        A ``(connection, tmp_path)`` tuple: an open connection to the temporary
+        database and the temporary path it lives at.
     """
     tmp_path = db_path + ".tmp"
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
-    return sqlite3.connect(tmp_path), tmp_path
+    for stale_path in (tmp_path, tmp_path + ".wal"):
+        if os.path.exists(stale_path):
+            os.remove(stale_path)
+    return duckdb_compat.connect(tmp_path), tmp_path
+
+
+def infer_column_types(column_order, rows):
+    """Chooses the DuckDB type to declare each column with, from its values.
+
+    A column is ``BIGINT`` when every value it holds is an int, ``DOUBLE`` when
+    every value is numeric and at least one is a float, and ``VARCHAR`` as soon
+    as one value is neither (which is what makes a legitimately mixed column,
+    e.g. an annotation carrying both counts and a ``"not_available"`` marker,
+    round-trip instead of failing its insert). A column with no values at all
+    falls back to ``DOUBLE`` for a name in ``NUMERIC_COLUMNS`` and ``VARCHAR``
+    otherwise.
+
+    Args:
+        column_order: The ordered list of column names being written.
+        rows: The list of row dicts that will be inserted.
+
+    Returns:
+        A dict mapping each column name to its DuckDB type name.
+    """
+    # 0 = int, 1 = float, 2 = neither; the widest kind seen wins.
+    widest_kind = {}
+    for row in rows:
+        for column, value in row.items():
+            if value is None:
+                continue
+            kind = 0 if isinstance(value, int) else 1 if isinstance(value, float) else 2
+            if kind > widest_kind.get(column, -1):
+                widest_kind[column] = kind
+
+    types = {}
+    for column in column_order:
+        kind = widest_kind.get(column)
+        if kind == 0:
+            types[column] = "BIGINT"
+        elif kind == 1:
+            types[column] = "DOUBLE"
+        elif kind == 2:
+            types[column] = "VARCHAR"
+        else:
+            types[column] = "DOUBLE" if column in NUMERIC_COLUMNS else "VARCHAR"
+    return types
 
 
 def write_table_from_dicts(connection, table_name, rows, column_order=None,
                            primary_key_column=None, integer_columns=None):
     """Creates ``table_name`` and bulk-inserts a list of row dicts.
 
+    The rows go in through ``duckdb_compat.insert_rows``, a chunk per INSERT
+    statement, because a per-row insert of a table as wide as ``loci`` spends
+    most of the build's time in the database.
+
     The column set and order are taken from ``column_order`` when given,
     otherwise from the insertion order of the first row's keys (so the producing
     module's dict layout defines the schema). The table is dropped first, so the
     call is idempotent. ``NULL`` is written for any column absent from a given
-    row dict.
+    row dict. Column types come from ``infer_column_types`` unless the caller
+    names the column explicitly.
 
     Args:
-        connection: An open sqlite3 connection.
+        connection: An open duckdb_compat connection.
         table_name: The name of the table to (re)create and populate.
         rows: A list of row dicts. May be empty (an empty table is still created
             when ``column_order`` is supplied; otherwise nothing is written).
         column_order: Optional explicit list of column names defining the
             written column order. When omitted, the first row's keys are used.
-        primary_key_column: Optional column name to declare ``PRIMARY KEY``.
-        integer_columns: Optional collection of column names to declare with an
-            ``INTEGER`` type affinity (the rest are created untyped, matching the
-            dynamically typed values pandas' ``to_sql`` would store).
+        primary_key_column: Optional column name to declare ``TEXT PRIMARY KEY``.
+        integer_columns: Optional collection of column names to declare
+            ``BIGINT`` regardless of the values present.
 
     Returns:
         The number of rows inserted.
@@ -93,26 +192,26 @@ def write_table_from_dicts(connection, table_name, rows, column_order=None,
             return 0
         column_order = list(rows[0].keys())
     integer_columns = set(integer_columns or ())
+    column_types = infer_column_types(column_order, rows)
 
     column_definitions = []
     for column in column_order:
         # Quote the identifier so annotation headers containing spaces or other
         # non-identifier characters (promoted verbatim from the input matrix) do
         # not corrupt the CREATE TABLE DDL.
-        definition = f'"{column}"'
         if column == primary_key_column:
-            definition += " TEXT PRIMARY KEY"
+            definition = f'"{column}" TEXT PRIMARY KEY'
         elif column in integer_columns:
-            definition += " INTEGER"
+            definition = f'"{column}" BIGINT'
+        else:
+            definition = f'"{column}" {column_types[column]}'
         column_definitions.append(definition)
 
     connection.execute(f"DROP TABLE IF EXISTS {table_name}")
     connection.execute(f"CREATE TABLE {table_name} ({', '.join(column_definitions)})")
 
-    placeholders = ", ".join("?" for _ in column_order)
-    connection.executemany(
-        f"INSERT INTO {table_name} VALUES ({placeholders})",
-        [tuple(row.get(column) for column in column_order) for row in rows])
+    if rows:
+        duckdb_compat.insert_rows(connection, table_name, column_order, rows)
     return len(rows)
 
 
@@ -125,14 +224,13 @@ def write_loci_table(connection, records, output_columns, extra_columns=None):
     record missing a present column gets ``NULL`` for it.
 
     Args:
-        connection: An open sqlite3 connection.
+        connection: An open duckdb_compat connection.
         records: A list of per-locus record dicts (the build's in-memory rows).
         output_columns: The full ordered ``OUTPUT_COLUMNS`` schema; the written
             column order is this list filtered to columns present in ``records``.
 
     Returns:
-        A ``(row_count, present_columns)`` tuple, where ``present_columns`` is the
-        ordered list of columns actually written.
+        The number of rows written.
     """
     present = set()
     for record in records:
@@ -155,90 +253,53 @@ def write_loci_table(connection, records, output_columns, extra_columns=None):
     row_count = write_table_from_dicts(
         connection, "loci", records, column_order=present_columns)
     print(f"  loci: {row_count:,} rows, {len(present_columns)} columns")
-    return row_count, present_columns
+    return row_count
 
 
-def create_loci_indexes(connection, present_columns):
-    """Creates the ``loci`` indexes the results server relies on.
+def write_sample_count(connection, num_samples):
+    """Records how many samples the database was built from, in ``metadata``.
 
-    Mirrors the index set built by the reference pipeline, but every index is
-    guarded by the presence of its column so a minimal database (without the
-    optional gene / phenotype / population-stat columns) still indexes cleanly.
+    The table is created if it does not exist yet and the row is written with
+    ``INSERT OR REPLACE``, so rebuilding or re-recording the count is idempotent.
+    The caller commits.
 
     Args:
-        connection: An open sqlite3 connection holding a populated ``loci`` table.
-        present_columns: The collection of column names present in ``loci``.
+        connection: An open duckdb_compat connection.
+        num_samples: The number of samples in the callset, i.e. the number of
+            sample genotype columns in the repeat-copy-numbers matrix the build
+            read. This counts every sample column in the matrix, including ones
+            with no metadata row and ones whose genotypes are all missing; it is
+            not the number of rows in the sample-metadata TSV (which may list
+            samples the matrix never genotyped).
+    """
+    connection.execute(
+        f"CREATE TABLE IF NOT EXISTS {METADATA_TABLE} "
+        f"(key TEXT PRIMARY KEY, value VARCHAR)")
+    connection.execute(
+        f"INSERT OR REPLACE INTO {METADATA_TABLE} (key, value) VALUES (?, ?)",
+        (SAMPLE_COUNT_KEY, str(num_samples)))
+    print(f"  {METADATA_TABLE}: {num_samples:,} samples")
+
+
+def read_sample_count(connection):
+    """Returns the sample count stored in ``metadata``, or None when absent.
+
+    Args:
+        connection: An open duckdb_compat connection to a results database.
 
     Returns:
-        The list of index names that were created.
+        The recorded number of samples as an int, or ``None`` when the database
+        predates the metadata table or has no sample-count row.
     """
-    present = set(present_columns)
-    cursor = connection.cursor()
-    created = []
-
-    def add_index(index_name, column):
-        if column in present:
-            cursor.execute(
-                f"CREATE INDEX IF NOT EXISTS {index_name} ON loci({column})")
-            created.append(index_name)
-
-    # Primary lookup + common single-column filter indexes.
-    for column in [
-        "LocusId", "gene_id", "Chrom", "KnownDiseaseLocus", "gene_region",
-        "gene_region_rank", "pLI", "Motif", "CanonicalMotif", "IsKnownMotif",
-        "IsInMendelianGene", "NumRepeatsInReference", "HPRC256_StdevPercentile",
-        "AoU1027_StdevPercentile",
-    ]:
-        add_index(f"idx_loci_{column}", column)
-
-    # Composite index backing the reference-region filter: an equality seek on Chrom
-    # followed by a b-tree range scan over Start0Based. End1Based is carried as a third
-    # column so the overlap test and the max-locus-span scan the server runs are served
-    # from the index without touching the table.
-    if {"Chrom", "Start0Based", "End1Based"} <= present:
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_loci_Chrom_Start0Based "
-                       "ON loci(Chrom, Start0Based, End1Based)")
-        created.append("idx_loci_Chrom_Start0Based")
-
-    # Phenotype score indexes (present only when phenotype scoring ran).
-    for outlier_type in OUTLIER_TYPES:
-        add_index(f"idx_loci_MaxGenePhenoSim_{outlier_type}",
-                  f"MaxGenePhenoSim_{outlier_type}")
-        add_index(f"idx_loci_SumPairwiseSim_{outlier_type}",
-                  f"SumPairwiseSim_{outlier_type}")
-
-    # Affected / unaffected allele-size indexes for the above-unaffected filters.
-    for prefix in ["First", "Second", "Third"]:
-        for outlier_type in OUTLIER_TYPES:
-            add_index(f"idx_loci_{prefix}AffectedAlleleSize_{outlier_type}",
-                      f"{prefix}AffectedAlleleSize_{outlier_type}")
-    for outlier_type in OUTLIER_TYPES:
-        add_index(f"idx_loci_FirstUnaffectedAlleleSize_{outlier_type}",
-                  f"FirstUnaffectedAlleleSize_{outlier_type}")
-
-    # Family-level allele-size indexes.
-    for prefix in ["First", "Second", "Third"]:
-        for outlier_type in OUTLIER_TYPES:
-            add_index(
-                f"idx_loci_{prefix}AffectedAlleleSize_{outlier_type}_ByFamily",
-                f"{prefix}AffectedAlleleSize_{outlier_type}_ByFamily")
-    for outlier_type in OUTLIER_TYPES:
-        add_index(
-            f"idx_loci_FirstUnaffectedAlleleSize_{outlier_type}_ByFamily",
-            f"FirstUnaffectedAlleleSize_{outlier_type}_ByFamily")
-
-    # Sorting indexes used by the default ranked views.
-    add_index("idx_loci_NumAffectedAboveUnaffected_AllAlleles",
-              "NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles")
-    add_index("idx_loci_NumAffectedFamiliesAboveUnaffected_AllAlleles",
-              "NumAffectedUnsolvedFamiliesAboveUnaffected_AllAlleles")
-
-    connection.commit()
-    return created
+    if METADATA_TABLE not in duckdb_compat.list_tables(connection):
+        return None
+    row = connection.execute(
+        f"SELECT value FROM {METADATA_TABLE} WHERE key = ?", (SAMPLE_COUNT_KEY,)).fetchone()
+    return int(row[0]) if row else None
 
 
 def write_swim_plot(connection, swim_rows, columns=None):
-    """Writes the ``swim_plot`` table (one row per outlier allele) + its indexes.
+    """Writes the ``swim_plot`` table (one row per outlier allele).
 
     The column schema and order come from the keys of the first swim row (as
     produced by ``swim_plot.generate_swim_plot_table``). When ``swim_rows`` is
@@ -248,7 +309,7 @@ def write_swim_plot(connection, swim_rows, columns=None):
     table (a valid build can legitimately yield zero outlier rows).
 
     Args:
-        connection: An open sqlite3 connection.
+        connection: An open duckdb_compat connection.
         swim_rows: A list of swim-plot row dicts.
         columns: Optional canonical column order used to create the table when
             ``swim_rows`` is empty.
@@ -262,59 +323,21 @@ def write_swim_plot(connection, swim_rows, columns=None):
 
     column_order = None if swim_rows else list(columns)
     row_count = write_table_from_dicts(connection, "swim_plot", swim_rows, column_order=column_order)
-
-    cursor = connection.cursor()
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_outlier_category ON swim_plot(outlier_type, motif_category)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_allele_size ON swim_plot(allele_size)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_sample_outlier ON swim_plot(sample_id, outlier_type, is_above_first_unaffected)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_locus_id ON swim_plot(LocusId, outlier_type)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_gene_symbol ON swim_plot(GeneTableGeneSymbol, outlier_type)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_gene_region ON swim_plot(gene_region)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_outlier_rank ON swim_plot(outlier_type, outlier_rank, MotifSize)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_known_motif ON swim_plot(IsKnownMotif)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_canonical_motif ON swim_plot(CanonicalMotif)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_pli ON swim_plot(pLI)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_motif_size ON swim_plot(MotifSize)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_gene_id ON swim_plot(gene_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swim_mendelian ON swim_plot(IsInMendelianGene)")
     connection.commit()
 
-    print(f"  swim_plot: {row_count:,} rows, 13 indexes")
+    print(f"  swim_plot: {row_count:,} rows")
     return row_count
 
 
-def write_skinny_tables(connection, present_columns):
-    """Builds the three per-outlier-type skinny sort/filter tables.
-
-    Delegates to ``skinny_tables.build_skinny_table`` for each outlier type. The
-    skinny tables intersect their wanted columns with ``present_columns`` so a
-    minimal ``loci`` table still yields valid (narrower) projections.
-
-    Args:
-        connection: An open sqlite3 connection holding a populated ``loci`` table.
-        present_columns: The collection of column names present in ``loci``.
-
-    Returns:
-        The list of skinny table names that were created.
-    """
-    present = set(present_columns)
-    table_names = [
-        skinny_tables.build_skinny_table(connection, outlier_type, present)
-        for outlier_type in OUTLIER_TYPES
-    ]
-    connection.commit()
-    return table_names
-
-
 def write_phenotype_tables(connection, per_outlier_rows, per_locus_rows):
-    """Writes the two phenotype-score tables + their indexes (when non-empty).
+    """Writes the two phenotype-score tables (when non-empty).
 
     Both tables are written only when ``per_outlier_rows`` is non-empty (matching
     the reference: the per-locus table is written alongside the per-outlier one).
     Column order for each table is taken from the first row dict.
 
     Args:
-        connection: An open sqlite3 connection.
+        connection: An open duckdb_compat connection.
         per_outlier_rows: A list of per-outlier phenotype-score row dicts.
         per_locus_rows: A list of per-locus phenotype-score row dicts.
 
@@ -327,26 +350,8 @@ def write_phenotype_tables(connection, per_outlier_rows, per_locus_rows):
 
     per_outlier_count = write_table_from_dicts(
         connection, "per_outlier_phenotype_scores", per_outlier_rows)
-    cursor = connection.cursor()
-    cursor.execute("CREATE INDEX idx_outlier_pheno_locus ON per_outlier_phenotype_scores(locus_id)")
-    cursor.execute("CREATE INDEX idx_outlier_pheno_sample ON per_outlier_phenotype_scores(sample_id)")
-    cursor.execute("CREATE INDEX idx_outlier_pheno_type ON per_outlier_phenotype_scores(outlier_type)")
-    cursor.execute("CREATE INDEX idx_outlier_pheno_gene_sim ON per_outlier_phenotype_scores(gene_phenotype_similarity)")
-    cursor.execute("CREATE INDEX idx_outlier_pheno_gene ON per_outlier_phenotype_scores(gene_symbol)")
-
     per_locus_count = write_table_from_dicts(
         connection, "per_locus_phenotype_scores", per_locus_rows)
-    cursor.execute("CREATE INDEX idx_locus_pheno_id ON per_locus_phenotype_scores(locus_id)")
-    cursor.execute("CREATE INDEX idx_locus_pheno_type ON per_locus_phenotype_scores(outlier_type)")
-    cursor.execute("CREATE INDEX idx_locus_pheno_sum_sim ON per_locus_phenotype_scores(sum_pairwise_similarity)")
-    cursor.execute("CREATE INDEX idx_locus_pheno_max_gene ON per_locus_phenotype_scores(max_gene_phenotype_similarity)")
-    cursor.execute("CREATE INDEX idx_locus_pheno_num_samples ON per_locus_phenotype_scores(num_qualifying_samples)")
-    cursor.execute("CREATE INDEX idx_locus_pheno_known_motif ON per_locus_phenotype_scores(IsKnownMotif)")
-    cursor.execute("CREATE INDEX idx_locus_pheno_gene_region ON per_locus_phenotype_scores(gene_region)")
-    cursor.execute("CREATE INDEX idx_locus_pheno_motif_size ON per_locus_phenotype_scores(MotifSize)")
-    cursor.execute("CREATE INDEX idx_locus_pheno_pairwise_sort ON per_locus_phenotype_scores(outlier_type, sum_pairwise_similarity DESC, locus_id)")
-    cursor.execute("CREATE INDEX idx_locus_pheno_gene_sort ON per_locus_phenotype_scores(outlier_type, max_gene_phenotype_similarity DESC, locus_id)")
-    cursor.execute("CREATE INDEX idx_locus_pheno_gene_known ON per_locus_phenotype_scores(outlier_type, IsKnownMotif, max_gene_phenotype_similarity DESC, locus_id)")
     connection.commit()
 
     print(f"  per_outlier_phenotype_scores: {per_outlier_count:,} rows")
@@ -360,11 +365,11 @@ def write_mendelian_tables(connection, per_sample_rows, per_motif_rows):
     These tables are written only when ``per_sample_rows`` is non-empty (i.e. at
     least one complete trio existed). ``sample_id`` is the primary key of each
     table and is forced to be the first column; the remaining columns and their
-    order come from the first row dict (all declared ``INTEGER``, matching the
+    order come from the first row dict (all declared ``BIGINT``, matching the
     reference per-trio count schema).
 
     Args:
-        connection: An open sqlite3 connection.
+        connection: An open duckdb_compat connection.
         per_sample_rows: A list of per-trio-child row dicts for
             ``mendelian_violations``.
         per_motif_rows: A list of per-trio-child row dicts for
@@ -390,10 +395,10 @@ def write_mendelian_tables(connection, per_sample_rows, per_motif_rows):
 
 def _write_mendelian_table(connection, table_name, rows):
     """Writes one Mendelian table: ``sample_id`` first as a TEXT primary key, every other
-    column declared INTEGER.
+    column declared BIGINT.
 
     Args:
-        connection: An open sqlite3 connection.
+        connection: An open duckdb_compat connection.
         table_name: The table to (re)create.
         rows: A list of flat row dicts; every key other than ``sample_id`` holds
             an integer count.
@@ -412,15 +417,32 @@ def _write_mendelian_table(connection, table_name, rows):
 def finalize_database(connection, tmp_path, final_path):
     """Commits, closes, and atomically moves the temp database into place.
 
+    Closing before the move matters: DuckDB keeps a ``<path>.wal`` sidecar next to
+    an open database and folds it back in on a clean close, so only a closed
+    database is the single file that ``os.replace`` can move.
+
     Uses ``os.replace`` (not a shell ``mv``) so the move is atomic on the same
     filesystem and overwrites any existing final database in a single step.
 
+    A ``<final_path>.wal`` left over from the database that was just overwritten is
+    removed after the move. DuckDB does not check that a write-ahead log belongs to the
+    database file next to it: it replays whatever it finds, so a log left behind by a
+    killed writer (the recovery command the results server prints opens the database
+    read-write, and so does the duckdb CLI) would be folded into the brand-new database,
+    resurrecting the previous build's tables or, when it re-creates a table the new
+    database already has, failing every open with ``Failure while replaying WAL file ...
+    Table with name "loci" already exists!``. The removal comes after ``os.replace`` on
+    purpose: until the move succeeds, that log is still the missing tail of a database
+    that is still there.
+
     Args:
-        connection: The open sqlite3 connection to the temporary database.
+        connection: The open duckdb_compat connection to the temporary database.
         tmp_path: The temporary database path (from ``open_new_database``).
         final_path: The destination path for the finished database.
     """
     connection.commit()
     connection.close()
     os.replace(tmp_path, final_path)
+    if os.path.exists(final_path + ".wal"):
+        os.remove(final_path + ".wal")
     print(f"  finalized database -> {final_path}")

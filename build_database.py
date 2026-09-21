@@ -1,12 +1,12 @@
-"""Build the TRails SQLite result database directly from the user's input TSVs.
+"""Build the TRails DuckDB result database directly from the user's input TSVs.
 
 This is TRails' analysis engine and pipeline orchestrator. It reads the
 repeat-copy-numbers matrix TSV + the sample-metadata TSV (plus the optional
-phenotype / gene / reference inputs) and — entirely in memory — computes the
+phenotype / gene / reference inputs) and, entirely in memory, computes the
 allele histograms, detects outliers, derives every analysis column, scores
-phenotypes, builds the swim-plot / skinny / phenotype / Mendelian tables, and
-writes them all straight into ``db_path``. Nothing is written to disk except the
-database itself: there is no intermediate histogram or JSON file.
+phenotypes, builds the swim-plot / phenotype / Mendelian tables, and writes them
+all straight into ``db_path``. Nothing is written to disk except the database
+itself: there is no intermediate histogram or JSON file.
 
 It ports the staged logic of the internal ``analyze_results.py`` pipeline (which
 read a pre-built per-locus JSON); here the same per-locus records are built
@@ -25,12 +25,12 @@ fully-tested unit):
   8. ``analysis_columns.add_gene_columns``               -> pLI / inheritance
   9. ``analysis_columns.add_all_outlier_columns``        -> the affected/unaffected analysis
  10. ``phenotype_scoring.compute_phenotype_scores``      -> phenotype-score columns + rows
- 11. ``result_database``: loci table + indexes + skinny tables + swim plot +
+ 11. ``result_database``: loci table + sample-count metadata + swim plot +
      phenotype tables + (when complete trios exist) Mendelian tables, finalized
      with an atomic move.
 
 CLI:
-    python3 build_database.py --repeat-copy-numbers-tsv X --sample-metadata-tsv Y --db out.db
+    python3 build_database.py --repeat-copy-numbers-tsv X --sample-metadata-tsv Y --db out.duckdb
 """
 
 import argparse
@@ -52,8 +52,8 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
           n_outlier_sample_ids=10, strchive_loci_json=None):
     """Read the input TSVs and write the TRails result database to db_path.
 
-    Builds every table in memory and populates the SQLite database directly — no
-    intermediate files. Optional inputs (phenotypes, gene table, known-loci
+    Builds every table in memory and populates the DuckDB database directly, with
+    no intermediate files. Optional inputs (phenotypes, gene table, known-loci
     catalog) are simply skipped when absent, and the build still runs: a missing
     gene/phenotype input leaves the corresponding columns NULL rather than
     hard-failing.
@@ -62,7 +62,7 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
         repeat_copy_numbers_tsv: Merged per-allele genotype matrix (trid, motif,
             one column per sample).
         sample_metadata_tsv: One row per sample (only sample_id required).
-        db_path: Output SQLite database path. Written atomically (``<path>.tmp``
+        db_path: Output DuckDB database path. Written atomically (``<path>.tmp``
             then ``os.replace``).
         phenotypes_table: Optional HPO-terms-per-sample TSV.
         gene_table: Optional gene-disease table (gene_id keyed).
@@ -151,7 +151,9 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
 
     # Stage 6: derived coordinate / motif / source / gene-region columns.
     print("Adding derived locus columns ...")
-    locus_annotations.add_derived_locus_columns(records, source_label=source_label)
+    locus_annotations.add_derived_locus_columns(
+        records, source_label=source_label,
+        repeat_copy_numbers_tsv=repeat_copy_numbers_tsv)
 
     # Stage 7: known-disease-locus match + IsKnownMotif + IsInMendelianGene.
     print("Annotating known-disease loci and known motifs ...")
@@ -214,11 +216,15 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
     print(f"Writing database: {db_path}")
     connection, tmp_path = result_database.open_new_database(db_path)
     try:
-        _, present_columns = result_database.write_loci_table(
+        result_database.write_loci_table(
             connection, records, analysis_columns.OUTPUT_COLUMNS,
             extra_columns=promoted_annotation_columns)
-        result_database.create_loci_indexes(connection, present_columns)
-        result_database.write_skinny_tables(connection, present_columns)
+        # The results server shows this next to the loci count. It is the matrix's
+        # sample-column count, not a per-locus call count: a sample that was not
+        # genotyped at a locus is simply absent from that locus's histograms, so no
+        # loci column holds the callset size. Written here so it lands in the temp
+        # database that finalize_database moves into place.
+        result_database.write_sample_count(connection, len(sample_id_list))
 
         swim_rows = swim_plot.generate_swim_plot_table(
             records, sample_lookup, affected_lookup, analysis_lookup)
@@ -249,7 +255,7 @@ def main():
                         help="merged repeat-copy-numbers TSV (one row per locus, one column per sample)")
     parser.add_argument("--sample-metadata-tsv", required=True,
                         help="sample metadata TSV (one row per sample; only sample_id is required)")
-    parser.add_argument("--db", required=True, help="output SQLite database path")
+    parser.add_argument("--db", required=True, help="output DuckDB database path")
     parser.add_argument("--phenotypes-table", help="optional phenotype TSV (HPO terms per sample)")
     parser.add_argument("--gene-table", help="optional gene-disease table (class B)")
     parser.add_argument("--genes-to-phenotype", help="HPO genes_to_phenotype.txt (reference)")

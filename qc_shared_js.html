@@ -1,8 +1,9 @@
 <script>
 // =========================================================================
-// Shared QC helpers used by sample_qc_template.html, qc2_template.html, and
-// swim_plot_template.html. Kept in one place so fixes to the box-plot stats /
-// Mendelian-warning popup can't drift between the pages. (escapeHtml, renderMendelianWarning, computeBoxStats,
+// Shared QC helpers used by index_page_template.html, sample_qc_template.html,
+// qc2_template.html, and swim_plot_template.html. Kept in one place so fixes to the
+// box-plot stats / Mendelian-warning popup can't drift between the pages. (escapeHtml,
+// isAffectedStatus, setupDropdownMenu, renderMendelianWarning, computeBoxStats,
 // computePercentile, singleBinBoxPlotPlugin, and the Mendelian-warning popup handler.)
 // Page-specific pieces (MOTIF_BINS, MENDELIAN_WARNINGS, chart-building) stay in each page.
 // Requires Chart.js + jQuery (loaded by header_template.html) and the page-level
@@ -307,7 +308,9 @@ document.addEventListener('click', function(e) {
         html += `<div class="popup-header">⚠️ 99th Percentile TR Outlier</div>`;
         html += '<table class="invisible-table">';
         html += '<tr><th style="font-weight:600;color:#555;">Bin</th><th style="text-align:right;font-weight:600;color:#555;padding-right:8px;">Count</th><th style="text-align:left;color:#888;">Threshold</th></tr>';
-        const binOrder = ['1bp', '2bp', '3-6bp', '7-24bp', '25+bp'];
+        // 'Unknown' is the bin results_server.compute_sample_qc_data emits for loci whose
+        // MotifSize is NULL or <= 0; without it a sample flagged only there gets an empty table.
+        const binOrder = ['1bp', '2bp', '3-6bp', '7-24bp', '25+bp', 'Unknown'];
         for (const bin of binOrder) {
             if (warning.outlier_bins[bin]) {
                 const data = warning.outlier_bins[bin];

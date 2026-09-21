@@ -103,8 +103,11 @@ body {
 #results-table thead th[data-sort] { cursor: pointer; }
 #results-table thead th[data-sort]:hover { color: #000; }
 #results-table thead th .sort-icon { color: #bbb; margin-left: 3px; font-size: 0.8em; }
-#results-table thead th.sorted-asc .sort-icon,
-#results-table thead th.sorted-desc .sort-icon { color: #333; }
+/* Each sortable field's direction is fixed on the server (SORT_MAPPING in results_server.py:
+   Region ascends, the rest descend) and a header click only adds or removes that field from the
+   sort list, so the indicator marks a column as part of the active sort instead of naming a
+   direction. That is also what the static up-down glyph in the header says. */
+#results-table thead th.sorted-active .sort-icon { color: #333; }
 
 /* Right-align numeric columns */
 #results-table .col-numeric { text-align: right; }
@@ -125,6 +128,7 @@ body {
 #results-table .col-pli       { width: 50px; }
 #results-table .col-sigma-hprc { width: 105px; }
 #results-table .col-sigma-aou  { width: 105px; }
+#results-table .col-vc        { width: 100px; white-space: nowrap; }
 #results-table .col-gene-pheno-sim { width: 85px; }
 #results-table .col-pairwise-sim   { width: 95px; }
 
@@ -156,8 +160,12 @@ body {
     margin: 0;
 }
 
-/* Expanded detail row */
-#results-table tbody tr.locus-detail-row td {
+/* Expanded detail row. The child combinator matters: the row's single cell holds the per-sample
+   sub-table and the Affected Unsolved summary table, and a descendant selector here (1 id, 1
+   class, 3 types) would out-specify the compact `.sample-subtable td`, `.threshold-marker` and
+   `.invisible-table td` rules below, re-indenting every nested cell by 40px and drawing the 2px
+   rule under each sample row. */
+#results-table tbody tr.locus-detail-row > td {
     padding: 10px 14px 10px 40px;
     background: #fafafa;
     border-bottom: 2px solid #ddd;
@@ -295,7 +303,10 @@ body {
     border: none;
     width: 100%;
 }
-.invisible-table td {
+/* The second selector is for the copy nested in the expanded detail row, where the bare class
+   would lose to `#results-table tbody td`'s 5px 8px padding. */
+.invisible-table td,
+#results-table .invisible-table td {
     border: none;
     padding: 1px 8px 1px 0;
     vertical-align: top;

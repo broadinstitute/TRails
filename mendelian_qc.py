@@ -10,9 +10,10 @@ sample-metadata table.
 
 Everything else -- ``allele_matches_any``, ``get_chrom_category``,
 ``get_motif_size_category``, ``MOTIF_SIZE_CATEGORIES``, the per-chromosome
-dispatch (chrY uses child+father, chrM uses child+mother, autosome/chrX uses all
-three), the "require at least 2 distinct allele sizes" filter, and the two
-output-table schemas -- is a faithful, verbatim port of the original behavior.
+dispatch (chrY uses child+father, chrM and a hemizygous chrX child use
+child+mother, autosome/diploid chrX uses all three), the "require at least 2
+distinct allele sizes" filter, and the two output-table schemas -- is a faithful,
+verbatim port of the original behavior.
 
 Three TRails-specific deviations. Two handle the fact that a matrix cell can be a
 no-call (the per-sample LPS files never were):
@@ -26,7 +27,8 @@ The third is in ``check_violation``: the original required a single-allele child
 call to come from the mother, which is right for a hemizygous son on chrX but
 wrong on an autosome, where a one-allele call may have come from either parent.
 It therefore takes a ``chrom_category`` argument and applies the mother-only rule
-only for chrX.
+only for chrX. The dispatch follows: a hemizygous chrX child is compared against
+the mother alone, so the locus is evaluated even when the father has no call.
 
 A fourth: the "at least 2 distinct allele sizes" filter is not applied to a
 haploid chrY (or chrM) comparison, where it would mean "the two disagree" and
@@ -126,7 +128,8 @@ def check_violation(child_genotype, mother_genotype, father_genotype, threshold,
     Args:
         child_genotype: Tuple of alleles for the child (1 or 2 elements).
         mother_genotype: Tuple of alleles for the mother (1 or 2 elements).
-        father_genotype: Tuple of alleles for the father (1 or 2 elements).
+        father_genotype: Tuple of alleles for the father (1 or 2 elements), or
+            None for a hemizygous chrX child, whose father is not consulted.
         threshold: Alleles match if they differ by strictly fewer than this many
             repeats.
         chrom_category: The locus's chromosome category, as returned by
@@ -323,7 +326,79 @@ def _new_trio_stats():
     }
 
 
-def _process_trio(child_id, mother_id, father_id, locus_rows, threshold):
+def _keep_genotyped_trios(trios, locus_rows):
+    """Drop trios whose members are not genotype columns of the matrix.
+
+    The sample metadata can describe families whose samples were never
+    genotyped. Such a trio is not comparable at any locus, so it would yield a
+    per-sample row of zeros that reads as a clean trio. Dropping it here keeps
+    genuinely clean trios (genotyped, zero violations over a non-zero
+    denominator) as the only zero-violation rows in the output.
+
+    Args:
+        trios: List of ``(child_id, mother_id, father_id)`` tuples.
+        locus_rows: The in-memory matrix rows, each with a ``genotypes`` dict.
+
+    Returns:
+        A list of the trios all three of whose members appear as genotype
+        columns, in the input order.
+    """
+    pending = set(sample_id for trio in trios for sample_id in trio)
+    genotyped = set()
+    for locus_row in locus_rows:
+        if not pending:
+            break
+        for sample_id in [s for s in pending if s in locus_row["genotypes"]]:
+            pending.discard(sample_id)
+            genotyped.add(sample_id)
+
+    kept = []
+    for trio in trios:
+        missing = [sample_id for sample_id in trio if sample_id not in genotyped]
+        if missing:
+            print(f"WARNING: skipping trio {trio} for Mendelian QC: "
+                  f"not genotyped in the matrix: {missing}")
+            continue
+        kept.append(trio)
+    return kept
+
+
+def _prepare_loci(locus_rows):
+    """Derive the per-locus values the trio loop needs, once for all trios.
+
+    The chromosome category, the motif-size category and the canonical motif depend only on
+    the locus, so they are computed here rather than inside ``_process_trio``, which runs
+    once per trio over the same rows.
+
+    Args:
+        locus_rows: The in-memory matrix rows (each with ``trid``, ``motif`` and a
+            ``genotypes`` dict mapping sample_id -> cell string).
+
+    Returns:
+        A list of ``(genotypes, chrom_category, motif_size_category, canonical_motif)``
+        tuples, one per scorable locus, in the input order.
+    """
+    prepared = []
+    for locus_row in locus_rows:
+        motif = locus_row["motif"]
+        # Skip loci with a blank motif (len 0 -> get_motif_size_category returns
+        # "0bp", which is not a MOTIF_SIZE_CATEGORIES key and would KeyError in
+        # _tally) or a motif carrying any base outside ACGT. compute_canonical_motif
+        # accepts the whole IUPAC alphabet, so an ambiguity code survives
+        # canonicalization, but per_motif_stats is keyed only by the ACGT canonical
+        # motifs, so "N", "R", "Y" and friends would all KeyError in _tally.
+        if not motif or not set(motif.upper()) <= set("ACGT"):
+            continue
+        prepared.append((
+            locus_row["genotypes"],
+            get_chrom_category(locus_row["trid"]),
+            get_motif_size_category(motif),
+            compute_canonical_motif(motif) if len(motif) <= 6 else None,
+        ))
+    return prepared
+
+
+def _process_trio(child_id, mother_id, father_id, prepared_loci, threshold):
     """Count Mendelian violations for a single trio over the in-memory matrix.
 
     Iterates the child's genotype at every locus, dispatching by chromosome
@@ -336,8 +411,9 @@ def _process_trio(child_id, mother_id, father_id, locus_rows, threshold):
         child_id: Sample id of the child.
         mother_id: Sample id of the mother.
         father_id: Sample id of the father.
-        locus_rows: The in-memory matrix rows (each with ``trid``, ``motif`` and
-            a ``genotypes`` dict mapping sample_id -> cell string).
+        prepared_loci: The ``_prepare_loci`` output for the matrix rows: one
+            ``(genotypes, chrom_category, motif_size_category, canonical_motif)``
+            tuple per scorable locus.
         threshold: Alleles match if they differ by strictly fewer than this many
             repeats.
 
@@ -349,22 +425,10 @@ def _process_trio(child_id, mother_id, father_id, locus_rows, threshold):
     stats = _new_trio_stats()
     per_motif_stats = {motif: {"violations": 0, "total": 0} for motif in ALL_CANONICAL_MOTIFS}
 
-    for locus_row in locus_rows:
-        genotypes = locus_row["genotypes"]
+    for genotypes, chrom_category, motif_size_category, canonical_motif in prepared_loci:
         child_genotype = parse_genotype(genotypes.get(child_id))
         if child_genotype is None:
             continue
-
-        motif = locus_row["motif"]
-        # Skip loci with a blank motif (len 0 -> get_motif_size_category returns
-        # "0bp", which is not a MOTIF_SIZE_CATEGORIES key and would KeyError in
-        # _tally) or an N-containing motif.
-        if not motif or "N" in motif.upper():
-            continue
-
-        chrom_category = get_chrom_category(locus_row["trid"])
-        motif_size_category = get_motif_size_category(motif)
-        canonical_motif = compute_canonical_motif(motif) if len(motif) <= 6 else None
 
         if chrom_category == "chrY":
             father_genotype = parse_genotype(genotypes.get(father_id))
@@ -397,6 +461,23 @@ def _process_trio(child_id, mother_id, father_id, locus_rows, threshold):
                 for child_allele in child_genotype
             )
             _tally(stats, per_motif_stats, "chrM", motif_size_category, canonical_motif, is_violation)
+
+        elif chrom_category == "chrX" and len(child_genotype) == 1:
+            # A hemizygous son's single X allele comes from the mother, so check_violation
+            # never consults the father here. Requiring his genotype would drop the locus
+            # for no reason, so require only the mother, as on chrM.
+            mother_genotype = parse_genotype(genotypes.get(mother_id))
+            if mother_genotype is None:
+                continue
+            # Same haploid caveat as chrY above: the child has one allele here, so the
+            # "at least 2 distinct alleles" filter only means what it does elsewhere when
+            # the mother is diploid.
+            if len(mother_genotype) > 1 and len(set(child_genotype) | set(mother_genotype)) < 2:
+                continue
+            _tally(
+                stats, per_motif_stats, "chrX", motif_size_category, canonical_motif,
+                check_violation(child_genotype, mother_genotype, None, threshold, "chrX"),
+            )
 
         else:
             mother_genotype = parse_genotype(genotypes.get(mother_id))
@@ -474,8 +555,11 @@ def compute_mendelian_violations(locus_rows, sample_lookup, sample_df, threshold
     """Compute per-sample and per-motif Mendelian-violation rows for all trios.
 
     Drives the computation entirely from the in-memory matrix (``locus_rows``)
-    and the trio relationships in the sample metadata. Returns ``([], [])`` when
-    no complete trio exists, so the caller can skip writing the Mendelian tables.
+    and the trio relationships in the sample metadata. Trios whose child or
+    parents are not genotype columns of the matrix are dropped (the metadata can
+    describe samples the matrix does not carry), so every returned row comes from
+    a trio that was actually compared. Returns ``([], [])`` when no genotyped
+    complete trio exists, so the caller can skip writing the Mendelian tables.
 
     Args:
         locus_rows: The in-memory matrix rows from
@@ -497,6 +581,7 @@ def compute_mendelian_violations(locus_rows, sample_lookup, sample_df, threshold
         are empty when there are no trios.
     """
     trios = find_trios(sample_df if sample_df is not None else sample_lookup)
+    trios = _keep_genotyped_trios(trios, locus_rows)
     if not trios:
         return [], []
 
@@ -505,11 +590,14 @@ def compute_mendelian_violations(locus_rows, sample_lookup, sample_df, threshold
     per_sample_column_names = per_sample_columns()
     per_motif_column_names = per_motif_columns()
 
+    # Derived once here rather than per trio: none of these values depends on the trio.
+    prepared_loci = _prepare_loci(locus_rows)
+
     per_sample_rows = []
     per_motif_rows = []
     for child_id, mother_id, father_id in trios:
         stats, per_motif_stats = _process_trio(
-            child_id, mother_id, father_id, locus_rows, threshold)
+            child_id, mother_id, father_id, prepared_loci, threshold)
 
         per_sample_values = [child_id]
         total_violations = 0

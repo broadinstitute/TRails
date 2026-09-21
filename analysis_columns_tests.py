@@ -367,8 +367,8 @@ class AddGeneColumnsTests(unittest.TestCase):
 class OutputColumnsTests(unittest.TestCase):
 
     def test_exact_count_and_uniqueness(self):
-        self.assertEqual(len(OUTPUT_COLUMNS), 129)
-        self.assertEqual(len(set(OUTPUT_COLUMNS)), 129)
+        self.assertEqual(len(OUTPUT_COLUMNS), 131)
+        self.assertEqual(len(set(OUTPUT_COLUMNS)), 131)
 
     def test_anchor_positions(self):
         # Spot-check load-bearing positions from the blueprint's numbered schema.
@@ -378,6 +378,7 @@ class OutputColumnsTests(unittest.TestCase):
         self.assertEqual(OUTPUT_COLUMNS[33], "inheritance")  # col 34
         self.assertEqual(OUTPUT_COLUMNS[34], "FirstAffectedAlleleSize_AllAlleles")  # col 35
         self.assertEqual(OUTPUT_COLUMNS[128], "VariationClusterSizeDiff")  # col 129
+        self.assertEqual(OUTPUT_COLUMNS[130], "VariationClusterFilterReason")  # col 131
 
 
 if __name__ == "__main__":

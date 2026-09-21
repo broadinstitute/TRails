@@ -2,6 +2,7 @@
 # package for small pieces of functionality (e.g. canonical-motif / locus-id parsing are
 # reimplemented in motif_utilities.py rather than pulled from str-analysis).
 flask            # the local results server
-pandas           # TSV I/O + SQLite writing convenience
+pandas           # TSV I/O + the dataframes the analysis pipeline passes around
 numpy            # numeric helpers used by the analysis columns
 intervaltree     # interval-overlap lookups for known-disease-locus matching
+duckdb>=1.0      # the result-database engine; >=1.0 for the stable on-disk format

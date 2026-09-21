@@ -110,7 +110,7 @@ ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED = {normalize_column_name(name): name f
     "ReferenceRegion", "NumRepeatsInReference", "CanonicalMotif", "MotifSize",
     "Chrom", "Start0Based", "End1Based", "KnownDiseaseLocus", "IsKnownMotif",
     "IsInMendelianGene", "Source", "NonCodingAnnotations", "RepeatMaskerIntervals",
-    "VariationClusterSizeDiff",
+    "VariationClusterSizeDiff", "VariationCluster", "VariationClusterFilterReason",
 ]}
 # Per-cohort population-stat / TRExplorer annotation columns share these header
 # prefixes (e.g. HPRC256_99thPercentile, AoU1027_Mode, TRExplorerMotif). They are
@@ -423,20 +423,21 @@ def read_gene_table(path):
     # in pLI_v2/pLI_v4 arrives as the literal string and analysis_columns.add_gene_columns dies on
     # float(".").
     df = pandas.read_table(path, na_values=["."])
-    if "gene_id" not in df.columns:
-        raise ValueError(
-            f"Gene table {path} is missing a required 'gene_id' column; "
-            f"found columns: {list(df.columns)[:10]}"
-        )
 
     # Matched with match_columns rather than by exact name, so this reader honors the
     # case/underscore-insensitive rule the module docstring states for every input table: a header
-    # spelled "PLI_V4" or "gene symbol" would otherwise be silently dropped.
+    # spelled "Gene_ID", "PLI_V4" or "gene symbol" would otherwise be silently dropped (or, for the
+    # required gene_id column, rejected outright).
     matches = match_columns(df, [
         "gene_id", "gene_symbol", "gene_aliases", "pLI_v2", "pLI_v4",
         "lof_oe_ci_upper_v4", "hgnc_gene_id", "inheritance", "disease_category",
         "LLM_phenotype_summary", "sources",
     ])
+    if "gene_id" not in matches:
+        raise ValueError(
+            f"Gene table {path} is missing a required 'gene_id' column; "
+            f"found columns: {list(df.columns)[:10]}"
+        )
     df = df.rename(columns={actual: logical for logical, actual in matches.items()})
     columns_to_keep = list(matches)
 

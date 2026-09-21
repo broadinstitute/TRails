@@ -60,10 +60,11 @@ if [[ -n "$TRAILS_DIR" && "${INSTALL_DIR_EXPLICIT:-}" == "1" ]]; then
 fi
 
 # Bootstrap mode: no local checkout -> download + extract the repo. Needs only curl + tar
-# + python3 (no git, no jq). Idempotent, resumable, and self-updating:
+# + python3 (no git, no jq). Idempotent and self-updating:
 #   - an existing up-to-date copy is reused (no work);
 #   - if the remote $TRAILS_VERSION has advanced, it is re-downloaded seamlessly;
-#   - a partial tarball from an interrupted run is discarded and refetched;
+#   - a partial tarball from an interrupted run is discarded and the download restarts from
+#     the beginning (GitHub's archive endpoint cannot resume), so re-running is always safe;
 #   - TRAILS_FORCE=1 forces a fresh re-download.
 # The installed commit is recorded in $INSTALL_DIR/.trails_version.
 if [[ -z "$TRAILS_DIR" ]]; then
@@ -113,19 +114,39 @@ except Exception: pass" 2>/dev/null || true)"
     rm -f "$_tarball"
     curl -fL --retry 3 -o "$_tarball" "$tarball_url"
     # Stage the new tree, then replace the old one, so a file the new revision no longer
-    # ships does not survive. The prune is gated on .trails_version so it only ever runs
-    # against a directory this installer created, never an arbitrary path.
+    # ships does not survive.
     _staging="$INSTALL_DIR/.trails_src_staging"
     rm -rf "$_staging"
     mkdir -p "$_staging"
     tar -xz -f "$_tarball" -C "$_staging" --strip-components=1
-    if [[ -f "$VERSION_FILE" ]]; then
-      # reference_data/ is the download cache, not part of the source tree, so it stays.
-      find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 \
-          ! -name 'reference_data' ! -name '.trails_src_staging' \
-          ! -name '.trails_src.*' ! -name '.trails_version' -exec rm -rf {} +
+    # Prune only the files this installer itself shipped: .trails_manifest lists what the
+    # previous run installed, so a file the new revision drops is removed while everything
+    # else in the directory (the result database, the notes/tags database, input TSVs,
+    # reference_data/) is left untouched. An install made before the manifest existed has
+    # nothing to compare against, so that one run prunes nothing.
+    _manifest="$INSTALL_DIR/.trails_manifest"
+    _manifest_new="$INSTALL_DIR/.trails_manifest.new"
+    (cd "$_staging" && find . ! -type d -print | sed 's|^\./||') | LC_ALL=C sort > "$_manifest_new"
+    if [[ -f "$_manifest" ]]; then
+      LC_ALL=C comm -23 <(LC_ALL=C sort "$_manifest") "$_manifest_new" | while IFS= read -r _rel; do
+        # These paths come out of a downloaded tarball, so refuse any that could point outside
+        # the install directory rather than trusting them.
+        [[ -n "$_rel" ]] || continue
+        [[ "$_rel" == /* || "$_rel" == *..* ]] && continue
+        rm -f "$INSTALL_DIR/$_rel"
+        # Drop the directories that held it, innermost first, if the removal emptied them.
+        _dir="$(dirname "$_rel")"
+        while [[ "$_dir" != "." && "$_dir" != "/" ]]; do
+          rmdir "$INSTALL_DIR/$_dir" 2>/dev/null || break
+          _dir="$(dirname "$_dir")"
+        done
+      done
+    elif [[ -f "$VERSION_FILE" ]]; then
+      echo "  note: this install predates the file manifest, so files dropped by earlier revisions"
+      echo "        may still be present; later updates will track and remove them."
     fi
     (cd "$_staging" && tar -cf - .) | (cd "$INSTALL_DIR" && tar -xf -)
+    mv "$_manifest_new" "$_manifest"
     rm -rf "$_staging"
     rm -f "$INSTALL_DIR"/.trails_src.*.tar.gz   # clean up only after a successful extract
     printf '%s\n' "${remote_sha:-$TRAILS_VERSION}" > "$VERSION_FILE"
@@ -148,7 +169,7 @@ mkdir -p "$REF_DIR"
 
 # --- Python dependencies ------------------------------------------------------------
 echo "Installing Python dependencies..."
-python3 -m pip install -r "$TRAILS_DIR/requirements.txt"   # flask, pandas, numpy, intervaltree, requests
+python3 -m pip install -r "$TRAILS_DIR/requirements.txt"   # flask, pandas, numpy, intervaltree, duckdb
 # pyhpo only sharpens phenotype scoring (phenotype_scoring falls back to Jaccard without it), so a
 # failure here must not abort the install the way a required dependency would. Installed by name
 # rather than from a requirements file, so it cannot fail the required set alongside it.

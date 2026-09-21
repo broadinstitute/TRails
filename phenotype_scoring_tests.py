@@ -15,8 +15,18 @@ from phenotype_scoring import (
     compute_phenotype_scores,
     compute_similarity_pyhpo,
     get_qualifying_samples,
+    resolvable_hpo_terms,
     score_patient_vs_gene_filtered,
 )
+
+
+def pyhpo_is_installed():
+    """Return True if the optional pyhpo dependency can be imported."""
+    try:
+        import pyhpo  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 class ForceJaccardTestCase(unittest.TestCase):
@@ -227,8 +237,10 @@ class ComputePhenotypeScoresTests(ForceJaccardTestCase):
         )
         self.assertEqual(per_outlier, [])
         self.assertEqual(per_locus, [])
-        # No phenotype columns added to records.
+        # The keys are absent rather than present-and-None, which is why the loci writer
+        # (whose schema comes from the record keys) omits the columns entirely.
         self.assertNotIn("MaxGenePhenoSim_AllAlleles", records[0])
+        self.assertNotIn("SumPairwiseSim_AllAlleles", records[0])
 
     def test_per_locus_aggregation(self):
         records = self._records()
@@ -253,11 +265,13 @@ class ComputePhenotypeScoresTests(ForceJaccardTestCase):
         # shared raw: s1&s2={A,B}=2, s2&s3={}=0 ; sum=2
         self.assertEqual(locus_row["sum_pairwise_shared_raw"], 2)
         self.assertEqual(locus_row["sum_pairwise_shared_ic"], 2.0)
-        # denormalized passthroughs
-        self.assertEqual(locus_row["IsKnownMotif"], 1)
-        self.assertEqual(locus_row["FirstAffectedAlleleSize"], 50)
-        self.assertEqual(locus_row["NumAffectedAboveUnaffected"], 3)
-        self.assertEqual(locus_row["NumAffectedFamiliesAboveUnaffected"], 2)
+        # The row carries only the score columns the server selects; annotations such as
+        # IsKnownMotif and MotifSize live in the loci table under the same LocusId.
+        self.assertEqual(sorted(locus_row), [
+            "locus_id", "max_gene_phenotype_similarity", "num_qualifying_samples",
+            "outlier_type", "qualifying_sample_ids", "sum_pairwise_shared_ic",
+            "sum_pairwise_shared_raw", "sum_pairwise_similarity",
+        ])
 
         # Records augmented with denormalized phenotype columns.
         self.assertEqual(records[0]["MaxGenePhenoSim_AllAlleles"], 1.0)
@@ -298,6 +312,40 @@ class ComputePhenotypeScoresTests(ForceJaccardTestCase):
         self.assertIsNone(locus_row["max_gene_phenotype_similarity"])
         # pairwise still computed.
         self.assertEqual(locus_row["sum_pairwise_similarity"], 1.0)
+
+
+@unittest.skipUnless(pyhpo_is_installed(), "pyhpo is not installed")
+class PyhpoUnknownTermTests(unittest.TestCase):
+    """With pyhpo installed, an unknown HPO id must not zero a whole score.
+
+    pyhpo's HPOSet.from_queries raises for the entire set when any single term is
+    unknown, so a retired or misspelled id used to make the whole similarity 0.0.
+    These tests use the real ontology (HP:0001250 Seizure, HP:0001263 Global
+    developmental delay) and skip when pyhpo is not installed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # resolvable_hpo_terms assumes ensure_ontology has already succeeded, so build the
+        # ontology here rather than depending on an earlier test having built it.
+        if not phenotype_scoring.ensure_ontology():
+            raise unittest.SkipTest("the pyhpo ontology could not be initialized")
+
+    def test_unknown_term_is_dropped(self):
+        self.assertEqual(
+            resolvable_hpo_terms(["HP:0001250", "HP:9999999", "not-an-hpo-id"]),
+            ["HP:0001250"],
+        )
+
+    def test_unknown_term_does_not_zero_the_similarity(self):
+        valid_only = compute_similarity_pyhpo(["HP:0001250"], ["HP:0001263"])
+        self.assertGreater(valid_only, 0.0)
+        with_unknown_term = compute_similarity_pyhpo(
+            ["HP:0001250", "HP:9999999"], ["HP:0001263"])
+        self.assertEqual(with_unknown_term, valid_only)
+
+    def test_only_unknown_terms_scores_zero(self):
+        self.assertEqual(compute_similarity_pyhpo(["HP:9999999"], ["HP:0001263"]), 0.0)
 
 
 if __name__ == "__main__":

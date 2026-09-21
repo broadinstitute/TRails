@@ -1,5 +1,7 @@
 """Unit tests for locus_annotations.py."""
 
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -130,6 +132,117 @@ class AddDerivedLocusColumnsTests(unittest.TestCase):
         self.assertEqual(records[1]["gene_id"], "ENSG2")
         self.assertEqual(records[1]["gene_region"], "intron")
         self.assertEqual(records[1]["gene_region_rank"], 5)
+
+    def test_supplied_gene_region_rank_is_ignored_and_reported(self):
+        # gene_region_rank is always derived from gene_region, so a rank the input matrix
+        # supplied is dropped (here there is no gene_region, so the derived rank is None).
+        records = [
+            {"LocusId": "1-10-22-AT", "Motif": "AT", "gene_region_rank": 3},
+            {"LocusId": "1-30-42-AT", "Motif": "AT"},
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            locus_annotations.add_derived_locus_columns(records)
+        self.assertIsNone(records[0]["gene_region_rank"])
+        self.assertIsNone(records[1]["gene_region_rank"])
+        self.assertIn("ignored the gene_region_rank supplied by the input matrix for 1 of 2 loci",
+                      output.getvalue())
+
+    def test_supplied_gene_region_rank_never_disagrees_with_gene_region(self):
+        # The whole point of deriving the rank: the stored rank always matches the region the
+        # locus actually has, even when the matrix supplied a rank for a different region.
+        records = [{"LocusId": "1-10-22-AT", "Motif": "AT", "gene_region": "intron",
+                    "gene_region_rank": 1}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            locus_annotations.add_derived_locus_columns(records)
+        self.assertEqual(records[0]["gene_region"], "intron")
+        self.assertEqual(records[0]["gene_region_rank"], 5)
+
+    def test_non_numeric_gene_region_rank_is_replaced_by_derived_rank(self):
+        records = [{"LocusId": "1-10-22-AT", "Motif": "AT", "gene_region": "CDS",
+                    "gene_region_rank": "high"}]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            locus_annotations.add_derived_locus_columns(records)
+        # A string rank would make the loci-table column VARCHAR; the derived rank wins.
+        self.assertEqual(records[0]["gene_region_rank"], 1)
+        self.assertIn("ignored the gene_region_rank supplied by the input matrix for 1 of 1 loci",
+                      output.getvalue())
+
+    def test_no_supplied_gene_region_rank_prints_nothing(self):
+        records = [{"LocusId": "1-10-22-AT", "Motif": "AT", "gene_region": "CDS"}]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            locus_annotations.add_derived_locus_columns(records)
+        self.assertEqual(records[0]["gene_region_rank"], 1)
+        self.assertEqual(output.getvalue(), "")
+
+
+class LocusIdValidationTests(unittest.TestCase):
+
+    def test_locus_id_with_too_few_fields_names_column_value_and_file(self):
+        records = [{"LocusId": "ATXN1", "Motif": "CAG"}]
+        with self.assertRaises(ValueError) as raised:
+            locus_annotations.add_derived_locus_columns(
+                records, repeat_copy_numbers_tsv="/data/matrix.tsv")
+        message = str(raised.exception)
+        self.assertIn("'trid'", message)
+        self.assertIn("'ATXN1'", message)
+        self.assertIn("/data/matrix.tsv", message)
+
+    def test_locus_id_with_too_many_fields_is_rejected(self):
+        records = [{"LocusId": "chr1-100-110-CAG-extra", "Motif": "CAG"}]
+        with self.assertRaises(ValueError) as raised:
+            locus_annotations.add_derived_locus_columns(records)
+        self.assertIn("'chr1-100-110-CAG-extra'", str(raised.exception))
+
+    def test_locus_id_with_non_integer_coordinates_is_rejected(self):
+        records = [{"LocusId": "chr1-start-end-CAG", "Motif": "CAG"}]
+        with self.assertRaises(ValueError) as raised:
+            locus_annotations.add_derived_locus_columns(
+                records, repeat_copy_numbers_tsv="/data/matrix.tsv")
+        message = str(raised.exception)
+        self.assertIn("integer start and end", message)
+        self.assertIn("'chr1-start-end-CAG'", message)
+        self.assertIn("/data/matrix.tsv", message)
+
+    def test_error_names_the_matrix_generically_when_the_path_is_unknown(self):
+        with self.assertRaises(ValueError) as raised:
+            locus_annotations.parse_locus_id("chr1_100_110_CAG")
+        self.assertIn("the repeat-copy-numbers matrix", str(raised.exception))
+
+    def test_well_formed_locus_id_parses(self):
+        self.assertEqual(
+            locus_annotations.parse_locus_id("chr1-100-110-CAG"), ("chr1", 100, 110, "CAG"))
+
+
+class MotifValidationTests(unittest.TestCase):
+
+    def test_decorated_motif_names_locus_column_value_and_file(self):
+        records = [{"LocusId": "chr1-100-110-CAG", "Motif": "(CAG)n"}]
+        with self.assertRaises(ValueError) as raised:
+            locus_annotations.add_derived_locus_columns(
+                records, repeat_copy_numbers_tsv="/data/matrix.tsv")
+        message = str(raised.exception)
+        self.assertIn("'motif'", message)
+        self.assertIn("chr1-100-110-CAG", message)
+        self.assertIn("'(CAG)n'", message)
+        self.assertIn("/data/matrix.tsv", message)
+
+    def test_iupac_ambiguity_codes_are_accepted(self):
+        # compute_canonical_motif handles the whole IUPAC table, so a motif made of ambiguity
+        # codes must not be rejected; only characters outside the table are.
+        records = [{"LocusId": "chr1-100-110-CRG", "Motif": "crg"}]
+        locus_annotations.add_derived_locus_columns(records)
+        self.assertEqual(records[0]["CanonicalMotif"], "CRG")
+
+    def test_empty_motif_is_still_tolerated(self):
+        # A blank motif cell leaves NumRepeatsInReference NULL rather than failing the build.
+        records = [{"LocusId": "chr1-100-110-", "Motif": ""}]
+        locus_annotations.add_derived_locus_columns(records)
+        self.assertEqual(records[0]["MotifSize"], 0)
+        self.assertIsNone(records[0]["NumRepeatsInReference"])
+        self.assertEqual(records[0]["CanonicalMotif"], "")
 
 
 def _make_catalog_file(loci):
@@ -320,6 +433,52 @@ class MatchesDiseaseLocusTests(unittest.TestCase):
                 "9-999-1030-CAG", self.interval_trees, strchive_trees),
             "STR_FALLBACK")
 
+    def test_strchive_fallback_matches_a_pathogenic_motif(self):
+        # The pathogenic motif differs from the reference one, which is the case this fallback
+        # exists for: matching only the reference motif would miss the expansion.
+        strchive_trees = {"9": intervaltree.IntervalTree()}
+        strchive_trees["9"].addi(999, 1030, data={
+            "locus_id": "STR_PATHOGENIC",
+            "reference_motif_reference_orientation": ["AAAAG"],
+            "pathogenic_motif_reference_orientation": ["AAGGG"],
+        })
+        self.assertEqual(
+            locus_annotations.matches_disease_locus(
+                "9-999-1030-AAGGG", self.interval_trees, strchive_trees),
+            "STR_PATHOGENIC")
+        # The same locus's motif also counts as known, so IsKnownMotif agrees with
+        # KnownDiseaseLocus.
+        self.assertIn(
+            locus_annotations.compute_canonical_motif("AAGGG", include_reverse_complement=True),
+            locus_annotations.collect_known_disease_canonical_motifs({}, strchive_trees))
+
+
+class StrchiveLocusMotifsTests(unittest.TestCase):
+    """The one definition of a STRchive locus's motif list, shared by the build and the server."""
+
+    def test_both_lists_are_returned_reference_first(self):
+        self.assertEqual(
+            locus_annotations.strchive_locus_motifs({
+                "reference_motif_reference_orientation": ["AAAAG"],
+                "pathogenic_motif_reference_orientation": ["AAGGG", "AGGGG"],
+            }),
+            ["AAAAG", "AAGGG", "AGGGG"])
+
+    def test_missing_and_null_lists_are_treated_as_empty(self):
+        self.assertEqual(locus_annotations.strchive_locus_motifs({}), [])
+        self.assertEqual(
+            locus_annotations.strchive_locus_motifs({
+                "reference_motif_reference_orientation": None,
+                "pathogenic_motif_reference_orientation": ["AAGGG"],
+            }),
+            ["AAGGG"])
+
+    def test_the_server_uses_this_definition(self):
+        # results_server's locus-detail fallback used to keep its own reference-only copy of this
+        # list, which is how it came to disagree with the build about known disease loci.
+        self.assertIs(results_server.strchive_locus_motifs,
+                      locus_annotations.strchive_locus_motifs)
+
 
 class KnownMotifAndMendelianGeneTests(unittest.TestCase):
 
@@ -363,9 +522,6 @@ class KnownMotifAndMendelianGeneTests(unittest.TestCase):
         self.assertEqual(locus_annotations.is_in_mendelian_gene(None, gene_lookup), 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class PathogenicMotifsNullTests(unittest.TestCase):
     """WS2: PathogenicMotifs explicitly null must not raise TypeError."""
@@ -384,3 +540,7 @@ class PathogenicMotifsNullTests(unittest.TestCase):
         result = results_server.compute_known_disease_info(row, lookups)
         self.assertIsNotNone(result)
         self.assertEqual(result["locus_id"], "DISEASE_AT")
+
+
+if __name__ == "__main__":
+    unittest.main()

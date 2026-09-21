@@ -7,12 +7,13 @@ and populated outlier columns — and that a re-run is idempotent.
 """
 
 import os
-import sqlite3
 import tempfile
 import unittest
 
 import analysis_columns
 import build_database
+import duckdb_compat
+import result_database
 
 
 def _write_tsv(path, header, rows):
@@ -24,13 +25,12 @@ def _write_tsv(path, header, rows):
 
 
 def _table_names(connection):
-    return {row[0] for row in connection.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'")}
+    return duckdb_compat.list_tables(connection)
 
 
 def _table_columns(connection, table_name):
-    return [row[1] for row in connection.execute(
-        f"SELECT * FROM pragma_table_info('{table_name}')")]
+    return [column[0] for column in
+            connection.execute(f"SELECT * FROM {table_name} LIMIT 0").description]
 
 
 class BuildDatabaseEndToEndTests(unittest.TestCase):
@@ -43,7 +43,7 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
         self.matrix_path = os.path.join(self.directory, "matrix.tsv")
         self.metadata_path = os.path.join(self.directory, "samples.tsv")
         self.phenotypes_path = os.path.join(self.directory, "phenotypes.tsv")
-        self.db_path = os.path.join(self.directory, "result.db")
+        self.db_path = os.path.join(self.directory, "result.duckdb")
 
         sample_ids = ["CHILD", "MOTHER", "FATHER", "SINGLE1", "SINGLE2"]
 
@@ -100,12 +100,15 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
         self.assertTrue(os.path.exists(self.db_path))
         self.assertFalse(os.path.exists(self.db_path + ".tmp"))
 
-        connection = sqlite3.connect(self.db_path)
+        connection = duckdb_compat.connect(self.db_path)
         try:
             tables = _table_names(connection)
-            for required in ["loci", "swim_plot", "sk_AllAlleles", "sk_ShortAlleles",
-                             "sk_HemizygousAlleles"]:
+            for required in ["loci", "swim_plot", "metadata"]:
                 self.assertIn(required, tables)
+
+            # The callset size recorded for the results server: the matrix's five
+            # sample columns.
+            self.assertEqual(result_database.read_sample_count(connection), 5)
 
             # Phenotype tables: two phenotyped affected/unsolved samples carry HPO
             # terms, so qualifying samples exist and the tables are written.
@@ -171,7 +174,7 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
 
     def _snapshot(self):
         """Return a deterministic snapshot of the built database's loci table."""
-        connection = sqlite3.connect(self.db_path)
+        connection = duckdb_compat.connect(self.db_path)
         try:
             columns = _table_columns(connection, "loci")
             rows = connection.execute(
@@ -185,7 +188,7 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
         # produces a valid database; phenotype + Mendelian tables behave per their
         # skip rules (Mendelian still written because the trio exists).
         build_database.build(self.matrix_path, self.metadata_path, self.db_path)
-        connection = sqlite3.connect(self.db_path)
+        connection = duckdb_compat.connect(self.db_path)
         try:
             tables = _table_names(connection)
             self.assertIn("loci", tables)

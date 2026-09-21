@@ -103,21 +103,6 @@
         </div>
     </div>
 
-    <!-- Source (database selector) — only shown if more than one database is available -->
-    {% if db_labels | length > 1 %}
-    <div class="field">
-        <label>Source Database</label>
-        <div class="radio-group">
-            {% for label in db_labels %}
-            <div class="ui radio checkbox">
-                <input type="radio" name="source" value="{{ label }}" {{ 'checked' if loop.first else '' }}>
-                <label>{{ label }}</label>
-            </div>
-            {% endfor %}
-        </div>
-    </div>
-    {% endif %}
-
     </div>
     <!-- Right column: checkbox fields -->
     <div class="ten wide column">
@@ -211,8 +196,21 @@
             <input type="text" name="motif" placeholder="e.g., CCG, CAG">
         </div>
         <div class="field">
-            <label style="display: inline;">Max Variation Cluster Size Diff (bp)</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="Keeps loci whose <b>variation cluster</b> is at most this many base pairs larger than the tandem repeat itself.<br /><br />TRExplorer annotates some repeats with a surrounding variation cluster: a wider interval that also varies between people. A large difference means most of the variation lies outside the repeat being genotyped.<br /><br />Loci with no variation cluster have no variation beyond the repeat itself, so they are kept whatever value you enter."></i>
+            <label style="display: inline;">Max Variation Cluster Size Diff (bp)</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="Keeps loci whose <b>variation cluster</b> is at most this many base pairs larger than the tandem repeat itself.<br /><br />TRExplorer annotates some repeats with a surrounding variation cluster: a wider interval that also varies between people. A large difference means most of the variation lies outside the repeat being genotyped.<br /><br />Loci with no variation cluster size are kept whatever value you enter, because there is no size to compare against: TRExplorer either never annotated a cluster there or computed one and then filtered it out (see the next filter)."></i>
             <input type="number" name="max_variation_cluster_size_diff" min="0" placeholder="e.g., 20" style="display: block;">
+        </div>
+        <div class="field">
+            <label style="display: inline;">Exclude Filtered-Out Variation Clusters</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="Drops loci where TRExplorer computed a <b>variation cluster</b> and then threw it away, which the VC column marks with a crossed-out circle.<br /><br /><b>Depth:</b> the region had too little coverage in the PacBio HiFi population dataset used to build variation clusters, so no cluster could be computed. Shown in gold.<br /><br /><b>Size:</b> a cluster was computed but was wider than the maximum allowed, so it was thrown out. Shown in dark red.<br /><br />Either way TRExplorer has no verdict on whether the repeat sits inside a variation cluster. Loci it did annotate, and loci it never filtered, are unaffected by these two boxes."></i>
+            <div class="checkbox-group">
+                <div class="ui checkbox">
+                    <input type="checkbox" name="exclude_vc_depth_filtered">
+                    <label><i class="times circle outline icon" style="color: gold;"></i>Depth-filtered</label>
+                </div>
+                <div class="ui checkbox">
+                    <input type="checkbox" name="exclude_vc_size_filtered">
+                    <label><i class="times circle outline icon" style="color: darkred;"></i>Size-filtered</label>
+                </div>
+            </div>
         </div>
     </div>
     <div class="column">
@@ -290,6 +288,10 @@
                 <input type="checkbox" name="sort_by" value="sigma_aou_rank">
                 <label>σ<sub>AoU1027</sub> Rank</label>
             </div>
+            <div class="ui checkbox">
+                <input type="checkbox" name="sort_by" value="variation_cluster">
+                <label>Variation Cluster Size</label>
+            </div>
         </div>
     </div>
 
@@ -325,7 +327,7 @@
                                 <th class="col-row-num">#</th>
                                 <th class="col-locus">Locus</th>
                                 <th class="col-motif">Motif</th>
-                                <th class="col-region" data-sort="region">Region</th>
+                                <th class="col-region" data-sort="region">Region<span class="sort-icon">&#8597;</span></th>
                                 <th class="col-gene">Gene</th>
                                 <th class="col-allele col-numeric" data-sort="size">Allele<span class="sort-icon">&#8597;</span></th>
                                 <th class="col-delta-ref col-numeric">&Delta;ref</th>
@@ -336,6 +338,7 @@
                                 <th class="col-pli col-numeric">pLI</th>
                                 <th class="col-sigma-hprc col-numeric">σ<sub>HPRC256</sub></th>
                                 <th class="col-sigma-aou col-numeric">σ<sub>AoU1027</sub></th>
+                                <th class="col-vc" data-sort="variation_cluster" title="TRExplorer variation cluster: how many base pairs wider the surrounding variation cluster is than the repeat itself">VC<span class="sort-icon">&#8597;</span></th>
                                 <th class="col-gene-pheno-sim col-numeric" title="Max gene-phenotype similarity across samples">Gene Pheno</th>
                                 <th class="col-pairwise-sim col-numeric" title="Sum of pairwise phenotype similarities">2-Samp Pheno</th>
                             </tr>
@@ -524,29 +527,18 @@ $(document).ready(function() {
         $(this).closest('.ui.message').hide();
     });
 
-    // Update total loci count for the selected source database
-    // `source` defaults to the committed currentState.source; the source radio's change
-    // handler passes the live selection so the count label can preview a source WITHOUT
-    // committing it to currentState (that only happens in readStateFromUI on Search).
-    function updateTotalLociCount(source) {
-        source = source || currentState.source;
-        fetch(`${API_BASE_URL}/schema?source=${encodeURIComponent(source)}`)
+    // Update the total loci count for the database being viewed
+    function updateTotalLociCount() {
+        fetch(`${API_BASE_URL}/schema?source=${encodeURIComponent(currentState.source)}`)
             .then(r => r.json())
             .then(data => {
-                const label = data.available_sources.length > 1
-                    ? `${source} Database: ${data.total_loci.toLocaleString()} loci`
-                    : `${data.total_loci.toLocaleString()} loci`;
-                $('#total-loci-label').text(label);
+                let counts = `${data.total_loci.toLocaleString()} loci`;
+                if (data.total_samples != null) {
+                    counts += `, ${data.total_samples.toLocaleString()} samples`;
+                }
+                $('#total-loci-label').text(counts);
             });
     }
-
-    // Preview the loci count when the source radio changes, but do NOT commit the selection
-    // to currentState — that happens in readStateFromUI() on Search. Committing here would
-    // desync currentState.source from the source the displayed results were loaded with,
-    // making detail-expansion fetches and Mendelian warnings use the wrong source.
-    $('input[name="source"]').on('change', function() {
-        updateTotalLociCount($(this).val());
-    });
 
     // Initialize tag dropdown
     $('#tag-filter').dropdown({
@@ -555,7 +547,12 @@ $(document).ready(function() {
         fullTextSearch: true,
         maxResults: 10,
     });
-    populateTagDropdown().then(() => {
+    // Kept as a promise because the startup restore below has to wait for it: applyStateToUI
+    // selects the saved tag by value, and a 'set selected' for a value the menu does not contain
+    // yet is a silent no-op, so the next Search or Export (both re-read the dropdown through
+    // readStateFromUI) would drop the tag.
+    const tagDropdownReady = populateTagDropdown();
+    tagDropdownReady.then(() => {
         // Cache all tags for prompt hints
         fetch(`${API_BASE_URL}/annotations/tags`)
             .then(r => r.json())
@@ -579,7 +576,7 @@ $(document).ready(function() {
         maxResults: 10,
     });
 
-    populateSampleIdDropdown().then(() => {
+    Promise.all([tagDropdownReady, populateSampleIdDropdown()]).then(() => {
         // Read URL state and perform initial search after dropdowns are populated
         readStateFromUrl();
         updateTotalLociCount();
@@ -611,6 +608,8 @@ const DEFAULT_STATE = {
     known_loci_only: false,
     known_motifs_only: false,
     mendelian_genes_only: false,
+    exclude_vc_depth_filtered: false,
+    exclude_vc_size_filtered: false,
     gene_regions: '',
     exclude_gene_regions: '',
     min_expansion: '',
@@ -717,7 +716,7 @@ function applyStateToUI() {
     // Radio buttons
     for (const name of ['outlier_type', 'require_above_unaffected',
                         'require_families_above_unaffected',
-                        'require_above_population', 'source']) {
+                        'require_above_population']) {
         const val = currentState[name] || '';
         $(`input[name="${name}"][value="${val}"]`).parent().checkbox('check');
     }
@@ -730,7 +729,8 @@ function applyStateToUI() {
     $(`input[name="population_metric"][value="${currentState.population_metric || '99th'}"]`).prop('checked', true);
 
     // Boolean checkboxes
-    for (const name of ['apply_pathogenic_threshold', 'known_loci_only', 'known_motifs_only', 'mendelian_genes_only', 'include_loci_without_population_data']) {
+    for (const name of ['apply_pathogenic_threshold', 'known_loci_only', 'known_motifs_only', 'mendelian_genes_only',
+                        'exclude_vc_depth_filtered', 'exclude_vc_size_filtered', 'include_loci_without_population_data']) {
         const cb = $(`input[name="${name}"]`).parent();
         currentState[name] ? cb.checkbox('check') : cb.checkbox('uncheck');
     }
@@ -784,13 +784,14 @@ function readStateFromUI() {
     currentState.require_above_population = $('input[name="require_above_population"]:checked').val() || '';
     currentState.population_metric = $('input[name="population_metric"]:checked').val() || '99th';
     currentState.include_loci_without_population_data = $('input[name="include_loci_without_population_data"]').parent().checkbox('is checked');
-    currentState.source = $('input[name="source"]:checked').val() || DEFAULT_STATE.source;
 
     // Boolean checkboxes
     currentState.apply_pathogenic_threshold = $('input[name="apply_pathogenic_threshold"]').parent().checkbox('is checked');
     currentState.known_loci_only = $('input[name="known_loci_only"]').parent().checkbox('is checked');
     currentState.known_motifs_only = $('input[name="known_motifs_only"]').parent().checkbox('is checked');
     currentState.mendelian_genes_only = $('input[name="mendelian_genes_only"]').parent().checkbox('is checked');
+    currentState.exclude_vc_depth_filtered = $('input[name="exclude_vc_depth_filtered"]').parent().checkbox('is checked');
+    currentState.exclude_vc_size_filtered = $('input[name="exclude_vc_size_filtered"]').parent().checkbox('is checked');
 
     // Gene regions
     const geneRegions = [];
@@ -877,7 +878,11 @@ function buildApiUrl() {
     if (currentState.known_loci_only) params.set('known_loci_only', 'true');
     if (currentState.known_motifs_only) params.set('known_motifs_only', 'true');
     if (currentState.mendelian_genes_only) params.set('mendelian_genes_only', 'true');
-    if (currentState.include_loci_without_population_data) params.set('include_loci_without_population_data', 'true');
+    if (currentState.exclude_vc_depth_filtered) params.set('exclude_vc_depth_filtered', 'true');
+    if (currentState.exclude_vc_size_filtered) params.set('exclude_vc_size_filtered', 'true');
+    if (currentState.require_above_population && currentState.include_loci_without_population_data) {
+        params.set('include_loci_without_population_data', 'true');
+    }
 
     return `${API_BASE_URL}/loci?${params.toString()}`;
 }
@@ -913,9 +918,9 @@ function describeFetchError(error) {
 // updating the indicator here keeps the highlighted header consistent with the order
 // actually applied. Radio-only sorts (which have no header column) correctly clear it.
 function syncSortHeaderIndicator() {
-    $('#results-table thead th').removeClass('sorted-asc sorted-desc');
+    $('#results-table thead th').removeClass('sorted-active');
     for (const field of getSortList()) {
-        $(`#results-table thead th[data-sort="${field}"]`).addClass('sorted-desc');
+        $(`#results-table thead th[data-sort="${field}"]`).addClass('sorted-active');
     }
 }
 
@@ -1021,7 +1026,6 @@ async function performSearch() {
         }
         const data = await response.json();
         if (requestId !== searchRequestSeq) return;  // superseded while parsing the response
-        window.searchResults = data;
         renderResults(data);
         renderSummaryCharts(data);
         updatePaginationControls(data);
@@ -1032,7 +1036,7 @@ async function performSearch() {
         console.error('Search error:', error);
         $('#error-text').text(describeFetchError(error));
         $('#error-message').show();
-        $('#results-tbody').html('<tr><td colspan="17" style="color: #888; padding: 20px; text-align: center;">Search failed</td></tr>');
+        $('#results-tbody').html('<tr><td colspan="18" style="color: #888; padding: 20px; text-align: center;">Search failed</td></tr>');
         $('.pagination-container').hide();
         $('#summary-charts-container').hide();
     } finally {
@@ -1082,11 +1086,13 @@ async function performExport(format) {
         if (currentState.require_families_above_unaffected) params.set('require_families_above_unaffected', currentState.require_families_above_unaffected);
         if (currentState.require_above_population) params.set('require_above_population', currentState.require_above_population);
         if (currentState.require_above_population && currentState.population_metric === 'max') params.set('population_metric', 'max');
-        if (currentState.include_loci_without_population_data) params.set('include_loci_without_population_data', '1');
+        if (currentState.require_above_population && currentState.include_loci_without_population_data) params.set('include_loci_without_population_data', '1');
         if (currentState.apply_pathogenic_threshold) params.set('apply_pathogenic_threshold', '1');
         if (currentState.known_loci_only) params.set('known_loci_only', '1');
         if (currentState.known_motifs_only) params.set('known_motifs_only', '1');
         if (currentState.mendelian_genes_only) params.set('mendelian_genes_only', '1');
+        if (currentState.exclude_vc_depth_filtered) params.set('exclude_vc_depth_filtered', '1');
+        if (currentState.exclude_vc_size_filtered) params.set('exclude_vc_size_filtered', '1');
         if (currentState.gene_regions) params.set('gene_regions', currentState.gene_regions);
         if (currentState.exclude_gene_regions) params.set('exclude_gene_regions', currentState.exclude_gene_regions);
         if (currentState.min_expansion) params.set('min_expansion', currentState.min_expansion);
@@ -1149,12 +1155,15 @@ function updateActiveFiltersBar() {
         motif: 'Motif', phenotype_keyword: 'Phenotype', sample_id_keyword: 'Sample ID',
         sample_id_like: 'Sample Keyword', search: 'Search',
         max_variation_cluster_size_diff: 'Max VC Size Diff', tag: 'Tag',
+        exclude_vc_depth_filtered: 'No depth-filtered VC', exclude_vc_size_filtered: 'No size-filtered VC',
     };
     for (const [key, value] of Object.entries(currentState)) {
         if (key === 'page' || key === 'page_size') continue;
         if (key === 'sort_by') continue;  // shown as dedicated priority pills, not a chip
-        // population_metric is only meaningful (and only sent to the API) when require_above_population is set
-        if (key === 'population_metric' && !currentState.require_above_population) continue;
+        // population_metric and include_loci_without_population_data are only meaningful (and only
+        // sent to the API) when require_above_population is set
+        if ((key === 'population_metric' || key === 'include_loci_without_population_data')
+            && !currentState.require_above_population) continue;
         if (value === DEFAULT_STATE[key] || value === '' || value === false) continue;
         const display = value === true ? labels[key] : `${escapeHtml(labels[key] || key)}: ${escapeHtml(value)}`;
         chips.push(`<a class="ui small label filter-chip" data-filter="${escapeHtml(key)}">${display}<i class="delete icon"></i></a>`);
@@ -1372,7 +1381,7 @@ function renderSummaryCharts(data) {
 function renderResults(data) {
     const tbody = $('#results-tbody');
     if (!data.results || data.results.length === 0) {
-        tbody.html('<tr><td colspan="17" style="color: #888; padding: 20px; text-align: center;">No matching results found</td></tr>');
+        tbody.html('<tr><td colspan="18" style="color: #888; padding: 20px; text-align: center;">No matching results found</td></tr>');
         return;
     }
 
@@ -1405,6 +1414,15 @@ function getValueColorClass(alleleSize, popMax, pathogenicMin) {
     if (popMax != null && alleleSize > popMax) return 'val-medium';
     return 'val-neutral';
 }
+
+// Why TRExplorer computed a variation cluster for a repeat and then dropped it. Wording and
+// icon colors follow TRExplorer's own VC column so the two read the same; any reason value
+// not listed here is shown verbatim in orange.
+const VC_FILTER_REASON_TITLES = {
+    'DEPTH': 'Depth Filter: variation cluster not computed due to low depth in this region in the PacBio HiFi population dataset used to generate variation clusters',
+    'EXTENSION': 'Size Filter: variation cluster filtered out because its width exceeded the maximum variation cluster size threshold',
+};
+const VC_FILTER_REASON_COLORS = {'DEPTH': 'gold', 'EXTENSION': 'darkred'};
 
 // 8.4 Row Rendering Function
 function renderLocusRow(locus, rowIndex) {
@@ -1574,6 +1592,33 @@ function renderLocusRow(locus, rowIndex) {
     const sigmaHprc = getSigmaRankText(locus.HPRC256_Stdev, locus.HPRC256_StdevRankByMotif, locus.HPRC256_StdevRankTotalNumberByMotif);
     const sigmaAou = getSigmaRankText(locus.AoU1027_Stdev, locus.AoU1027_StdevRankByMotif, locus.AoU1027_StdevRankTotalNumberByMotif);
 
+    // Variation cluster column, rendered like TRExplorer's VC column, with the popups it opens
+    // on click served here as hover tooltips instead (table rows are re-rendered on every
+    // search, so they carry no Semantic UI popup bindings). Three states, same as TRExplorer:
+    // a check icon and the size difference when a variation cluster was kept for this repeat,
+    // a crossed-out circle when one was computed and then filtered out (gold for the depth
+    // filter, dark red for the size filter, orange for any other reason), and blank when
+    // TRExplorer recorded neither. VariationCluster / VariationClusterFilterReason are optional
+    // input columns (see input_tables.py); a database without them shows only the first state.
+    let vcCell = '';
+    if (locus.VariationClusterSizeDiff != null && locus.VariationClusterSizeDiff !== '') {
+        const vcDiff = Number(locus.VariationClusterSizeDiff);
+        if (Number.isFinite(vcDiff)) {
+            const refSize = (locus.Start0Based != null && locus.End1Based != null) ? locus.End1Based - locus.Start0Based : null;
+            const vcTitle = (locus.VariationCluster ? `Variation Cluster Interval: ${locus.VariationCluster}\n` : '')
+                + 'Variation Cluster Interval Size: '
+                + (refSize != null ? `reference repeat interval size (${refSize.toLocaleString('en-US')} bp) + ` : '')
+                + `${vcDiff.toLocaleString('en-US')} bp`;
+            const vcSign = vcDiff >= 0 ? '+' : '';
+            vcCell = `<span title="${escapeHtml(vcTitle)}"><i class="check circle icon" style="color: #2185d0;"></i>Yes</span>: ${vcSign}${vcDiff.toLocaleString('en-US')}bp`;
+        }
+    } else if (locus.VariationClusterFilterReason) {
+        const vcReason = locus.VariationClusterFilterReason;
+        const vcReasonTitle = VC_FILTER_REASON_TITLES[vcReason] || vcReason;
+        const vcReasonColor = VC_FILTER_REASON_COLORS[vcReason] || 'darkorange';
+        vcCell = `<i class="times circle outline icon" style="color: ${vcReasonColor};" title="${escapeHtml(vcReasonTitle)}"></i>`;
+    }
+
     // UCSC link
     const ucscUrl = 'https://genome.ucsc.edu/cgi-bin/hgTracks?db=hg38&position='
         + encodeURIComponent(locus.Chrom + ':' + (locus.Start0Based + 1) + '-' + locus.End1Based);
@@ -1608,6 +1653,7 @@ function renderLocusRow(locus, rowIndex) {
         <td class="col-pli col-numeric" style="${pliStyle}">${pli}</td>
         <td class="col-sigma-hprc col-numeric"${sigmaHprc.bgColor ? ` style="background-color: ${sigmaHprc.bgColor};"` : ''}>${sigmaHprc.value}${sigmaHprc.rankText ? ` <span style="color: #888; font-size: 0.9em;">${sigmaHprc.rankText}</span>` : ''}</td>
         <td class="col-sigma-aou col-numeric"${sigmaAou.bgColor ? ` style="background-color: ${sigmaAou.bgColor};"` : ''}>${sigmaAou.value}${sigmaAou.rankText ? ` <span style="color: #888; font-size: 0.9em;">${sigmaAou.rankText}</span>` : ''}</td>
+        <td class="col-vc">${vcCell}</td>
         <td class="col-gene-pheno-sim col-numeric" style="${locus.MaxGenePhenoSim >= 0.5 ? 'color: #e65100; font-weight: 600;' : ''}">${locus.MaxGenePhenoSim != null ? locus.MaxGenePhenoSim.toFixed(2) : ''}</td>
         <td class="col-pairwise-sim col-numeric" style="${locus.SumPairwiseSim >= 1.0 ? 'color: #e65100; font-weight: 600;' : ''}">${locus.SumPairwiseSim != null ? locus.SumPairwiseSim.toFixed(2) : ''}</td>
     </tr>`;
@@ -1654,8 +1700,10 @@ $(document).on('click', function(e) {
 
 // 9.1 Click Handler
 // Bind to the whole expand cell (not just the inner toggle icon) so the entire
-// pointer-cursor cell area is clickable, not only the narrow chevron.
-$(document).on('click', '.col-expand', async function() {
+// pointer-cursor cell area is clickable, not only the narrow chevron. Matching `td` only
+// is what keeps the results table's `<th class="col-expand">` header out of this handler;
+// a click there has no locus row, so it used to fetch /loci/undefined.
+$(document).on('click', 'td.col-expand', async function() {
     const $row = $(this).closest('.locus-row');
     const locusId = $row.data('locus-id');
     const $toggle = $(this).find('.expand-toggle');
@@ -1663,9 +1711,11 @@ $(document).on('click', '.col-expand', async function() {
 
     // Toggle off (with slide animation)
     if ($existingDetail.length) {
-        const $td = $existingDetail.find('td');
+        // .children(), not .find(): the rendered detail holds hundreds of nested cells (the
+        // per-sample sub-table and the summary tables), and this wants the row's one outer cell.
+        const $td = $existingDetail.children('td');
         $td.wrapInner('<div class="slide-wrapper"></div>');
-        $td.find('.slide-wrapper').slideUp(200, function() {
+        $td.children('.slide-wrapper').slideUp(200, function() {
             $existingDetail.remove();
             refreshCollapseAllButton();
         });
@@ -1675,7 +1725,7 @@ $(document).on('click', '.col-expand', async function() {
 
     // Show loading
     $toggle.addClass('expanded').html('<i class="chevron down icon"></i>');
-    const $loadingRow = $(`<tr class="locus-detail-row"><td colspan="17" style="padding: 12px 14px; background: #fafafa; border-top: 1px solid #ccc; border-bottom: 2px solid #2185d0;"><div class="ui tiny active inline loader"></div> Loading...</td></tr>`);
+    const $loadingRow = $(`<tr class="locus-detail-row"><td colspan="18" style="padding: 12px 14px; background: #fafafa; border-top: 1px solid #ccc; border-bottom: 2px solid #2185d0;"><div class="ui tiny active inline loader"></div> Loading...</td></tr>`);
     $row.after($loadingRow);
     refreshCollapseAllButton();
 
@@ -1684,11 +1734,11 @@ $(document).on('click', '.col-expand', async function() {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const detail = await response.json();
         const html = renderLocusDetail(detail, currentState.outlier_type);
-        $loadingRow.find('td').html(html);
+        $loadingRow.children('td').html(html);
     } catch (error) {
         // Keep the chevron expanded so it stays consistent with the error detail row left in
         // the DOM; otherwise the next click "collapses" the error row instead of retrying.
-        $loadingRow.find('td').html(`<span style="color: red;">Error: ${escapeHtml(error.message)}</span>`);
+        $loadingRow.children('td').html(`<span style="color: red;">Error: ${escapeHtml(error.message)}</span>`);
     }
 });
 
@@ -1763,10 +1813,23 @@ function renderLocusDetail(detail, outlierType) {
         html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">RepeatMasker: ${escapeHtml(locus.RepeatMaskerIntervals)}</div>`;
     }
 
-    // C3: Variation cluster size diff
-    if (locus.VariationClusterSizeDiff != null) {
-        const vcsSign = locus.VariationClusterSizeDiff >= 0 ? '+' : '';
-        html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">Variation Cluster: ${vcsSign}${locus.VariationClusterSizeDiff}</div>`;
+    // C3: Variation cluster. Same three states as the table's VC column (see renderLocusRow):
+    // the size difference when TRExplorer kept a variation cluster for this repeat, the crossed-out
+    // circle and the reason when it computed one and then filtered it out, and nothing when it
+    // recorded neither. Without the second branch a filtered-out locus read here as having no
+    // variation cluster at all, while its row one line above showed the crossed-out icon.
+    if (locus.VariationClusterSizeDiff != null && locus.VariationClusterSizeDiff !== '') {
+        const vcsDiff = Number(locus.VariationClusterSizeDiff);
+        if (Number.isFinite(vcsDiff)) {
+            const vcsSign = vcsDiff >= 0 ? '+' : '';
+            html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">Variation Cluster: ${vcsSign}${vcsDiff.toLocaleString('en-US')}bp</div>`;
+        }
+    } else if (locus.VariationClusterFilterReason) {
+        const vcsReason = locus.VariationClusterFilterReason;
+        const vcsReasonTitle = VC_FILTER_REASON_TITLES[vcsReason] || vcsReason;
+        const vcsReasonColor = VC_FILTER_REASON_COLORS[vcsReason] || 'darkorange';
+        html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">Variation Cluster: `
+            + `<i class="times circle outline icon" style="color: ${vcsReasonColor};"></i>${escapeHtml(vcsReasonTitle)}</div>`;
     }
 
     // C4: Allele histogram
@@ -1979,20 +2042,30 @@ function renderLocusDetail(detail, outlierType) {
 
 // C7: Copy affected sample IDs to clipboard
 $(document).on('click', '.copy-ids-btn', function() {
-    const text = window._copyTextMap[$(this).data('locus-id')] || '';
+    const $button = $(this);
+    const text = window._copyTextMap[$button.data('locus-id')] || '';
+    // navigator.clipboard only exists in a secure context (https, or http on localhost), so it is
+    // undefined whenever the server is reached over plain http on a LAN address, which --host
+    // allows. A write can also be rejected by the browser's permission prompt. Both cases fall
+    // back to a prompt box the user can copy the ids out of by hand.
+    const copyByHand = () => window.prompt('Copy the affected sample IDs:', text);
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        copyByHand();
+        return;
+    }
     navigator.clipboard.writeText(text).then(() => {
-        $(this).html('<i class="check icon"></i> Copied!');
-        setTimeout(() => $(this).html('<i class="copy icon"></i> Copy affected IDs'), 2000);
-    });
+        $button.html('<i class="check icon"></i> Copied!');
+        setTimeout(() => $button.html('<i class="copy icon"></i> Copy affected IDs'), 2000);
+    }).catch(() => copyByHand());
 });
 
 // Collapse details button handler (with slide animation)
 $(document).on('click', '.collapse-detail-btn', function() {
     const $detailRow = $(this).closest('.locus-detail-row');
     const $locusRow = $detailRow.prev('.locus-row');
-    const $td = $detailRow.find('td');
+    const $td = $detailRow.children('td');
     $td.wrapInner('<div class="slide-wrapper"></div>');
-    $td.find('.slide-wrapper').slideUp(200, function() {
+    $td.children('.slide-wrapper').slideUp(200, function() {
         $detailRow.remove();
         refreshCollapseAllButton();
     });
@@ -2012,9 +2085,11 @@ $(document).on('click', '.collapse-all-btn', function() {
     // Reset every chevron up front rather than per row: the rows themselves go away in the
     // animation callbacks below, and their locus rows stay put.
     $('.locus-row .expand-toggle').removeClass('expanded').html('<i class="chevron right icon"></i>');
-    const $td = $detailRows.find('td');
+    // One outer cell per detail row: .find('td') would wrap and animate every nested cell too,
+    // and fire this callback once per animated element instead of once per row.
+    const $td = $detailRows.children('td');
     $td.wrapInner('<div class="slide-wrapper"></div>');
-    $td.find('.slide-wrapper').slideUp(200, function() {
+    $td.children('.slide-wrapper').slideUp(200, function() {
         $(this).closest('.locus-detail-row').remove();
         refreshCollapseAllButton();
     });
@@ -2198,13 +2273,22 @@ function goToPage(page) {
 // Annotation CRUD Functions
 // =========================================================================
 
+// The annotation write routes explain every failure in the response body: a "detail" field for
+// the read-only-server 403 (the results_server.restrict_writes before_request hook) and an "error" field for the
+// validation failures, so surface that text instead of a bare status number. The callers show
+// e.message in an alert.
+async function annotationError(response) {
+    const body = await response.json().catch(() => ({}));
+    return new Error(body.detail || body.error || `HTTP ${response.status}`);
+}
+
 async function saveNote(locusId, noteText) {
     const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}/note`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({note_text: noteText}),
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) throw await annotationError(response);
     return response.json();
 }
 
@@ -2212,7 +2296,7 @@ async function deleteNote(locusId) {
     const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}/note`, {
         method: 'DELETE',
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) throw await annotationError(response);
     return response.json();
 }
 
@@ -2222,7 +2306,7 @@ async function addTag(locusId, tag) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({tag: tag}),
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) throw await annotationError(response);
     return response.json();
 }
 
@@ -2230,7 +2314,7 @@ async function removeTag(locusId, tag) {
     const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}/tags/${encodeURIComponent(tag)}`, {
         method: 'DELETE',
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) throw await annotationError(response);
     return response.json();
 }
 
@@ -2244,7 +2328,7 @@ async function refreshDetailPanel(locusId) {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const detail = await response.json();
         const html = renderLocusDetail(detail, currentState.outlier_type);
-        $detailRow.find('td').html(html);
+        $detailRow.children('td').html(html);
     } catch (error) {
         console.error('Refresh detail error:', error);
     }
@@ -2338,10 +2422,13 @@ $(document).on('click', '.add-note-btn, .note-indicator', async function() {
     const $updatedAt = $('#note-updated-at');
     const seq = ++noteModalSeq;
 
-    // Fetch existing note for this locus
+    // Fetch existing note for this locus. The editor must not open until that text is known:
+    // the Save handler replaces the stored note with whatever the textarea holds, so an empty
+    // textarea shown over an existing note destroys it on save.
     try {
         const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}`);
-        const data = response.ok ? await response.json() : {};
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
         if (seq !== noteModalSeq) return;  // a newer click already owns the modal
 
         // Store locusId on modal for save handler, together with the text it belongs to.
@@ -2356,9 +2443,11 @@ $(document).on('click', '.add-note-btn, .note-indicator', async function() {
         }
     } catch (e) {
         if (seq !== noteModalSeq) return;
-        $modal.data('locus-id', locusId);
-        $textarea.val('');
-        $existingSection.hide();
+        // Deliberately no empty-editor fallback: the locus may well have a note, and saving over
+        // it would replace it with whatever the user typed. Report the failure and stay closed.
+        console.error('Load note error:', e);
+        alert('Failed to load the existing note: ' + e.message + '\n\nThe note was not opened for editing.');
+        return;
     }
 
     // Show the modal
@@ -2535,7 +2624,10 @@ function renderExistingTagsInModal(tags, locusId) {
 // Delete handler for modal tags
 $(document).on('click', '.delete-modal-tag', async function() {
     const locusId = $(this).data('locus-id');
-    const tag = $(this).data('tag');
+    // .attr(), not .data(): jQuery's .data() converts an attribute that looks like a boolean,
+    // null or a number, so a tag literally named "true" or "1" would arrive here as a boolean
+    // or a number and fail the strict comparison against currentState.tag below.
+    const tag = $(this).attr('data-tag');
 
     try {
         await removeTag(locusId, tag);

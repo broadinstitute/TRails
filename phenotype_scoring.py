@@ -76,13 +76,44 @@ def ensure_ontology():
     return True
 
 
+def resolvable_hpo_terms(hpo_ids):
+    """Filter HPO term ids down to the ones the installed ontology recognizes.
+
+    Terms that do not start with ``HP:`` are dropped, as are ids the ontology
+    cannot resolve (a retired or misspelled id). The per-term check matters
+    because ``HPOSet.from_queries`` raises for the WHOLE set when any single term
+    is unknown, which would otherwise zero an otherwise scorable similarity.
+    Assumes ``ensure_ontology`` has already succeeded.
+
+    Args:
+        hpo_ids: Iterable of HPO term ids.
+
+    Returns:
+        list: The recognized term ids, in input order.
+    """
+    from pyhpo import Ontology
+
+    recognized = []
+    for term_id in hpo_ids:
+        if not str(term_id).startswith("HP:"):
+            continue
+        try:
+            Ontology.get_hpo_object(term_id)
+        except Exception:
+            continue
+        recognized.append(term_id)
+    return recognized
+
+
 def compute_similarity_pyhpo(patient_hpo_ids, disease_hpo_ids):
     """Compute semantic similarity between two HPO term sets.
 
     Uses pyhpo's graph-information-content similarity (kind='omim',
     method='graphic', combine='funSimAvg') when pyhpo is installed; otherwise
     falls back to the Jaccard overlap of the two term sets. Returns 0.0 when
-    either set is empty (or, with pyhpo, when neither set has any HP: terms).
+    either set is empty (or, with pyhpo, when either set has no term the
+    ontology recognizes). Unrecognized terms are dropped individually, so one
+    retired HPO id does not zero the score of a sample's remaining terms.
 
     Args:
         patient_hpo_ids: Iterable of the patient's HPO term ids.
@@ -97,8 +128,8 @@ def compute_similarity_pyhpo(patient_hpo_ids, disease_hpo_ids):
         if not ensure_ontology():
             raise ImportError("pyhpo ontology unavailable")
 
-        patient_valid = [term for term in patient_hpo_ids if term.startswith("HP:")]
-        disease_valid = [term for term in disease_hpo_ids if term.startswith("HP:")]
+        patient_valid = resolvable_hpo_terms(patient_hpo_ids)
+        disease_valid = resolvable_hpo_terms(disease_hpo_ids)
         if not patient_valid or not disease_valid:
             return 0.0
 
@@ -312,8 +343,8 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
     scored two ways: a gene-phenotype similarity per sample (best matching,
     inheritance-filtered disease) and a pairwise similarity / shared-term count
     against the next qualifying sample in descending-allele order. Per-locus rows
-    aggregate these (sum of pairwise similarities, max gene similarity, the
-    comma-joined qualifying sample ids, plus denormalized filter columns).
+    aggregate these (sum of pairwise similarities, max gene similarity, and the
+    comma-joined qualifying sample ids).
 
     As a side effect, each record gains ``MaxGenePhenoSim_{outlier_type}`` and
     ``SumPairwiseSim_{outlier_type}`` columns (the per-locus aggregates), so the
@@ -322,8 +353,13 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
     columns as None on that record.
 
     If ``participant_to_hpo`` is empty there are no phenotypes to score: the
-    function returns ([], []) and adds no columns (the loci-table phenotype
-    columns stay NULL), so the build degrades gracefully.
+    function returns ([], []) and adds no columns to the records. The loci-table
+    writer derives its schema from the keys the records carry, so the loci table
+    of such a build has no ``MaxGenePhenoSim_*`` / ``SumPairwiseSim_*`` columns
+    at all rather than NULL-valued ones, and a query naming one of them is a
+    binder error. The results server tolerates this because every reference to
+    those columns is guarded by a membership check against the loci table's
+    actual column list.
 
     Args:
         records: List of locus record dicts (one per locus), mutated in place to
@@ -438,18 +474,6 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
                 "sum_pairwise_shared_ic": sum(pairwise_shared_ic) if pairwise_shared_ic else None,
                 "max_gene_phenotype_similarity": max_gene_similarity,
                 "qualifying_sample_ids": ",".join(entry[0] for entry in qualifying),
-                "IsKnownMotif": row.get("IsKnownMotif"),
-                "gene_region": row.get("gene_region"),
-                "gene_region_rank": row.get("gene_region_rank"),
-                "FirstAffectedAlleleSize": row.get(f"FirstAffectedAlleleSize_{outlier_type}"),
-                "FirstUnaffectedAlleleSize": row.get(f"FirstUnaffectedAlleleSize_{outlier_type}"),
-                "NumRepeatsInReference": row.get("NumRepeatsInReference"),
-                "HPRC256_MaxAllele": row.get("HPRC256_MaxAllele"),
-                "AoU1027_MaxAllele": row.get("AoU1027_MaxAllele"),
-                "TenK10K_MaxAllele": row.get("TenK10K_MaxAllele"),
-                "NumAffectedAboveUnaffected": row.get(f"NumAffectedUnsolvedSamplesAboveUnaffected_{outlier_type}"),
-                "NumAffectedFamiliesAboveUnaffected": row.get(f"NumAffectedUnsolvedFamiliesAboveUnaffected_{outlier_type}"),
-                "MotifSize": row.get("MotifSize"),
             })
 
     return per_outlier_rows, per_locus_rows

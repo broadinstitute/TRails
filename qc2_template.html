@@ -161,11 +161,10 @@
 const QC2_API_BASE = window.location.origin + '/api/v1';
 
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
+// This page has no source selector, so its renderMendelianWarning() calls pass no source and
+// show only the source-independent Mendelian-violation part. The per-source 99th-percentile
+// outlier warnings are therefore never read here and are not serialized into the page.
 const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
-// Per-source 99th-percentile outlier warnings. This page has no source selector, so its
-// renderMendelianWarning() calls pass no source and show only the source-independent
-// Mendelian-violation part (an outlier warning is meaningless without a chosen source).
-const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
 
 
 // Category order for bins

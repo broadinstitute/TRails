@@ -4,6 +4,7 @@ import unittest
 
 import pandas
 
+import mendelian_qc
 from mendelian_qc import (
     ALL_CANONICAL_MOTIFS,
     MOTIF_SIZE_CATEGORIES,
@@ -328,6 +329,51 @@ class ComputeMendelianViolationsTests(unittest.TestCase):
         self.assertEqual(per_sample[0]["chrM_total"], 1)
         self.assertEqual(per_sample[0]["chrM_violations"], 0)
 
+    def test_chrx_hemizygous_child_evaluated_without_a_paternal_call(self):
+        # A son's single X allele comes from the mother, so the comparison never needs the
+        # father: the locus must be evaluated even though he has no call there.
+        locus_rows = [
+            {
+                "trid": "chrX-1-10-A", "motif": "A",
+                "genotypes": {"child": "10", "mom": "10,40", "dad": "."},
+            },
+            {
+                "trid": "chrX-100-110-A", "motif": "A",
+                "genotypes": {"child": "30", "mom": "10,11", "dad": "."},
+            },
+        ]
+        sample_df = pandas.DataFrame([
+            {"sample_id": "child", "maternal_id": "mom", "paternal_id": "dad"},
+            {"sample_id": "mom", "maternal_id": "", "paternal_id": ""},
+            {"sample_id": "dad", "maternal_id": "", "paternal_id": ""},
+        ])
+        per_sample, _ = compute_mendelian_violations(locus_rows, {}, sample_df, threshold=2)
+        self.assertEqual(per_sample[0]["chrX_total"], 2)
+        self.assertEqual(per_sample[0]["chrX_violations"], 1)
+
+    def test_chrx_diploid_child_still_requires_both_parents(self):
+        # A daughter's two X alleles come one from each parent, so a missing paternal call
+        # still means the locus cannot be evaluated.
+        sample_df = pandas.DataFrame([
+            {"sample_id": "child", "maternal_id": "mom", "paternal_id": "dad"},
+            {"sample_id": "mom", "maternal_id": "", "paternal_id": ""},
+            {"sample_id": "dad", "maternal_id": "", "paternal_id": ""},
+        ])
+        without_father = [{
+            "trid": "chrX-1-10-A", "motif": "A",
+            "genotypes": {"child": "10,20", "mom": "10,11", "dad": "."},
+        }]
+        per_sample, _ = compute_mendelian_violations(without_father, {}, sample_df, threshold=2)
+        self.assertEqual(per_sample[0]["chrX_total"], 0)
+
+        with_father = [{
+            "trid": "chrX-1-10-A", "motif": "A",
+            "genotypes": {"child": "10,20", "mom": "10,11", "dad": "20,21"},
+        }]
+        per_sample, _ = compute_mendelian_violations(with_father, {}, sample_df, threshold=2)
+        self.assertEqual(per_sample[0]["chrX_total"], 1)
+        self.assertEqual(per_sample[0]["chrX_violations"], 0)
+
     def test_motif_with_n_skipped(self):
         locus_rows = [{
             "trid": "chr1-1-10-ANG", "motif": "ANG",
@@ -341,6 +387,36 @@ class ComputeMendelianViolationsTests(unittest.TestCase):
         per_sample, _ = compute_mendelian_violations(locus_rows, {}, sample_df, threshold=2)
         self.assertEqual(per_sample[0]["total_loci"], 0)
 
+    def test_motif_with_other_iupac_code_skipped(self):
+        # compute_canonical_motif accepts the whole IUPAC alphabet, but the per-motif table is
+        # keyed only by the ACGT canonical motifs, so an "R" motif used to KeyError here.
+        locus_rows = [{
+            "trid": "chr1-1-10-ARG", "motif": "ARG",
+            "genotypes": {"child": "10,20", "mom": "5,6", "dad": "7,8"},
+        }]
+        sample_df = pandas.DataFrame([
+            {"sample_id": "child", "maternal_id": "mom", "paternal_id": "dad"},
+            {"sample_id": "mom", "maternal_id": "", "paternal_id": ""},
+            {"sample_id": "dad", "maternal_id": "", "paternal_id": ""},
+        ])
+        per_sample, _ = compute_mendelian_violations(locus_rows, {}, sample_df, threshold=2)
+        self.assertEqual(per_sample[0]["total_loci"], 0)
+
+    def test_motif_with_lowercase_bases_still_counted(self):
+        # A lowercase motif is still an ACGT motif and must not be dropped by the
+        # outside-ACGT skip.
+        locus_rows = [{
+            "trid": "chr1-1-10-cag", "motif": "cag",
+            "genotypes": {"child": "10,20", "mom": "10,11", "dad": "20,21"},
+        }]
+        sample_df = pandas.DataFrame([
+            {"sample_id": "child", "maternal_id": "mom", "paternal_id": "dad"},
+            {"sample_id": "mom", "maternal_id": "", "paternal_id": ""},
+            {"sample_id": "dad", "maternal_id": "", "paternal_id": ""},
+        ])
+        per_sample, _ = compute_mendelian_violations(locus_rows, {}, sample_df, threshold=2)
+        self.assertEqual(per_sample[0]["total_loci"], 1)
+
     def test_child_no_call_skipped(self):
         locus_rows = [{
             "trid": "chr1-1-10-A", "motif": "A",
@@ -353,6 +429,122 @@ class ComputeMendelianViolationsTests(unittest.TestCase):
         ])
         per_sample, _ = compute_mendelian_violations(locus_rows, {}, sample_df, threshold=2)
         self.assertEqual(per_sample[0]["total_loci"], 0)
+
+
+class GenotypedTrioFilterTests(unittest.TestCase):
+    """A trio described only in the metadata must not produce an all-zero row."""
+
+    def _trio_metadata(self):
+        return pandas.DataFrame([
+            {"sample_id": "child", "maternal_id": "mom", "paternal_id": "dad"},
+            {"sample_id": "mom", "maternal_id": "", "paternal_id": ""},
+            {"sample_id": "dad", "maternal_id": "", "paternal_id": ""},
+        ])
+
+    def test_trio_absent_from_the_matrix_is_dropped(self):
+        locus_rows = [{
+            "trid": "chr1-100-110-CAG", "motif": "CAG",
+            "genotypes": {"other1": "10,20", "other2": "10,11"},
+        }]
+        per_sample, per_motif = compute_mendelian_violations(
+            locus_rows, {}, self._trio_metadata(), threshold=2)
+        self.assertEqual(per_sample, [])
+        self.assertEqual(per_motif, [])
+
+    def test_trio_with_one_ungenotyped_parent_is_dropped(self):
+        locus_rows = [{
+            "trid": "chr1-100-110-CAG", "motif": "CAG",
+            "genotypes": {"child": "10,20", "mom": "10,11"},
+        }]
+        per_sample, per_motif = compute_mendelian_violations(
+            locus_rows, {}, self._trio_metadata(), threshold=2)
+        self.assertEqual(per_sample, [])
+        self.assertEqual(per_motif, [])
+
+    def test_genotyped_clean_trio_is_still_reported(self):
+        # The clean trio must stay in the output and be distinguishable from a trio that was
+        # never compared: zero violations over a non-zero denominator.
+        locus_rows = [{
+            "trid": "chr1-100-110-CAG", "motif": "CAG",
+            "genotypes": {"child": "10,20", "mom": "10,11", "dad": "20,21"},
+        }]
+        per_sample, per_motif = compute_mendelian_violations(
+            locus_rows, {}, self._trio_metadata(), threshold=2)
+        self.assertEqual(len(per_sample), 1)
+        self.assertEqual(len(per_motif), 1)
+        self.assertEqual(per_sample[0]["sample_id"], "child")
+        self.assertEqual(per_sample[0]["total_loci"], 1)
+        self.assertEqual(per_sample[0]["total_violations"], 0)
+
+    def test_genotyped_trio_with_only_no_calls_is_kept(self):
+        # The members are genotype columns of the matrix, so the trio is real even though every
+        # locus is skipped; the zero denominator is what marks it as uncompared.
+        locus_rows = [{
+            "trid": "chr1-100-110-CAG", "motif": "CAG",
+            "genotypes": {"child": ".", "mom": ".", "dad": "."},
+        }]
+        per_sample, _ = compute_mendelian_violations(
+            locus_rows, {}, self._trio_metadata(), threshold=2)
+        self.assertEqual(len(per_sample), 1)
+        self.assertEqual(per_sample[0]["total_loci"], 0)
+
+
+class PerLocusDerivationTests(unittest.TestCase):
+    """The per-locus values must be derived once per locus, not once per trio per locus."""
+
+    def _two_trio_metadata(self):
+        return pandas.DataFrame([
+            {"sample_id": "child1", "maternal_id": "mom", "paternal_id": "dad"},
+            {"sample_id": "child2", "maternal_id": "mom", "paternal_id": "dad"},
+            {"sample_id": "mom", "maternal_id": "", "paternal_id": ""},
+            {"sample_id": "dad", "maternal_id": "", "paternal_id": ""},
+        ])
+
+    def _two_locus_rows(self):
+        return [
+            {"trid": "chr1-100-110-CAG", "motif": "CAG",
+             "genotypes": {"child1": "10,20", "child2": "10,21", "mom": "10,11",
+                           "dad": "20,21"}},
+            {"trid": "chr2-100-110-AT", "motif": "AT",
+             "genotypes": {"child1": "5,6", "child2": "5,7", "mom": "5,8", "dad": "6,7"}},
+        ]
+
+    def test_canonical_motif_is_computed_once_per_locus_for_two_trios(self):
+        calls = []
+        real_compute_canonical_motif = mendelian_qc.compute_canonical_motif
+
+        def counting_compute_canonical_motif(motif):
+            calls.append(motif)
+            return real_compute_canonical_motif(motif)
+
+        mendelian_qc.compute_canonical_motif = counting_compute_canonical_motif
+        try:
+            per_sample, _ = compute_mendelian_violations(
+                self._two_locus_rows(), {}, self._two_trio_metadata(), threshold=2)
+        finally:
+            mendelian_qc.compute_canonical_motif = real_compute_canonical_motif
+
+        self.assertEqual(len(per_sample), 2)
+        self.assertEqual(sorted(calls), ["AT", "CAG"])
+
+    def test_loci_with_an_unusable_motif_are_dropped_before_the_trio_loop(self):
+        # A blank motif and one carrying a non-ACGT base are not scorable, and the filter now
+        # lives in the shared per-locus pass, so they must not reach any trio's tally.
+        locus_rows = self._two_locus_rows() + [
+            {"trid": "chr3-1-10-", "motif": "",
+             "genotypes": {"child1": "1,2", "child2": "1,3", "mom": "1,4", "dad": "2,3"}},
+            {"trid": "chr3-20-30-CNG", "motif": "CNG",
+             "genotypes": {"child1": "1,2", "child2": "1,3", "mom": "1,4", "dad": "2,3"}},
+        ]
+        per_sample, _ = compute_mendelian_violations(
+            locus_rows, {}, self._two_trio_metadata(), threshold=2)
+        self.assertEqual([row["total_loci"] for row in per_sample], [2, 2])
+
+    def test_prepared_loci_carry_the_derived_values(self):
+        prepared = mendelian_qc._prepare_loci(self._two_locus_rows())
+        self.assertEqual([(chrom, size, canonical)
+                          for _genotypes, chrom, size, canonical in prepared],
+                         [("autosome", "3bp", "AGC"), ("autosome", "2bp", "AT")])
 
 
 if __name__ == "__main__":

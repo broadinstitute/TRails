@@ -42,7 +42,7 @@ import intervaltree
 KnownDiseaseLoci = collections.namedtuple(
     "KnownDiseaseLoci", ["interval_trees", "strchive_trees", "locus_lookup"])
 
-from motif_utilities import compute_canonical_motif
+from motif_utilities import COMPLEMENT, compute_canonical_motif
 
 
 # STRchive raw-data URL, used only when the optional network fetch is requested.
@@ -280,6 +280,26 @@ def load_known_disease_loci(filepath=None, fetch_strchive=False, strchive_filepa
     return KnownDiseaseLoci(dict(interval_trees), strchive_trees, locus_lookup)
 
 
+def strchive_locus_motifs(locus_data):
+    """Return the motifs to match a STRchive locus against.
+
+    A STRchive locus lists the reference motif and, separately, the motif(s) seen in
+    the pathogenic allele, which for several loci differ (e.g. an interrupted reference
+    unit expanding as a pure one). Matching only the reference motif would miss exactly
+    the expansions this tool exists to surface, so both lists are returned. This is the
+    one definition of that list: the build and the server's locus-detail page both call
+    it, and they must agree on which loci are known disease loci.
+
+    Args:
+        locus_data: A STRchive locus dict (an interval's ``.data``).
+
+    Returns:
+        A list of motif strings: the reference motifs followed by the pathogenic ones.
+    """
+    return (list(locus_data.get("reference_motif_reference_orientation") or [])
+            + list(locus_data.get("pathogenic_motif_reference_orientation") or []))
+
+
 def matches_disease_locus(locus_id, interval_trees, strchive_trees=None):
     """Return the disease LocusId matched by a query locus, or None.
 
@@ -319,13 +339,7 @@ def matches_disease_locus(locus_id, interval_trees, strchive_trees=None):
             if compute_jaccard(start, end, interval.begin, interval.end) <= 0.66:
                 continue
             locus_data = interval.data
-            # A STRchive locus lists the reference motif and, separately, the motif(s) seen in
-            # the pathogenic allele, which for several loci differ (e.g. an interrupted reference
-            # unit expanding as a pure one). Matching only the reference motif would miss exactly
-            # the expansions this tool exists to surface, so consider both.
-            strchive_motifs = (locus_data.get("reference_motif_reference_orientation", [])
-                               + locus_data.get("pathogenic_motif_reference_orientation", []))
-            for strchive_motif in strchive_motifs:
+            for strchive_motif in strchive_locus_motifs(locus_data):
                 if motifs_match(motif, strchive_motif):
                     return locus_data.get("locus_id", locus_data.get("id"))
 
@@ -337,8 +351,8 @@ def collect_known_disease_canonical_motifs(interval_trees, strchive_trees=None):
 
     Walks every disease-locus interval and collects the canonical form
     (including reverse complement) of each locus's ``RepeatUnit`` and
-    ``PathogenicMotifs``. When ``strchive_trees`` is supplied, the STRchive
-    ``reference_motif_reference_orientation`` motifs are collected too, so a
+    ``PathogenicMotifs``. When ``strchive_trees`` is supplied, each STRchive
+    locus's motifs (``strchive_locus_motifs``) are collected too, so a
     locus that is recognized as a known disease locus only via the STRchive
     fallback (see ``matches_disease_locus``) still has its motif counted as
     known -- otherwise such a locus would get ``KnownDiseaseLocus`` set but
@@ -369,9 +383,7 @@ def collect_known_disease_canonical_motifs(interval_trees, strchive_trees=None):
         for interval in tree:
             if not interval.data:
                 continue
-            # Both motif lists, for the same reason as matches_disease_locus above.
-            for motif in (interval.data.get("reference_motif_reference_orientation", [])
-                          + interval.data.get("pathogenic_motif_reference_orientation", [])):
+            for motif in strchive_locus_motifs(interval.data):
                 if "N" in motif:
                     continue
                 known_canonical_motifs.add(
@@ -379,7 +391,83 @@ def collect_known_disease_canonical_motifs(interval_trees, strchive_trees=None):
     return known_canonical_motifs
 
 
-def add_derived_locus_columns(locus_records, source_label=""):
+def parse_locus_id(locus_id, repeat_copy_numbers_tsv=None):
+    """Parse a ``chrom-start-end-motif`` locus id into its four fields.
+
+    The locus id is the ``trid`` cell of the repeat-copy-numbers matrix, passed
+    through verbatim by ``input_tables.read_repeat_copy_numbers``, so a matrix
+    written by a tool that uses some other locus-id shape reaches this function
+    unchanged. Rather than letting the tuple unpacking or ``int()`` raise a bare
+    message, this names the column, the offending value and the file, in the
+    same shape as the sample-id check in ``build_database.build``.
+
+    Args:
+        locus_id: The ``LocusId`` / ``trid`` value, e.g. ``"chr1-100-110-CAG"``.
+        repeat_copy_numbers_tsv: Path of the matrix the value came from, used in
+            the error message. None when the caller does not know it.
+
+    Returns:
+        A ``(chrom_field, start0_based, end1_based, motif_field)`` tuple, with
+        the two coordinates as ints and the chromosome field exactly as written.
+
+    Raises:
+        ValueError: If the locus id does not have exactly four ``-``-separated
+            fields, or its start/end fields are not integers.
+    """
+    source = repeat_copy_numbers_tsv or "the repeat-copy-numbers matrix"
+    fields = locus_id.split("-")
+    if len(fields) != 4:
+        raise ValueError(
+            f"The 'trid' (locus id) column in {source} must hold values of the form "
+            f"'chrom-start-end-motif' (4 '-'-separated fields); got {locus_id!r} with "
+            f"{len(fields)}")
+    chrom_field, start_field, end_field, motif_field = fields
+    try:
+        start0_based = int(start_field)
+        end1_based = int(end_field)
+    except ValueError:
+        raise ValueError(
+            f"The 'trid' (locus id) column in {source} must hold values of the form "
+            f"'chrom-start-end-motif' with integer start and end coordinates; got "
+            f"{locus_id!r}") from None
+    return chrom_field, start0_based, end1_based, motif_field
+
+
+def validate_motif(motif, locus_id, repeat_copy_numbers_tsv=None):
+    """Raise a descriptive ValueError if a motif is outside the IUPAC alphabet.
+
+    ``compute_canonical_motif`` reverse-complements the motif through
+    ``motif_utilities.COMPLEMENT``, which raises a bare ``KeyError`` naming only
+    the offending character for anything outside the table (a decorated motif
+    such as ``"(CAG)n"``, a whitespace-padded cell, an ``"N/A"`` placeholder).
+    The build fails on such a motif rather than skipping the locus: the locus
+    comes from a row the user put in the matrix, so dropping it would silently
+    shrink the database, and ``CanonicalMotif`` is one of the columns the server
+    groups and searches by, so the locus cannot be stored without it. (The
+    Mendelian-QC stage skips rather than fails on the same class of motif
+    because it computes a summary statistic over a subset of loci, where a
+    skipped locus costs a little precision and nothing else.)
+
+    Args:
+        motif: The ``Motif`` value from the record, possibly empty.
+        locus_id: The record's ``LocusId``, named in the error message.
+        repeat_copy_numbers_tsv: Path of the matrix the value came from, used in
+            the error message. None when the caller does not know it.
+
+    Raises:
+        ValueError: If the motif carries a character outside ``COMPLEMENT``.
+    """
+    # An empty motif cell is tolerated (see NumRepeatsInReference below), so only a
+    # non-empty motif with a character outside the table is an error.
+    if not motif or set(motif.upper()) <= set(COMPLEMENT):
+        return
+    raise ValueError(
+        f"The 'motif' column in {repeat_copy_numbers_tsv or 'the repeat-copy-numbers matrix'} "
+        f"must contain only IUPAC bases ({''.join(sorted(COMPLEMENT))}); locus {locus_id} has "
+        f"motif {motif!r}")
+
+
+def add_derived_locus_columns(locus_records, source_label="", repeat_copy_numbers_tsv=None):
     """Add coordinate, motif, source, gene-region, and canonical-motif columns.
 
     For each per-locus dict, parses the ``LocusId`` (``chrom-start-end-motif``)
@@ -397,23 +485,39 @@ def add_derived_locus_columns(locus_records, source_label=""):
       * ``gene_id`` / ``gene_region`` -- pass-through from the record (also
         accepting the ``GencodeGeneId`` / ``GencodeGeneRegion`` aliases); None
         when absent.
-      * ``gene_region_rank`` -- numeric rank of ``gene_region`` (None if
-        unranked/absent).
+      * ``gene_region_rank`` -- always the rank derived from ``gene_region``
+        (None if the region is unranked or absent). A rank supplied by the input
+        matrix is ignored, so the stored rank can never disagree with the
+        region the locus actually has.
+
+    Prints a one-line summary when the input matrix supplied any
+    ``gene_region_rank`` values, so their replacement is not silent.
 
     Args:
         locus_records: A list of per-locus dicts, each with at least ``LocusId``
             and ``Motif`` keys. Mutated in place.
         source_label: The value to store in the ``Source`` column. Defaults to
             the empty string.
+        repeat_copy_numbers_tsv: Path of the matrix the records came from, named
+            in the error messages raised for a malformed ``LocusId`` or
+            ``Motif``. None when the caller does not know it.
 
     Returns:
         The same ``locus_records`` list (mutated in place), for convenience.
+
+    Raises:
+        ValueError: If a ``LocusId`` is not ``chrom-start-end-motif`` with
+            integer coordinates, or a ``Motif`` carries a character outside the
+            IUPAC alphabet.
     """
+    supplied_rank_count = 0
+
     for record in locus_records:
-        chrom_field, start_field, end_field, _motif_field = record["LocusId"].split("-")
+        chrom_field, start0_based, end1_based, _motif_field = parse_locus_id(
+            record["LocusId"], repeat_copy_numbers_tsv)
         record["Chrom"] = f"chr{chrom_field.replace('chr', '')}"
-        record["Start0Based"] = int(start_field)
-        record["End1Based"] = int(end_field)
+        record["Start0Based"] = start0_based
+        record["End1Based"] = end1_based
 
         if record.get("ReferenceRegion") is None:
             record["ReferenceRegion"] = (
@@ -436,6 +540,7 @@ def add_derived_locus_columns(locus_records, source_label=""):
         if record.get("Source") is None:
             record["Source"] = source_label
 
+        validate_motif(record["Motif"], record["LocusId"], repeat_copy_numbers_tsv)
         record["CanonicalMotif"] = compute_canonical_motif(
             record["Motif"], include_reverse_complement=True)
 
@@ -443,7 +548,22 @@ def add_derived_locus_columns(locus_records, source_label=""):
             record["gene_id"] = record.get("GencodeGeneId")
         if record.get("gene_region") is None:
             record["gene_region"] = record.get("GencodeGeneRegion")
+
+        # gene_region_rank is a recognized annotation column of the input matrix
+        # (input_tables.ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED) so that it is not mistaken
+        # for a sample column, but it is not a pass-through: unlike gene_id / gene_region /
+        # Source, it carries no information of its own, being purely GENE_REGION_RANK applied
+        # to gene_region. Deriving it unconditionally is what keeps it consistent with the
+        # region stored next to it, which matters because the server's "region" ordering sorts
+        # by this column while displaying gene_region (results_server SORT_MAPPING).
+        if record.get("gene_region_rank") is not None:
+            supplied_rank_count += 1
         record["gene_region_rank"] = gene_region_rank(record.get("gene_region"))
+
+    if supplied_rank_count:
+        print(f"  ignored the gene_region_rank supplied by the input matrix for "
+              f"{supplied_rank_count:,d} of {len(locus_records):,d} loci; the rank is always "
+              f"derived from gene_region")
 
     return locus_records
 

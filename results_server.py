@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Flask-based read-only API server for TRails tandem-repeat outlier results.
 
-Serves data from a single pre-computed SQLite database of locus-level outlier
+Serves data from a single pre-computed DuckDB database of locus-level outlier
 statistics, enriched with sample metadata, gene-disease associations, and known
 disease loci. This is the single-database TRails server: there is no source
 selector, no read-visualization (readviz) integration, and no cloud dependency.
 
 The server tolerates optional tables being absent. The ``loci`` table is the only
-hard requirement (see ``REQUIRED_COLUMNS``); ``swim_plot``, the per-outlier-type
-skinny tables (``sk_*``), the phenotype-score tables, and the Mendelian-violation
-tables are all optional, and the corresponding pages/endpoints degrade gracefully
-when they are missing.
+hard requirement (see ``REQUIRED_COLUMNS``); ``swim_plot``, the phenotype-score
+tables and the Mendelian-violation tables are all optional, and the corresponding
+pages/endpoints degrade gracefully when they are missing.
 """
 
 import argparse
@@ -20,8 +19,8 @@ import json
 import math
 import os
 import re
-import sqlite3
 import sys
+import threading
 import traceback
 import zlib
 
@@ -31,8 +30,14 @@ from werkzeug.exceptions import HTTPException
 import jinja2
 import numpy as np
 
+# The only module that imports duckdb; everything here goes through its sqlite3-shaped API.
+import duckdb_compat
+
 # Standalone motif primitive (no str_analysis dependency, no sys.path insertion).
 from motif_utilities import COMPLEMENT, compute_canonical_motif
+
+# The number of samples the database was built from, recorded in its metadata table.
+from result_database import read_sample_count
 
 # The bases compute_canonical_motif can canonicalize. Deriving this from motif_utilities.COMPLEMENT
 # rather than spelling the alphabet out here keeps the two from drifting: anything outside the table
@@ -50,6 +55,7 @@ try:
         load_known_disease_loci,
         motifs_match,
         normalize_affected_status_for_logic,
+        strchive_locus_motifs,
     )
 except ImportError as import_error:
     # A missing module is the supported degraded mode; a missing *name* means the two files have
@@ -65,7 +71,10 @@ except ImportError as import_error:
         if isinstance(value, float) and value != value:  # NaN
             return None
         normalized = str(value).strip().lower()
-        if normalized == "nan":
+        # Every blank spelling maps to None, exactly as locus_annotations does it. Checking only
+        # "nan" here left a cell reading "NA" classified as the status "na", so the locus-detail
+        # page showed "Na" instead of "Unknown" whenever this fallback was in use.
+        if normalized in BLANK_STATUS_VALUES:
             return None
         if normalized == "possibly affected":
             return "affected"
@@ -99,6 +108,11 @@ except ImportError as import_error:
         """
         return {}, {}, {}
 
+    def strchive_locus_motifs(locus_data):
+        """Reference plus pathogenic STRchive motifs of one locus (fallback)."""
+        return (list(locus_data.get("reference_motif_reference_orientation") or [])
+                + list(locus_data.get("pathogenic_motif_reference_orientation") or []))
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -115,18 +129,15 @@ VALID_SORTS = (
     "region", "size", "count", "family_count",
     "pairwise_similarity", "gene_phenotype",
     "sigma_hprc_rank", "sigma_aou_rank",
+    "variation_cluster",
 )
 
 REQUIRED_TABLE = "loci"
 REQUIRED_COLUMNS = {"LocusId", "Chrom", "Start0Based", "End1Based", "Motif", "MotifSize"}
 
-# Composite index on loci(Chrom, Start0Based, End1Based) that makes the reference-region
-# filter a b-tree range scan instead of a full table scan (see result_database.py).
-REFERENCE_REGION_INDEX = "idx_loci_Chrom_Start0Based"
-
-# SQLite stores integers as signed 64-bit, so a larger coordinate cannot be bound as a
-# query parameter. A reference-region start must stay strictly below the limit, since a
-# bare position is widened to [start, start + 1).
+# A coordinate is bound as a 64-bit integer, so a larger one cannot be passed as a query
+# parameter. A reference-region start must stay strictly below the limit, since a bare
+# position is widened to [start, start + 1).
 MAX_REFERENCE_COORDINATE = 2 ** 63 - 1
 
 GENE_REGION_MAP = {
@@ -147,6 +158,10 @@ LIST_COLUMNS_STATIC = [
     "GeneTableGeneSymbol", "GeneTableInheritance", "GeneTableLLMPhenotypeSummary",
     "pLI", "inheritance",
     "IsKnownMotif", "IsInMendelianGene", "KnownDiseaseLocus",
+    # The three variation-cluster columns are optional: they are carried over from the input
+    # TSV only when it supplies them. A database predating them reports them as None
+    # (row_to_list_dict tolerates a missing static column), which leaves the VC column blank.
+    "VariationClusterSizeDiff", "VariationCluster", "VariationClusterFilterReason",
     "AoU1027_MaxAllele", "AoU1027_99thPercentile",
     "AoU1027_Stdev", "AoU1027_StdevRankByMotif", "AoU1027_StdevRankTotalNumberByMotif",
     "HPRC256_MaxAllele", "HPRC256_99thPercentile",
@@ -199,18 +214,19 @@ def resolve_tag_to_loci(tag):
     return app.config["ANNOTATIONS"]["tag_to_loci"].get(tag, set())
 
 
-# SQLite stores integers as signed 64-bit, so binding a larger Python int raises OverflowError at
-# query time, which would surface as a 500. Every parsed integer that becomes a query parameter goes
-# through parse_sqlite_int so an oversized value fails validation with a 400 like any other bad input.
-SQLITE_MIN_INT = -(2 ** 63)
-SQLITE_MAX_INT = 2 ** 63 - 1
+# Integer query parameters are bound as BIGINT, which is signed 64-bit, so binding a larger Python
+# int raises at query time and would surface as a 500. Every parsed integer that becomes a query
+# parameter goes through parse_int64 so an oversized value fails validation with a 400 like any
+# other bad input.
+MIN_INT64 = -(2 ** 63)
+MAX_INT64 = 2 ** 63 - 1
 
 
 def escape_like_wildcards(text):
-    """Escape SQL LIKE metacharacters so text matches literally.
+    """Escape SQL ILIKE metacharacters so text matches literally.
 
-    Pair with ``ESCAPE '\\'`` in the LIKE clause. Used where a value that is conceptually an exact
-    match has to go through LIKE because it is embedded in a larger delimited string.
+    Pair with ``ESCAPE '\\'`` in the ILIKE clause. Used where a value that is conceptually an exact
+    match has to go through ILIKE because it is embedded in a larger delimited string.
 
     Args:
         text: The literal value to match.
@@ -221,8 +237,8 @@ def escape_like_wildcards(text):
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def parse_sqlite_int(text):
-    """Parse text as an integer SQLite can bind.
+def parse_int64(text):
+    """Parse text as an integer that can be bound as a query parameter.
 
     Args:
         text: The raw parameter value.
@@ -231,11 +247,11 @@ def parse_sqlite_int(text):
         The parsed integer.
 
     Raises:
-        ValueError: If text is not an integer, or is outside SQLite's signed 64-bit range.
+        ValueError: If text is not an integer, or is outside the signed 64-bit range.
     """
     value = int(text)
-    if not SQLITE_MIN_INT <= value <= SQLITE_MAX_INT:
-        raise ValueError(f"integer out of SQLite's 64-bit range: '{text}'")
+    if not MIN_INT64 <= value <= MAX_INT64:
+        raise ValueError(f"integer out of the signed 64-bit range: '{text}'")
     return value
 
 
@@ -276,18 +292,18 @@ def parse_motif_size_filter(motif_size_str):
             if left and right:
                 try:
                     clauses.append("MotifSize BETWEEN ? AND ?")
-                    params.extend([parse_sqlite_int(left), parse_sqlite_int(right)])
+                    params.extend([parse_int64(left), parse_int64(right)])
                 except ValueError:
                     return None, [], f"Invalid motif_size range: '{part}'"
             elif left and not right:
                 try:
-                    params.append(parse_sqlite_int(left))
+                    params.append(parse_int64(left))
                     clauses.append("MotifSize >= ?")
                 except ValueError:
                     return None, [], f"Invalid motif_size value: '{part}'"
             elif not left and right:
                 try:
-                    params.append(parse_sqlite_int(right))
+                    params.append(parse_int64(right))
                     clauses.append("MotifSize <= ?")
                 except ValueError:
                     return None, [], f"Invalid motif_size value: '{part}'"
@@ -295,7 +311,7 @@ def parse_motif_size_filter(motif_size_str):
                 return None, [], f"Invalid motif_size format: '{part}'"
         else:
             try:
-                params.append(parse_sqlite_int(part))
+                params.append(parse_int64(part))
                 clauses.append("MotifSize = ?")
             except ValueError:
                 return None, [], f"Invalid motif_size value: '{part}'"
@@ -347,7 +363,7 @@ def normalize_gene_id(text):
     """Return an Ensembl gene id spelled the way the database stores it, else None.
 
     Stored gene ids are upper case and carry no ".<version>" suffix. Normalizing the queried value
-    keeps the comparison an indexed equality test, which COLLATE NOCASE would give up.
+    keeps the comparison a plain equality test rather than a case-insensitive one.
 
     Args:
         text: A candidate gene id.
@@ -386,11 +402,11 @@ def classify_search_term(term):
         are None and error_message says why.
     """
     if SEARCH_LOCUS_ID_PATTERN.match(term):
-        # Stored locus ids spell the motif in upper case but keep the chromosome exactly as the
-        # input matrix wrote it ("chr1-100-110-AT"), so only the motif field is normalized here.
-        # Normalizing rather than comparing with COLLATE NOCASE keeps the index on LocusId.
-        head, _, motif = term.rpartition("-")
-        return "locus_id", f"{head}-{motif.upper()}", None
+        # The build stores the locus id exactly as the input matrix spelled it (build_database
+        # copies the "trid" field verbatim), so a lower-case motif is a spelling the database can
+        # really contain. The term is therefore kept as typed and both endpoints compare it
+        # case-insensitively rather than normalizing it to a spelling that may not exist.
+        return "locus_id", term, None
     normalized_gene_id = normalize_gene_id(term)
     if normalized_gene_id:
         return "gene_id", normalized_gene_id, None
@@ -465,9 +481,9 @@ def chromosome_name_variants(chrom):
 
     Databases differ in whether they store the "chr" prefix, users differ in how they
     capitalize the suffix, and the mitochondrial chromosome is written as either M or MT.
-    Listing the alternatives as an IN set keeps the lookup an equality seek on the leading
-    column of REFERENCE_REGION_INDEX; a COLLATE NOCASE comparison would match more
-    spellings but would stop SQLite from using the index at all.
+    Listing the alternatives as an IN set keeps the lookup an equality test, which DuckDB can
+    evaluate against the Chrom column's per-row-group min/max; a case-insensitive comparison
+    would match more spellings but would have to be evaluated row by row.
 
     Args:
         chrom: A chromosome name carrying the lowercase "chr" prefix.
@@ -529,7 +545,7 @@ def parse_args():
     parser.add_argument(
         "--db",
         required=True,
-        help="Path to the single TRails SQLite results database.",
+        help="Path to the single TRails DuckDB results database.",
     )
     parser.add_argument(
         "--port",
@@ -567,8 +583,8 @@ def parse_args():
     )
     parser.add_argument(
         "--annotations-db",
-        default="annotations.db",
-        help="Path to annotations SQLite database for notes/tags (default: annotations.db).",
+        default="annotations.duckdb",
+        help="Path to annotations DuckDB database for notes/tags (default: annotations.duckdb).",
     )
     parser.add_argument(
         "--debug",
@@ -579,84 +595,58 @@ def parse_args():
     return parser.parse_args()
 
 
-def find_leftover_write_files(path):
-    """Find leftover journal files sitting next to a SQLite database.
-
-    A script that is killed part way through writing leaves behind a rollback journal
-    (<db>-journal) or a write-ahead log (<db>-wal). SQLite has to roll the database back
-    to its last committed state before it will serve any read, so a read-only connection
-    fails on even a plain SELECT with "attempt to write a readonly database".
-
-    Args:
-        path: Path to the SQLite database file.
-
-    Returns:
-        List of (filename, size in bytes) tuples for each journal file that exists.
-    """
-    return [(path + suffix, os.path.getsize(path + suffix))
-            for suffix in ("-journal", "-wal")
-            if os.path.exists(path + suffix)]
-
-
 def print_leftover_write_files_help(path, error, leftover):
-    """Explain a read-only open that failed because of leftover journal files.
+    """Explain a read-only open that failed because of a leftover write-ahead log.
 
     Args:
-        path: Path to the SQLite database file.
-        error: The sqlite3 error that was raised.
-        leftover: List of (filename, size in bytes) tuples from find_leftover_write_files.
+        path: Path to the DuckDB database file.
+        error: The DuckDB error that was raised.
+        leftover: List of (filename, size in bytes) tuples from
+            duckdb_compat.find_leftover_write_files.
     """
     abspath = os.path.abspath(path)
     print(f"Error: database could not be read: {error}")
-    print(f"  This is almost certainly because of these leftover journal files next to {path}:")
+    print(f"  This is almost certainly because of these leftover files next to {path}:")
     for filename, size in leftover:
         print(f"    {os.path.basename(filename)}  ({size:,d} bytes)")
-    print("  They are left behind when a script writing to the database is killed part way through, and")
-    print("  SQLite has to roll the database back to its last committed state before it will serve any")
-    print("  read. This server opens databases read-only, so it cannot do that and even a SELECT fails.")
+    print("  They are left behind when a script writing to the database is killed part way through.")
+    print("  DuckDB has to replay the write-ahead log into the database file before it will serve any")
+    print("  read, and it can only do that with write access. This server opens databases read-only,")
+    print("  so it cannot replay the log and even a SELECT fails.")
     print("  To recover, first check that nothing is still writing to the database:")
     print(f"    lsof '{abspath}'")
-    print("  If that prints nothing, open it once read-write so SQLite does the rollback itself:")
-    print(f"    python3 -c \"import sqlite3; sqlite3.connect('{abspath}').execute('SELECT 1')\"")
-    print("  The interrupted write never committed, so its changes are discarded and whichever script")
-    print("  was writing to the database has to be re-run.")
+    print("  If that prints nothing, open it once read-write so DuckDB replays the log itself:")
+    print(f"    python3 -c \"import duckdb; duckdb.connect('{abspath}').execute('SELECT 1')\"")
+    print("  Whatever the interrupted write had already committed is kept and the rest is discarded,")
+    print("  so whichever script was writing to the database has to be re-run.")
 
 
 def validate_database(path):
     """Validate that the database file exists and has the required table/columns.
 
     Args:
-        path: Path to the SQLite database file.
+        path: Path to the DuckDB database file.
     """
     if not os.path.exists(path):
         print(f"Error: database file not found: {path}")
         sys.exit(1)
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        try:
-            tables = [row[0] for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()]
-        except sqlite3.OperationalError as e:
-            leftover = find_leftover_write_files(path)
-            if not leftover:
-                raise
-            print_leftover_write_files_help(path, e, leftover)
-            sys.exit(1)
+        conn = duckdb_compat.connect(path, read_only=True)
+    except duckdb_compat.OperationalError as e:
+        leftover = duckdb_compat.find_leftover_write_files(path)
+        if not leftover:
+            raise
+        print_leftover_write_files_help(path, e, leftover)
+        sys.exit(1)
+    try:
+        tables = sorted(duckdb_compat.list_tables(conn))
         if REQUIRED_TABLE not in tables:
             print(f"Error: database missing required table '{REQUIRED_TABLE}'. Found tables: {tables}")
             sys.exit(1)
-        cursor = conn.execute(f"SELECT * FROM {REQUIRED_TABLE} LIMIT 1")
-        db_columns = {desc[0] for desc in cursor.description}
-        missing = REQUIRED_COLUMNS - db_columns
+        missing = REQUIRED_COLUMNS - duckdb_compat.table_columns(conn, REQUIRED_TABLE)
         if missing:
             print(f"Error: database table '{REQUIRED_TABLE}' missing required columns: {sorted(missing)}")
             sys.exit(1)
-        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
-                            (REFERENCE_REGION_INDEX,)).fetchone():
-            print(f"Warning: {path} has no {REFERENCE_REGION_INDEX} index, so Reference Region "
-                  f"searches cannot use the composite Chrom/Start range scan and may have to "
-                  f"examine every locus on the matching chromosome. Rebuild the database to add it.")
     finally:
         conn.close()
 
@@ -739,7 +729,7 @@ def load_mendelian_warnings(db_path, threshold=0.10):
     table is absent (no trios were available at build time), returns {}.
 
     Args:
-        db_path: Path to the results SQLite database.
+        db_path: Path to the results DuckDB database.
         threshold: Violation-rate threshold (default 0.10 = 10%).
 
     Returns:
@@ -749,12 +739,10 @@ def load_mendelian_warnings(db_path, threshold=0.10):
     if not os.path.exists(db_path):
         return {}
 
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = duckdb_compat.connect(db_path, read_only=True)
+    conn.row_factory = duckdb_compat.Row
     try:
-        if not conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='mendelian_violations'"
-        ).fetchone():
+        if "mendelian_violations" not in duckdb_compat.list_tables(conn):
             return {}
 
         warnings = {}
@@ -797,19 +785,20 @@ def compute_sample_qc_data(db_path):
     sample_id and motif size bin, and returns counts for rank1 (largest outlier)
     and top10 (in the top 10 outliers).
 
+    The rank1 rows are a subset of the top10 rows, so both counts come from one pass over
+    outlier_rank <= 10 rather than a query each, which halves the work on a swim_plot table
+    of tens of millions of rows.
+
     Returns:
         dict with {"rank1": [...], "top10": [...]}, or None if swim_plot / its
         outlier_rank column is missing.
     """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = duckdb_compat.connect(db_path, read_only=True)
+    conn.row_factory = duckdb_compat.Row
     try:
-        if not conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='swim_plot'"
-        ).fetchone():
+        if "swim_plot" not in duckdb_compat.list_tables(conn):
             return None
-        columns = {desc[0] for desc in conn.execute("SELECT * FROM swim_plot LIMIT 1").description}
-        if "outlier_rank" not in columns:
+        if "outlier_rank" not in duckdb_compat.table_columns(conn, "swim_plot"):
             return None
 
         bin_case = """
@@ -822,19 +811,24 @@ def compute_sample_qc_data(db_path):
                 ELSE '25+bp'
             END
         """
-        rank1_rows = conn.execute(
-            f"SELECT sample_id, {bin_case} AS bin, COUNT(*) AS count FROM swim_plot "
-            "WHERE outlier_type = 'AllAlleles' AND outlier_rank = 1 "
-            "GROUP BY sample_id, bin ORDER BY sample_id, bin"
-        ).fetchall()
-        top10_rows = conn.execute(
-            f"SELECT sample_id, {bin_case} AS bin, COUNT(*) AS count FROM swim_plot "
+        # Both counts are counts of LOCI, which is what the QC page labels them. swim_plot holds
+        # one row per outlier entry, and a diploid sample is recorded under both of its alleles, so
+        # a sample can own two of a locus's first ten entries; COUNT(*) would report that locus
+        # twice. Counting distinct LocusId is also what makes rank1_count independent of whether
+        # two entries at one locus ever share rank 1.
+        rows = conn.execute(
+            f"SELECT sample_id, {bin_case} AS bin, "
+            "COUNT(DISTINCT CASE WHEN outlier_rank = 1 THEN LocusId END) AS rank1_count, "
+            "COUNT(DISTINCT LocusId) AS top10_count FROM swim_plot "
             "WHERE outlier_type = 'AllAlleles' AND outlier_rank <= 10 "
             "GROUP BY sample_id, bin ORDER BY sample_id, bin"
         ).fetchall()
+        # A sample/bin with no rank-1 locus is dropped from rank1, which is what querying
+        # outlier_rank = 1 on its own did; it stays in top10 with its full count.
         return {
-            "rank1": [{"sample_id": r["sample_id"], "bin": r["bin"], "count": r["count"]} for r in rank1_rows],
-            "top10": [{"sample_id": r["sample_id"], "bin": r["bin"], "count": r["count"]} for r in top10_rows],
+            "rank1": [{"sample_id": r["sample_id"], "bin": r["bin"], "count": r["rank1_count"]}
+                      for r in rows if r["rank1_count"]],
+            "top10": [{"sample_id": r["sample_id"], "bin": r["bin"], "count": r["top10_count"]} for r in rows],
         }
     finally:
         conn.close()
@@ -873,34 +867,36 @@ def compute_outlier_warnings(rank1_data):
 
 
 def load_annotations(db_path):
-    """Load user annotations (notes/tags) from SQLite, creating the schema if needed.
+    """Load user annotations (notes/tags), creating the schema if needed.
+
+    The timestamp columns carry no DEFAULT: every route that writes a row supplies
+    created_at and updated_at itself.
 
     Returns:
         dict with keys: notes, tags, all_tags, tag_to_loci.
     """
-    conn = sqlite3.connect(db_path)
+    conn = duckdb_compat.connect(db_path)
     conn.execute("""CREATE TABLE IF NOT EXISTS notes (
         locus_id TEXT PRIMARY KEY,
         note_text TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS tags (
         locus_id TEXT NOT NULL,
         tag TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL,
         PRIMARY KEY (locus_id, tag)
     )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag)")
     conn.commit()
 
     notes = {}
-    for row in conn.execute("SELECT locus_id, note_text, updated_at FROM notes"):
+    for row in conn.execute("SELECT locus_id, note_text, updated_at FROM notes ORDER BY locus_id"):
         notes[row[0]] = {"note_text": row[1], "updated_at": row[2]}
 
     tags = {}
     tag_to_loci = collections.defaultdict(set)
-    for row in conn.execute("SELECT locus_id, tag FROM tags"):
+    for row in conn.execute("SELECT locus_id, tag FROM tags ORDER BY locus_id, tag"):
         tags.setdefault(row[0], []).append(row[1])
         tag_to_loci[row[1]].add(row[0])
 
@@ -920,43 +916,10 @@ def load_annotations(db_path):
 
 
 def get_db():
-    """Get a read-only SQLite connection to the single results database."""
-    db_path = app.config["DB_PATH"]
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    """Get a read-only DuckDB connection to the single results database."""
+    conn = duckdb_compat.connect(app.config["DB_PATH"], read_only=True)
+    conn.row_factory = duckdb_compat.Row
     return conn
-
-
-def get_max_locus_span():
-    """Return the largest End1Based - Start0Based across all loci (None if unknown).
-
-    The reference-region filter uses this to put a lower bound on Start0Based: a locus
-    can only overlap a region starting at ``start`` if it begins at or after
-    ``start - max_span``. Without that bound, the index range scan would have to walk
-    every locus on the chromosome from position 0 up to the region.
-
-    Computed once per process and cached, as an index-only scan of
-    ``REFERENCE_REGION_INDEX``. Without that index the region query cannot do the
-    Chrom/Start range scan the bound exists to tighten, so the (then unindexed, and
-    therefore expensive) MAX scan is skipped and None is returned, which simply leaves
-    the lower bound off. That verdict is deliberately not cached: the index can be added
-    to a database while the server is running (see the warning in validate_database), and
-    re-running the sqlite_master lookup on each region query costs nothing.
-
-    Returns:
-        The maximum locus span in bp, or None when it is not worth computing.
-    """
-    if "MAX_LOCUS_SPAN" not in app.config:
-        conn = get_db()
-        try:
-            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
-                                (REFERENCE_REGION_INDEX,)).fetchone():
-                return None
-            app.config["MAX_LOCUS_SPAN"] = conn.execute(
-                "SELECT MAX(End1Based - Start0Based) FROM loci").fetchone()[0]
-        finally:
-            conn.close()
-    return app.config["MAX_LOCUS_SPAN"]
 
 
 # ---------------------------------------------------------------------------
@@ -1064,7 +1027,7 @@ def validate_params():
     # page (default: 1)
     page_raw = request.args.get("page", "1")
     try:
-        params["page"] = parse_sqlite_int(page_raw)
+        params["page"] = parse_int64(page_raw)
         if params["page"] < 1:
             raise ValueError
     except ValueError:
@@ -1073,22 +1036,22 @@ def validate_params():
     # page_size (default: 50, max: 500)
     page_size_raw = request.args.get("page_size", "50")
     try:
-        params["page_size"] = parse_sqlite_int(page_size_raw)
+        params["page_size"] = parse_int64(page_size_raw)
         if params["page_size"] < 1 or params["page_size"] > 500:
             raise ValueError
     except ValueError:
         errors.append(f"page_size must be an integer between 1 and 500, got '{page_size_raw}'")
 
-    # SQLite binds the derived OFFSET, not `page`, so both have to be in range: page=2**62 with
+    # The derived OFFSET is bound, not `page`, so both have to be in range: page=2**62 with
     # page_size=50 passes the checks above and then overflows when bound.
     if "page" in params and "page_size" in params:
-        if (params["page"] - 1) * params["page_size"] > SQLITE_MAX_INT:
+        if (params["page"] - 1) * params["page_size"] > MAX_INT64:
             errors.append(f"page is too large for page_size={params['page_size']}, "
                           f"got '{page_raw}'")
 
     if request.args.get("min_expansion"):
         try:
-            params["min_expansion"] = parse_sqlite_int(request.args["min_expansion"])
+            params["min_expansion"] = parse_int64(request.args["min_expansion"])
             if params["min_expansion"] < 0:
                 raise ValueError
         except ValueError:
@@ -1139,7 +1102,7 @@ def validate_params():
 
     if request.args.get("min_repeats_threshold"):
         try:
-            params["min_repeats_threshold"] = parse_sqlite_int(request.args["min_repeats_threshold"])
+            params["min_repeats_threshold"] = parse_int64(request.args["min_repeats_threshold"])
         except ValueError:
             errors.append(f"min_repeats_threshold must be an integer, got '{request.args['min_repeats_threshold']}'")
 
@@ -1174,18 +1137,27 @@ def validate_params():
         except ValueError:
             errors.append(f"min_sigma_percentile must be a number between 0 and 1, got '{request.args['min_sigma_percentile']}'")
 
-    for flag_name in ("apply_pathogenic_threshold", "known_loci_only", "known_motifs_only", "mendelian_genes_only"):
+    for flag_name in ("apply_pathogenic_threshold", "known_loci_only", "known_motifs_only", "mendelian_genes_only",
+                      "exclude_vc_depth_filtered", "exclude_vc_size_filtered"):
         if request.args.get(flag_name, "").lower() in ("true", "1", "yes"):
             params[flag_name] = True
 
-    if request.args.get("phenotype_keyword"):
-        params["phenotype_keyword"] = [kw.strip() for kw in request.args["phenotype_keyword"].split(",") if kw.strip()]
+    # These list-valued filters are stored only when at least one entry survives the strip, the
+    # way the motif filter above is. A value that is all separators and blanks (",", " , ") is
+    # truthy as a request string but parses to nothing, and build_api_query would then emit
+    # "IN ()" or an empty "()", which DuckDB rejects as a syntax error. An empty list is the
+    # same as no filter at all, so drop it.
+    phenotype_keywords = [kw.strip() for kw in request.args.get("phenotype_keyword", "").split(",") if kw.strip()]
+    if phenotype_keywords:
+        params["phenotype_keyword"] = phenotype_keywords
 
-    if request.args.get("sample_id_keyword"):
-        params["sample_id_keyword"] = [kw.strip() for kw in request.args["sample_id_keyword"].split(",") if kw.strip()]
+    sample_id_keywords = [kw.strip() for kw in request.args.get("sample_id_keyword", "").split(",") if kw.strip()]
+    if sample_id_keywords:
+        params["sample_id_keyword"] = sample_id_keywords
 
-    if request.args.get("sample_id_like"):
-        params["sample_id_like"] = [kw.strip() for kw in request.args["sample_id_like"].split(",") if kw.strip()]
+    sample_id_like_keywords = [kw.strip() for kw in request.args.get("sample_id_like", "").split(",") if kw.strip()]
+    if sample_id_like_keywords:
+        params["sample_id_like"] = sample_id_like_keywords
 
     # search (optional, comma-separated; each term routed by shape, all OR'ed together). The
     # separate locus_id / reference_region / gene_symbol / gene_id parameters below still work
@@ -1208,13 +1180,14 @@ def validate_params():
     # cluster is at most this much larger than the repeat itself.
     if request.args.get("max_variation_cluster_size_diff"):
         try:
-            params["max_variation_cluster_size_diff"] = parse_sqlite_int(request.args["max_variation_cluster_size_diff"])
+            params["max_variation_cluster_size_diff"] = parse_int64(request.args["max_variation_cluster_size_diff"])
         except ValueError:
             errors.append("max_variation_cluster_size_diff must be an integer number of base pairs, "
                           f"got '{request.args['max_variation_cluster_size_diff']}'")
 
-    if request.args.get("locus_id"):
-        params["locus_id"] = [lid.strip() for lid in request.args["locus_id"].split(",") if lid.strip()]
+    locus_ids = [lid.strip() for lid in request.args.get("locus_id", "").split(",") if lid.strip()]
+    if locus_ids:
+        params["locus_id"] = locus_ids
 
     if request.args.get("reference_region"):
         region, error = parse_reference_region(request.args["reference_region"])
@@ -1233,8 +1206,9 @@ def validate_params():
         # ?gene_id=ENSG00000102081.5 match the stored spelling instead of silently returning
         # nothing. A value that is not an Ensembl gene id is passed through unchanged.
         params["gene_id"] = normalize_gene_id(request.args["gene_id"]) or request.args["gene_id"].strip()
-    if request.args.get("gene_symbol"):
-        params["gene_symbol"] = [gs.strip() for gs in request.args["gene_symbol"].split(",") if gs.strip()]
+    gene_symbols = [gs.strip() for gs in request.args.get("gene_symbol", "").split(",") if gs.strip()]
+    if gene_symbols:
+        params["gene_symbol"] = gene_symbols
 
     if request.args.get("motif_size"):
         clause, params_list, error = parse_motif_size_filter(request.args["motif_size"])
@@ -1267,16 +1241,22 @@ def validate_params():
     return params, None
 
 
-def build_api_order_by(params):
+def build_api_order_by(params, source_columns):
     """Build the ORDER BY clause from API parameters.
 
+    Args:
+        params: dict of validated query parameters.
+        source_columns: this database's loci column set. Most sort keys read an optional
+            annotation column (the sigma percentiles, the variation-cluster size, the
+            phenotype scores), and a build whose input TSV did not supply one has no such
+            column at all, so a sort key naming it is skipped rather than raising "no such
+            column" for the whole search. An empty set means "not introspected", and every
+            key is kept.
+
     Returns:
-        Tuple (order_by_clause, needs_phenotype_join). The second value is always
-        False (phenotype scores are denormalized onto loci); it is kept only for
-        the caller's signature.
+        The ORDER BY clause, as a string beginning with " ORDER BY".
     """
     ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
-    source_columns = app.config.get("DB_COLUMNS_SET", set())
     sort_list = list(params.get("sort_by") or ["count"])
 
     SORT_MAPPING = {
@@ -1288,7 +1268,21 @@ def build_api_order_by(params):
         "gene_phenotype": (f"MaxGenePhenoSim_{ot}", "DESC"),
         "sigma_hprc_rank": ("HPRC256_StdevPercentile", "ASC NULLS LAST"),
         "sigma_aou_rank": ("AoU1027_StdevPercentile", "ASC NULLS LAST"),
+        # Widest variation cluster first. DESC also puts the loci annotated with no variation
+        # cluster (NULL) last.
+        "variation_cluster": ("VariationClusterSizeDiff", "DESC"),
     }
+
+    # ORDER BY expression for the sort keys whose column cannot be ordered by as stored.
+    # VariationClusterSizeDiff is VARCHAR whenever the build saw a value that is not an integer
+    # (see result_database.infer_column_types), and ordering a VARCHAR by itself would compare
+    # digit strings ("999" above "4847"). The cast is harmless on the BIGINT case. TRY_CAST
+    # rather than CAST because DuckDB raises on a value that will not parse, where SQLite
+    # silently yielded 0; a value that will not parse sorts as NULL, which DESC puts last
+    # alongside the loci that have no variation cluster at all. The SORT_MAPPING column name
+    # stays the real one so the missing-column check below still tests a column this database
+    # either has or does not.
+    SORT_EXPRESSIONS = {"variation_cluster": "TRY_CAST(VariationClusterSizeDiff AS BIGINT)"}
 
     sequence = list(sort_list)
     for tiebreak in ("count", "region", "size"):
@@ -1300,44 +1294,35 @@ def build_api_order_by(params):
         col, direction = SORT_MAPPING[field]
         if source_columns and col not in source_columns:
             continue
-        order_parts.append(f"{col} {direction}")
+        order_parts.append(f"{SORT_EXPRESSIONS.get(field, col)} {direction}")
 
+    # LocusId last, so the order is a total one. Ties on every key above are common (count,
+    # gene_region_rank and allele size are all small integers), and DuckDB scans with several
+    # threads, so without a final unique key the tied rows come back in whatever order the
+    # threads finish in. That is not cosmetic: paging through a result whose order is unstable
+    # can show the same locus on two pages and never show another.
     if not order_parts:
         # Every mapped sort column is absent from this database. LocusId is in REQUIRED_COLUMNS, so
         # it is the one ordering that is always valid; naming a sort column here instead would
         # re-reference the very column the loop just skipped and raise "no such column".
-        return " ORDER BY LocusId ASC", False
-    return " ORDER BY " + ", ".join(order_parts), False
+        return " ORDER BY LocusId ASC"
+    return " ORDER BY " + ", ".join(order_parts) + ", LocusId ASC"
 
 
-def requires_full_loci_table(params, ot):
-    """Whether a query has to filter over `loci` rather than over a skinny sk_{ot} table.
-
-    The skinny tables project only the columns the common queries need. Start0Based / End1Based
-    are never projected, so a reference region (including one typed into the search box) always
-    falls back. The variation-cluster filter falls back only when this database's skinny tables
-    predate the column, so a rebuilt database answers it from the narrow table instead.
-
-    Args:
-        params: dict of validated query parameters.
-        ot: outlier-type suffix ("AllAlleles", "ShortAlleles", "HemizygousAlleles").
-
-    Returns:
-        True when the query must filter over the full loci table.
-    """
-    if ("reference_region_parsed" in params
-            or any(kind == "region" for kind, _value in params.get("search_terms", []))):
-        return True
-    if "max_variation_cluster_size_diff" in params:
-        return "VariationClusterSizeDiff" not in app.config.get("SKINNY_COLUMNS", {}).get(ot, set())
-    return False
+# The VariationClusterFilterReason value behind each "hide these loci" flag, and the icon it
+# draws in the results table's VC column. EXTENSION is the size filter, which is the name the UI
+# uses, since the raw value says nothing about what was measured.
+VC_FILTER_REASON_FLAGS = (
+    ("exclude_vc_depth_filtered", "DEPTH"),       # gold crossed-out circle
+    ("exclude_vc_size_filtered", "EXTENSION"),    # dark red crossed-out circle
+)
 
 
 def reference_region_clause(parsed_region):
     """Build the SQL that keeps the loci overlapping one reference region.
 
     Shared by the reference_region filter and by any region typed into the merged search box,
-    so both get the same index-friendly bounds.
+    so both get the same bounds.
 
     Args:
         parsed_region: (chrom, start_0based, end_1based) from parse_reference_region. The end
@@ -1348,27 +1333,23 @@ def reference_region_clause(parsed_region):
     """
     chrom, region_start, region_end = parsed_region
     # Chrom is matched against both naming conventions ("chr1" and "1") so the filter
-    # works whichever one the database uses; both are equality seeks on the leading
-    # column of REFERENCE_REGION_INDEX.
+    # works whichever one the database uses; either way it is an equality test DuckDB can
+    # evaluate against the Chrom column's per-row-group min/max.
     chrom_names = chromosome_name_variants(chrom)
     region_clauses = [f"loci.Chrom IN ({','.join('?' * len(chrom_names))})"]
     region_params = list(chrom_names)
     if region_end is not None:
         # Half-open overlap: the locus starts before the region ends and ends after
-        # the region starts.
+        # the region starts. Both comparisons also drop a locus whose coordinate is NULL,
+        # which is right for a coordinate filter.
         region_clauses.append("loci.Start0Based < ?")
         region_params.append(region_end)
         region_clauses.append("loci.End1Based > ?")
         region_params.append(region_start)
-    # A locus that overlaps the region cannot start before this. The bound is
-    # redundant with End1Based > region_start, but it is what lets SQLite range-scan
-    # REFERENCE_REGION_INDEX (and stay inside it) rather than walking the whole
-    # chromosome and reading each locus from the table. It stays in even for a
-    # whole-chromosome region, where it is just >= 0, for the same reason. A locus
-    # with no Start0Based is dropped, which is right for a coordinate filter.
-    max_span = get_max_locus_span()
-    region_clauses.append("loci.Start0Based >= ?")
-    region_params.append(max(0, region_start - max_span) if max_span is not None else 0)
+    else:
+        # A whole chromosome has no coordinate comparison to drop the loci with no
+        # Start0Based, so say so outright.
+        region_clauses.append("loci.Start0Based IS NOT NULL")
     return " AND ".join(region_clauses), region_params
 
 
@@ -1525,18 +1506,45 @@ def build_api_query(params):
             clauses.append("1=0")
 
     if "phenotype_keyword" in params:
-        kw_clauses = [f"FirstAffectedPhenotype_{ot} LIKE ? COLLATE NOCASE" for _ in params["phenotype_keyword"]]
-        clauses.append(f"({' OR '.join(kw_clauses)})")
-        sql_params.extend([f"%{kw}%" for kw in params["phenotype_keyword"]])
+        # A keyword selects a locus when ANY of its outlier samples carries that phenotype. The
+        # per-outlier phenotypes live in swim_plot, one row per outlier entry, so the filter is
+        # answered from there whenever the database has that table: the loci table's
+        # First/Second/ThirdAffectedPhenotype columns are a three-deep display summary of the
+        # affected outliers only (analysis_columns fills exactly three ranks), so matching them
+        # instead would drop a locus whose only matching phenotype belongs to its fourth affected
+        # outlier or to an unaffected one. The swim plot matches phenotype_description on every
+        # outlier row, and this is the same predicate over the same rows, so the two views select
+        # the same loci. Without a swim_plot table there is no swim plot to disagree with, and the
+        # summary columns are the only phenotypes the database has, so they are used instead.
+        if app.config.get("HAS_SWIM_PLOT_PHENOTYPES"):
+            kw_clauses = ["phenotype_description ILIKE ?" for _ in params["phenotype_keyword"]]
+            clauses.append("LocusId IN (SELECT LocusId FROM swim_plot WHERE outlier_type = ? "
+                           f"AND ({' OR '.join(kw_clauses)}))")
+            sql_params.append(ot)
+            sql_params.extend(f"%{kw}%" for kw in params["phenotype_keyword"])
+        else:
+            phenotype_columns = [
+                f"{col_prefix}AffectedPhenotype_{ot}" for col_prefix in ("First", "Second", "Third")
+                if not source_columns or f"{col_prefix}AffectedPhenotype_{ot}" in source_columns
+            ]
+            if phenotype_columns:
+                kw_clauses = ["(" + " OR ".join(f"{column} ILIKE ?" for column in phenotype_columns) + ")"
+                              for _ in params["phenotype_keyword"]]
+                clauses.append(f"({' OR '.join(kw_clauses)})")
+                for kw in params["phenotype_keyword"]:
+                    sql_params.extend([f"%{kw}%"] * len(phenotype_columns))
+            else:
+                # No phenotype column at all: match no rows rather than ignoring the filter.
+                clauses.append("1=0")
 
     if "sample_id_keyword" in params:
-        # These are exact sample ids picked from a dropdown, matched by LIKE only because the ids
+        # These are exact sample ids picked from a dropdown, matched by ILIKE only because the ids
         # are packed into one "{n}x:{sample_id},..." string. Sample ids routinely contain "_",
-        # which is LIKE's single-character wildcard, so escape the metacharacters; otherwise
+        # which is ILIKE's single-character wildcard, so escape the metacharacters; otherwise
         # "sample_1" would also match the unrelated "sampleX1".
         kw_clauses = [
-            f"((',' || OutlierSampleIds_{ot} || ',') LIKE ? ESCAPE '\\' COLLATE NOCASE"
-            f" OR OutlierSampleIds_{ot} LIKE ? ESCAPE '\\' COLLATE NOCASE)"
+            f"((',' || OutlierSampleIds_{ot} || ',') ILIKE ? ESCAPE '\\'"
+            f" OR OutlierSampleIds_{ot} ILIKE ? ESCAPE '\\')"
             for _ in params["sample_id_keyword"]
         ]
         clauses.append(f"({' OR '.join(kw_clauses)})")
@@ -1545,9 +1553,18 @@ def build_api_query(params):
             sql_params.extend([f"%:{escaped},%", f"%:{escaped}:%"])
 
     if "sample_id_like" in params:
-        kw_clauses = [f"OutlierSampleIds_{ot} LIKE ? COLLATE NOCASE" for _ in params["sample_id_like"]]
+        # ILIKE against the whole packed string would also match allele sizes and the "x:"
+        # delimiters ("15" matching "15x:sampleA"), so split it into entries and match inside each
+        # entry's sample-id field only, which is its second ":"-separated field. Wildcards are
+        # escaped for the same reason as in sample_id_keyword above: a keyword such as "sample_1"
+        # means a literal underscore, not ILIKE's single-character wildcard.
+        kw_clauses = [
+            f"len(list_filter(string_split(OutlierSampleIds_{ot}, ','),"
+            f" entry -> split_part(entry, ':', 2) ILIKE ? ESCAPE '\\')) > 0"
+            for _ in params["sample_id_like"]
+        ]
         clauses.append(f"({' OR '.join(kw_clauses)})")
-        sql_params.extend([f"%{kw}%" for kw in params["sample_id_like"]])
+        sql_params.extend([f"%{escape_like_wildcards(kw)}%" for kw in params["sample_id_like"]])
 
     if "locus_id" in params:
         clauses.append(f"LocusId IN ({','.join('?' * len(params['locus_id']))})")
@@ -1564,36 +1581,67 @@ def build_api_query(params):
     # no terms at all the filter matches nothing rather than everything.
     if "search_terms" in params:
         search_clauses = []
+        search_params = []
+        locus_id_values = []
         for kind, value in params["search_terms"]:
             if kind == "locus_id":
-                search_clauses.append("LocusId = ?")
-                sql_params.append(value)
+                # Collected into the one set lookup built below instead of a predicate per term.
+                locus_id_values.append(value.lower())
             elif kind == "gene_id":
                 if not source_columns or "gene_id" in source_columns:
                     search_clauses.append("gene_id = ?")
-                    sql_params.append(value)
+                    search_params.append(value)
             elif kind == "gene_symbol":
                 if "GeneTableGeneSymbol" in app.config["DB_COLUMNS_SET"]:
-                    search_clauses.append("GeneTableGeneSymbol LIKE ? COLLATE NOCASE")
-                    sql_params.append(f"%{value}%")
+                    search_clauses.append("GeneTableGeneSymbol ILIKE ?")
+                    search_params.append(f"%{value}%")
             else:
                 clause, region_params = reference_region_clause(value)
                 search_clauses.append(f"({clause})")
-                sql_params.extend(region_params)
+                search_params.extend(region_params)
+        if locus_id_values:
+            # One "lower(LocusId) IN (...)" for every pasted id rather than one ILIKE each: a
+            # chain of N ILIKEs costs N comparisons per row, while the IN list is a single hash
+            # probe DuckDB can also answer from the column's statistics. Pasting a few hundred
+            # ids is normal here, so the difference is seconds per request.
+            # Both sides are lower-cased because the build stores a locus id as the input matrix
+            # spelled it, which is what the ILIKE was there for. An IN list holds no wildcards,
+            # so a contig name carrying "_" needs no escaping and matches literally.
+            search_clauses.insert(0, f"lower(LocusId) IN ({','.join('?' * len(locus_id_values))})")
+            search_params[:0] = locus_id_values
         clauses.append(f"({' OR '.join(search_clauses)})" if search_clauses else "0")
+        sql_params.extend(search_params)
 
-    # Max variation cluster size diff. The TRExplorer column is TEXT, so it is compared
-    # numerically. A locus with no variation cluster has no variation beyond the repeat itself,
-    # so it passes any maximum.
+    # Max variation cluster size diff, compared numerically. The column's storage type depends on
+    # the input: result_database.infer_column_types declares it BIGINT when every value the build
+    # saw was an integer, and VARCHAR when any was not. TRY_CAST covers both, yielding NULL for a
+    # blank or non-numeric value. Comparing the column to '' as well would raise on the BIGINT
+    # case ("Could not convert string '' to INT64"), and is unnecessary: COALESCE sends a blank
+    # to 0, which passes any maximum. A locus with no variation cluster has no variation beyond
+    # the repeat itself, so it passes any maximum.
     if "max_variation_cluster_size_diff" in params:
-        # The clause deliberately passes loci whose cluster size is unknown (NULL or ''), so a
-        # database with no VariationClusterSizeDiff column at all is the same situation for every
-        # locus: add no clause rather than the "1=0" the filters below use, which would contradict
-        # this filter's own treatment of missing data and return an empty result set.
+        # The clause deliberately passes loci whose cluster size is unknown, so a database with no
+        # VariationClusterSizeDiff column at all is the same situation for every locus: add no
+        # clause rather than the "1=0" the filters below use, which would contradict this filter's
+        # own treatment of missing data and return an empty result set.
         if not source_columns or "VariationClusterSizeDiff" in source_columns:
-            clauses.append("(loci.VariationClusterSizeDiff IS NULL OR loci.VariationClusterSizeDiff = '' "
-                           "OR CAST(loci.VariationClusterSizeDiff AS INTEGER) <= ?)")
+            clauses.append("(loci.VariationClusterSizeDiff IS NULL "
+                           "OR COALESCE(TRY_CAST(loci.VariationClusterSizeDiff AS BIGINT), 0) <= ?)")
             sql_params.append(params["max_variation_cluster_size_diff"])
+
+    # Filter: drop loci whose variation cluster was computed and then filtered out, which the
+    # results table marks with a crossed-out circle in the VC column. A locus that was never
+    # filtered has no reason recorded, so the NULL check keeps it. These are exclusions, so a
+    # database with no VariationClusterFilterReason column recorded no locus as filtered out and
+    # there is nothing to exclude: add no clause, the way the maximum above does. A "1=0" here
+    # would empty the whole result set the moment either box is ticked.
+    for flag_name, filter_reason in VC_FILTER_REASON_FLAGS:
+        if not params.get(flag_name):
+            continue
+        if not source_columns or "VariationClusterFilterReason" in source_columns:
+            clauses.append("(loci.VariationClusterFilterReason IS NULL "
+                           "OR loci.VariationClusterFilterReason != ?)")
+            sql_params.append(filter_reason)
 
     if "chrom" in params:
         clauses.append("Chrom = ?")
@@ -1608,7 +1656,7 @@ def build_api_query(params):
 
     if "gene_symbol" in params:
         if "GeneTableGeneSymbol" in app.config["DB_COLUMNS_SET"]:
-            gs_clauses = ["GeneTableGeneSymbol LIKE ? COLLATE NOCASE" for _ in params["gene_symbol"]]
+            gs_clauses = ["GeneTableGeneSymbol ILIKE ?" for _ in params["gene_symbol"]]
             clauses.append(f"({' OR '.join(gs_clauses)})")
             sql_params.extend([f"%{gs}%" for gs in params["gene_symbol"]])
         else:
@@ -1640,49 +1688,33 @@ def build_api_query(params):
             clauses.append("1=0")
 
     where = " AND ".join(clauses) if clauses else "1=1"
-    order_by, _ = build_api_order_by(params)
     motif_count_col = "CanonicalMotif" if "CanonicalMotif" in source_columns else "Motif"
     # gene_region is an optional annotation column. Without it the region summary simply has
     # nothing to report; querying for it anyway would fail the whole /api/v1/loci request.
     has_gene_region = not source_columns or "gene_region" in source_columns
 
-    # The reference-region filter reads Start0Based / End1Based, which the skinny tables never
-    # project, so a region query always runs against the full loci table -- where
-    # REFERENCE_REGION_INDEX turns it into a b-tree range scan, far more selective than the skinny
-    # table's sequential scan anyway. The variation-cluster filter falls back only against older
-    # skinny tables built before VariationClusterSizeDiff was projected (skinny_tables.py's
-    # shared_columns includes it now), so a rebuilt database answers it from the narrow table. The
-    # deferred-lookup shape below is kept either way, so the sort never holds wide rows.
-    if requires_full_loci_table(params, ot):
-        filter_table = "loci"
-    elif app.config.get("HAS_SKINNY", False):
-        filter_table = f"sk_{ot}"
-    else:
-        filter_table = None
+    order_by = build_api_order_by(params, source_columns)
 
-    if filter_table:
-        inner = f"SELECT LocusId FROM {filter_table} AS loci WHERE {where}{order_by} LIMIT ? OFFSET ?"
-        select_query = (f"SELECT loci.* FROM loci "
-                        f"JOIN ({inner}) pick ON loci.LocusId = pick.LocusId{order_by}")
-        count_query = f"SELECT COUNT(*) FROM {filter_table} AS loci WHERE {where}"
-        motif_count_query = f"SELECT {motif_count_col}, COUNT(*) as count FROM {filter_table} AS loci WHERE {where} GROUP BY {motif_count_col} ORDER BY count DESC"
-        gene_region_count_query = (
-            f"SELECT gene_region, COUNT(*) as count FROM {filter_table} AS loci WHERE {where} GROUP BY gene_region"
-            if has_gene_region else None)
-    else:
-        select_query = f"SELECT * FROM loci WHERE {where}{order_by} LIMIT ? OFFSET ?"
-        count_query = f"SELECT COUNT(*) FROM loci WHERE {where}"
-        motif_count_query = f"SELECT {motif_count_col}, COUNT(*) as count FROM loci WHERE {where} GROUP BY {motif_count_col} ORDER BY count DESC"
-        gene_region_count_query = (
-            f"SELECT gene_region, COUNT(*) as count FROM loci WHERE {where} GROUP BY gene_region"
-            if has_gene_region else None)
+    # One pass over loci, with no inner "pick the LocusIds first" subquery in front of it.
+    # DuckDB is columnar: the filter and the sort read only the columns they name, and the
+    # remaining ~180 are read only for the page's rows, so deferring the wide read by hand
+    # would just make the table be scanned twice.
+    select_query = f"SELECT * FROM loci WHERE {where}{order_by} LIMIT ? OFFSET ?"
+    count_query = f"SELECT COUNT(*) FROM loci WHERE {where}"
+    # The motif name breaks ties on count, so two motifs with the same number of loci keep a
+    # fixed order in the response instead of swapping between identical requests.
+    motif_count_query = (f"SELECT {motif_count_col}, COUNT(*) as count FROM loci WHERE {where} "
+                         f"GROUP BY {motif_count_col} ORDER BY count DESC, {motif_count_col}")
+    gene_region_count_query = (
+        f"SELECT gene_region, COUNT(*) as count FROM loci WHERE {where} GROUP BY gene_region"
+        if has_gene_region else None)
 
     sql_params_with_pagination = sql_params + [params["page_size"], (params["page"] - 1) * params["page_size"]]
     return select_query, count_query, motif_count_query, gene_region_count_query, sql_params, sql_params_with_pagination
 
 
 def row_to_list_dict(row, ot):
-    """Convert a sqlite3.Row to a dict for the list endpoint.
+    """Convert a duckdb_compat.Row to a dict for the list endpoint.
 
     Selects curated columns and renames outlier-type-specific columns by stripping
     the _{ot} suffix. NaN values become None.
@@ -1842,6 +1874,29 @@ def build_sample_details(row_dict, raw_row, conn, lookups, phenotype_scores=None
     return result
 
 
+def strchive_inheritance_modes(value):
+    """Return a STRchive record's inheritance modes as a flat list of strings, or None.
+
+    The variant-catalog branch of compute_known_disease_info reports the top-level
+    ``inheritance`` as a flat list of mode strings, so the STRchive branch has to as well.
+    STRchive stores the value as a list already, so wrapping it unconditionally would return a
+    list inside a list.
+
+    Args:
+        value: A STRchive record's ``inheritance`` value: a list of mode strings, a single mode
+            string, or None.
+
+    Returns:
+        A list of mode strings, or None when nothing was recorded.
+    """
+    if not value:
+        return None
+    if isinstance(value, (list, tuple)):
+        modes = [mode for mode in value if mode]
+        return modes or None
+    return [value]
+
+
 def compute_known_disease_info(row, lookups):
     """Look up known-disease-locus info for a locus.
 
@@ -1885,7 +1940,10 @@ def compute_known_disease_info(row, lookups):
                 continue
             if compute_jaccard(start_0based, end_1based, interval.begin, interval.end) <= 0.66:
                 continue
-            for strchive_motif in interval.data.get("reference_motif_reference_orientation", []):
+            # Both motif lists, exactly as matches_disease_locus matches them during the build;
+            # checking only the reference motifs here would show no disease details for a locus
+            # the build flagged as known via a pathogenic motif.
+            for strchive_motif in strchive_locus_motifs(interval.data):
                 if motifs_match(motif, strchive_motif):
                     disease_info = interval.data
                     is_strchive = True
@@ -1900,7 +1958,10 @@ def compute_known_disease_info(row, lookups):
         return {
             "locus_id": disease_info.get("locus_id", disease_info.get("id")),
             "pathogenic_min": disease_info.get("pathogenic_min"),
-            "inheritance": [disease_info.get("inheritance")] if disease_info.get("inheritance") else None,
+            # Every record in the shipped STRchive file stores inheritance as a list, but an
+            # older cached file may store a bare string, so accept both and always report the
+            # flat list of modes the variant-catalog branch below returns.
+            "inheritance": strchive_inheritance_modes(disease_info.get("inheritance")),
             "diseases": [{
                 "name": disease_info.get("disease"),
                 "symbol": None,
@@ -1934,6 +1995,65 @@ def compute_known_disease_info(row, lookups):
     }
 
 
+def known_disease_pathogenic_min(chrom, start_0based, end_1based, motif, disease_trees,
+                                 strchive_trees):
+    """Return the lowest pathogenic minimum recorded for one locus, or None.
+
+    Matches the way locus_annotations.matches_disease_locus decides that a locus is a known
+    disease locus: overlap with Jaccard above 0.66 plus a motif match, the variant catalog first
+    and the STRchive trees as the fallback. Walking STRchive here too is what keeps the
+    pathogenic-threshold filter from dropping a locus that is known only through STRchive, whose
+    locus-detail page does report a pathogenic minimum.
+
+    Args:
+        chrom: The locus chromosome, with or without a "chr" prefix.
+        start_0based: The locus start, 0-based.
+        end_1based: The locus end, 1-based.
+        motif: The locus motif.
+        disease_trees: chrom -> IntervalTree of variant catalog disease loci.
+        strchive_trees: chrom -> IntervalTree of STRchive disease loci (may be empty).
+
+    Returns:
+        The smallest pathogenic minimum of the matching disease locus, or None when nothing
+        matches or the matched locus records no pathogenic minimum.
+    """
+    if not motif or start_0based is None or end_1based is None:
+        return None
+    chrom_key = chrom.replace("chr", "") if chrom else ""
+
+    catalog_tree = disease_trees.get(chrom_key) if disease_trees else None
+    if catalog_tree:
+        for interval in catalog_tree.overlap(start_0based, end_1based):
+            if not interval.data:
+                continue
+            if compute_jaccard(start_0based, end_1based, interval.begin, interval.end) <= 0.66:
+                continue
+            disease_motifs = [interval.data.get("RepeatUnit", "")] + (interval.data.get("PathogenicMotifs") or [])
+            if not any(motifs_match(motif, dm) for dm in disease_motifs):
+                continue
+            pathogenic_mins = [d.get("PathogenicMin") for d in interval.data.get("Diseases", [])
+                               if d.get("PathogenicMin") is not None]
+            # The catalog matched, so stop here even when it records no threshold: the STRchive
+            # trees are a fallback for loci the catalog does not know, exactly as in
+            # matches_disease_locus and compute_known_disease_info.
+            return min(pathogenic_mins) if pathogenic_mins else None
+
+    strchive_tree = strchive_trees.get(chrom_key) if strchive_trees else None
+    if strchive_tree:
+        for interval in strchive_tree.overlap(start_0based, end_1based):
+            if not interval.data:
+                continue
+            if compute_jaccard(start_0based, end_1based, interval.begin, interval.end) <= 0.66:
+                continue
+            # Both motif lists, the one definition of them, so the filter and the build agree on
+            # which loci STRchive knows.
+            if not any(motifs_match(motif, sm) for sm in strchive_locus_motifs(interval.data)):
+                continue
+            return interval.data.get("pathogenic_min")
+
+    return None
+
+
 def fetch_phenotype_scores(conn, locus_id):
     """Fetch phenotype scores for a locus, if the score tables exist.
 
@@ -1941,9 +2061,7 @@ def fetch_phenotype_scores(conn, locus_id):
         dict with 'per_outlier' and 'per_locus' keys, or {} when the tables are
         absent.
     """
-    tables = {row[0] for row in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()}
+    tables = duckdb_compat.list_tables(conn)
     if "per_outlier_phenotype_scores" not in tables:
         return {}
 
@@ -2019,9 +2137,7 @@ def fetch_all_phenotype_scores(conn):
         dict mapping locus_id to the same {'per_outlier': ..., 'per_locus': ...}
         structure fetch_phenotype_scores() returns for a single locus.
     """
-    tables = {row[0] for row in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()}
+    tables = duckdb_compat.list_tables(conn)
     if "per_outlier_phenotype_scores" not in tables:
         return {}
 
@@ -2083,7 +2199,7 @@ def fetch_all_phenotype_scores(conn):
 
 
 def row_to_full_dict(row):
-    """Convert a sqlite3.Row to a dict with all columns (NaN -> None)."""
+    """Convert a duckdb_compat.Row to a dict with all columns (NaN -> None)."""
     d = dict(row)
     for k, v in d.items():
         if isinstance(v, float) and v != v:
@@ -2176,6 +2292,38 @@ def get_annotations(locus_id):
     return jsonify(result)
 
 
+# Flask serves requests on several threads, so two annotation writes can overlap. DuckDB does not
+# wait for the other writer the way sqlite3's file lock and busy timeout did: it raises on the
+# second connection instead. Every write to the annotations database therefore runs under this one
+# process-wide lock, which is enough because that database is only ever written from here.
+ANNOTATION_WRITE_LOCK = threading.Lock()
+
+
+def execute_annotation_write(statement, values):
+    """Run one write against the annotations database, serialized against the other writers.
+
+    Args:
+        statement: The SQL statement to run.
+        values: Its bind parameters.
+
+    Returns:
+        None when the write succeeded, or a string describing why it failed.
+    """
+    with ANNOTATION_WRITE_LOCK:
+        try:
+            conn = duckdb_compat.connect(app.config["ANNOTATIONS_DB_PATH"])
+        except Exception as e:
+            return str(e)
+        try:
+            conn.execute(statement, values)
+            conn.commit()
+        except Exception as e:
+            return str(e)
+        finally:
+            conn.close()
+    return None
+
+
 @app.route("/api/v1/annotations/<path:locus_id>/note", methods=["PUT"])
 def upsert_note(locus_id):
     """Upsert a note for a locus."""
@@ -2185,14 +2333,13 @@ def upsert_note(locus_id):
         return jsonify({"error": "note_text is required and cannot be empty"}), 400
 
     now = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
-    conn = sqlite3.connect(app.config["ANNOTATIONS_DB_PATH"])
-    conn.execute(
+    error = execute_annotation_write(
         "INSERT INTO notes (locus_id, note_text, created_at, updated_at) VALUES (?, ?, ?, ?) "
         "ON CONFLICT(locus_id) DO UPDATE SET note_text=excluded.note_text, updated_at=excluded.updated_at",
         (locus_id, note_text, now, now),
     )
-    conn.commit()
-    conn.close()
+    if error:
+        return jsonify({"error": "Could not save the note", "detail": error}), 500
 
     app.config["ANNOTATIONS"]["notes"][locus_id] = {"note_text": note_text, "updated_at": now}
     return jsonify({"locus_id": locus_id, "note": app.config["ANNOTATIONS"]["notes"][locus_id]})
@@ -2201,10 +2348,9 @@ def upsert_note(locus_id):
 @app.route("/api/v1/annotations/<path:locus_id>/note", methods=["DELETE"])
 def delete_note(locus_id):
     """Delete a note for a locus."""
-    conn = sqlite3.connect(app.config["ANNOTATIONS_DB_PATH"])
-    conn.execute("DELETE FROM notes WHERE locus_id = ?", (locus_id,))
-    conn.commit()
-    conn.close()
+    error = execute_annotation_write("DELETE FROM notes WHERE locus_id = ?", (locus_id,))
+    if error:
+        return jsonify({"error": "Could not delete the note", "detail": error}), 500
     app.config["ANNOTATIONS"]["notes"].pop(locus_id, None)
     return jsonify({"locus_id": locus_id, "deleted": True})
 
@@ -2218,10 +2364,11 @@ def add_tag(locus_id):
         return jsonify({"error": "tag is required and cannot be empty"}), 400
 
     now = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
-    conn = sqlite3.connect(app.config["ANNOTATIONS_DB_PATH"])
-    conn.execute("INSERT OR IGNORE INTO tags (locus_id, tag, created_at) VALUES (?, ?, ?)", (locus_id, tag, now))
-    conn.commit()
-    conn.close()
+    error = execute_annotation_write(
+        "INSERT OR IGNORE INTO tags (locus_id, tag, created_at) VALUES (?, ?, ?)",
+        (locus_id, tag, now))
+    if error:
+        return jsonify({"error": "Could not add the tag", "detail": error}), 500
 
     annotations = app.config["ANNOTATIONS"]
     annotations["tags"].setdefault(locus_id, [])
@@ -2235,10 +2382,10 @@ def add_tag(locus_id):
 @app.route("/api/v1/annotations/<path:locus_id>/tags/<path:tag>", methods=["DELETE"])
 def remove_tag(locus_id, tag):
     """Remove a user tag from a locus."""
-    conn = sqlite3.connect(app.config["ANNOTATIONS_DB_PATH"])
-    conn.execute("DELETE FROM tags WHERE locus_id = ? AND tag = ?", (locus_id, tag))
-    conn.commit()
-    conn.close()
+    error = execute_annotation_write(
+        "DELETE FROM tags WHERE locus_id = ? AND tag = ?", (locus_id, tag))
+    if error:
+        return jsonify({"error": "Could not remove the tag", "detail": error}), 500
 
     annotations = app.config["ANNOTATIONS"]
     if locus_id in annotations["tags"]:
@@ -2510,6 +2657,10 @@ def export_expansion_hunter(conn, query, count_query, sql_params, ot, params):
             rows = conn.execute(query, sql_params).fetchall()
             results = [to_dict(row) for row in rows]
             lookups = app.config["LOOKUPS"]
+            # Bulk-loaded once for the whole export, the way export_json does it: passing the
+            # per-locus scores in keeps build_sample_details from running its own
+            # fetch_phenotype_scores() query (plus a list_tables() call) for every locus.
+            all_phenotype_scores = fetch_all_phenotype_scores(conn)
             for row_dict, raw_row in zip(results, rows):
                 thresholds = compute_plot_thresholds(
                     row_dict,
@@ -2522,7 +2673,9 @@ def export_expansion_hunter(conn, query, count_query, sql_params, ot, params):
                         {"If": allele, "Is": ">=", "Threshold": thresholds[allele]}
                         for allele in ("LongAllele", "ShortAllele") if allele in thresholds
                     ]
-                sample_details = build_sample_details(row_dict, raw_row, conn, lookups)
+                sample_details = build_sample_details(
+                    row_dict, raw_row, conn, lookups,
+                    phenotype_scores=all_phenotype_scores.get(row_dict.get("LocusId", ""), {}))
                 if sample_details:
                     row_dict["Samples"] = sample_details
         finally:
@@ -2762,7 +2915,7 @@ def get_swim_plot_data():
     if gene_symbol_raw:
         symbols = [gs.strip() for gs in gene_symbol_raw.split(",") if gs.strip()]
         if symbols:
-            gs_clauses = ["GeneTableGeneSymbol LIKE ? COLLATE NOCASE" for _ in symbols]
+            gs_clauses = ["GeneTableGeneSymbol ILIKE ?" for _ in symbols]
             extra_clauses.append(f"({' OR '.join(gs_clauses)})")
             extra_params.extend([f"%{gs}%" for gs in symbols])
 
@@ -2779,26 +2932,34 @@ def get_swim_plot_data():
     # which for a whole chromosome would be hundreds of thousands of bind parameters.
     if search_raw:
         search_clauses = []
+        search_params = []
+        locus_id_values = []
         for term in split_search_terms(search_raw):
             kind, value, error = classify_search_term(term)
             if error:
                 return jsonify({"error": "Invalid parameter", "detail": error}), 400
             if kind == "locus_id":
-                search_clauses.append("LocusId = ?")
-                extra_params.append(value)
+                # Collected into the one set lookup built below instead of a predicate per term.
+                locus_id_values.append(value.lower())
             elif kind == "gene_id":
                 if not source_columns or "gene_id" in source_columns:
                     search_clauses.append("gene_id = ?")
-                    extra_params.append(value)
+                    search_params.append(value)
             elif kind == "gene_symbol":
                 if not source_columns or "GeneTableGeneSymbol" in source_columns:
-                    search_clauses.append("GeneTableGeneSymbol LIKE ? COLLATE NOCASE")
-                    extra_params.append(f"%{value}%")
+                    search_clauses.append("GeneTableGeneSymbol ILIKE ?")
+                    search_params.append(f"%{value}%")
             else:
                 clause, region_params = reference_region_clause(value)
                 search_clauses.append(f"LocusId IN (SELECT LocusId FROM loci AS loci WHERE {clause})")
-                extra_params.extend(region_params)
+                search_params.extend(region_params)
+        if locus_id_values:
+            # Matched the same way the results table matches it (see build_api_query): one
+            # case-insensitive set lookup over every pasted id, which needs no wildcard escaping.
+            search_clauses.insert(0, f"lower(LocusId) IN ({','.join('?' * len(locus_id_values))})")
+            search_params[:0] = locus_id_values
         extra_clauses.append(f"({' OR '.join(search_clauses)})" if search_clauses else "1=0")
+        extra_params.extend(search_params)
 
     # Max variation cluster size diff. swim_plot does not copy VariationClusterSizeDiff, so this
     # is answered against loci too, the same way a region term is.
@@ -2807,7 +2968,7 @@ def get_swim_plot_data():
     vc_filter_max = None
     if max_variation_cluster_size_diff:
         try:
-            max_vc_diff = parse_sqlite_int(max_variation_cluster_size_diff)
+            max_vc_diff = parse_int64(max_variation_cluster_size_diff)
         except ValueError:
             return jsonify({
                 "error": "Invalid parameter",
@@ -2816,16 +2977,17 @@ def get_swim_plot_data():
             }), 400
         # source_columns is the loci column set (configure_app fills DB_COLUMNS_SET from
         # "SELECT * FROM loci LIMIT 1"), and VariationClusterSizeDiff is only ever read from loci,
-        # so the same set guards this filter. Without the column the filter cannot be answered, so
-        # match nothing instead of raising "no such column", the same choice build_api_query makes.
+        # so the same set guards this filter. The clause below deliberately keeps a locus whose
+        # cluster size is unknown, so a database with no such column at all is that same situation
+        # for every locus: add no clause, exactly as build_api_query does. Matching nothing here
+        # would empty the swim plot for a request whose results table still returns every locus.
         if not source_columns or "VariationClusterSizeDiff" in source_columns:
             # This endpoint runs one query per motif category, so an inline subquery over loci
-            # would re-scan that table 25 times for a single chart. Materialize the matching
-            # LocusIds once, after the connection is opened, and probe them by index instead.
+            # would re-scan that column 25 times for a single chart. Materialize the matching
+            # LocusIds into a temp table once, after the connection is opened, and join against
+            # that instead.
             vc_filter_max = max_vc_diff
             extra_clauses.append("LocusId IN (SELECT LocusId FROM vc_filtered_loci)")
-        else:
-            extra_clauses.append("1=0")
 
     if min_pli:
         try:
@@ -2841,27 +3003,29 @@ def get_swim_plot_data():
     if phenotype_keyword_raw:
         keywords = [kw.strip() for kw in phenotype_keyword_raw.split(",") if kw.strip()]
         if keywords:
-            kw_clauses = ["phenotype_description LIKE ? COLLATE NOCASE" for _ in keywords]
+            kw_clauses = ["phenotype_description ILIKE ?" for _ in keywords]
             extra_clauses.append(f"({' OR '.join(kw_clauses)})")
             extra_params.extend([f"%{kw}%" for kw in keywords])
 
     if sample_id_keyword_raw:
         keywords = [kw.strip() for kw in sample_id_keyword_raw.split(",") if kw.strip()]
         if keywords:
-            kw_clauses = ["sample_id = ? COLLATE NOCASE" for _ in keywords]
+            kw_clauses = ["lower(sample_id) = lower(?)" for _ in keywords]
             extra_clauses.append(f"({' OR '.join(kw_clauses)})")
             extra_params.extend(keywords)
 
     if sample_id_like_raw:
         keywords = [kw.strip() for kw in sample_id_like_raw.split(",") if kw.strip()]
         if keywords:
-            kw_clauses = ["sample_id LIKE ? COLLATE NOCASE" for _ in keywords]
+            # Escaped like the loci list's sample_id_like, so the same keyword selects the same
+            # samples in both views.
+            kw_clauses = ["sample_id ILIKE ? ESCAPE '\\'" for _ in keywords]
             extra_clauses.append(f"({' OR '.join(kw_clauses)})")
-            extra_params.extend([f"%{kw}%" for kw in keywords])
+            extra_params.extend([f"%{escape_like_wildcards(kw)}%" for kw in keywords])
 
     if min_expansion:
         try:
-            min_expansion_value = parse_sqlite_int(min_expansion)
+            min_expansion_value = parse_int64(min_expansion)
             if min_expansion_value < 0:
                 raise ValueError
         except ValueError:
@@ -2909,27 +3073,30 @@ def get_swim_plot_data():
 
     conn = get_db()
     try:
-        if not conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='swim_plot'"
-        ).fetchone():
+        if "swim_plot" not in duckdb_compat.list_tables(conn):
             return jsonify({"error": "swim_plot table not found", "detail": "The database has no swim_plot table."}), 500
 
         if vc_filter_max is not None:
-            # A read-only main database still allows temp tables (they live in the separate temp
-            # database), so this costs one scan of loci per request instead of one per category.
+            # A read-only main database still allows temp tables (they live in memory, in this
+            # connection's own temp schema), so this costs one scan of loci's one relevant
+            # column per request instead of one per category.
             conn.execute(
-                "CREATE TEMP TABLE vc_filtered_loci AS SELECT LocusId FROM loci "
-                "WHERE VariationClusterSizeDiff IS NULL OR VariationClusterSizeDiff = '' "
-                "OR CAST(VariationClusterSizeDiff AS INTEGER) <= ?", (vc_filter_max,))
-            conn.execute("CREATE INDEX temp.idx_vc_filtered_loci ON vc_filtered_loci(LocusId)")
+                "CREATE OR REPLACE TEMP TABLE vc_filtered_loci AS SELECT LocusId FROM loci "
+                "WHERE VariationClusterSizeDiff IS NULL "
+                "OR COALESCE(TRY_CAST(VariationClusterSizeDiff AS BIGINT), 0) <= ?",
+                (vc_filter_max,))
 
+        # LocusId and sample_id follow allele_size in the ORDER BY so the top 500 is a decided
+        # set rather than an arbitrary one: hundreds of rows share an allele size, and DuckDB
+        # reads the table with several threads, so ordering by allele_size alone would pick a
+        # different 500 of the tied rows on each request.
         for motif_category in categories:
             query = ("""SELECT rowid, allele_size, motif_category, affected_status,
                        LocusId, sample_id, Motif, gene_region, GeneTableGeneSymbol,
                        purity, methylation, family_id, sex, analysis_status, phenotype_description
                 FROM swim_plot
                 WHERE outlier_type = ? AND motif_category = ?""" + extra_where + """
-                ORDER BY allele_size DESC LIMIT 500""")
+                ORDER BY allele_size DESC, LocusId, sample_id LIMIT 500""")
             for row in conn.execute(query, [ot, motif_category] + extra_params).fetchall():
                 entry = {
                     "rowid": row["rowid"],
@@ -3106,15 +3273,16 @@ def get_sample_outlier_stats():
 
     conn = get_db()
     try:
-        if not conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='swim_plot'"
-        ).fetchone():
+        if "swim_plot" not in duckdb_compat.list_tables(conn):
             return jsonify({"error": "swim_plot table not found", "detail": "The database has no swim_plot table."}), 500
 
         locus_row = None
         if locus_id:
+            # One row per outlier sample matches, and they all carry the same MotifSize and
+            # CanonicalMotif, but the LIMIT still needs an ORDER BY to name a single one of them.
             locus_row = conn.execute(
-                "SELECT MotifSize, CanonicalMotif FROM swim_plot WHERE LocusId = ? AND outlier_type = ? LIMIT 1",
+                "SELECT MotifSize, CanonicalMotif FROM swim_plot WHERE LocusId = ? AND outlier_type = ? "
+                "ORDER BY sample_id, allele_size LIMIT 1",
                 (locus_id, ot),
             ).fetchone()
 
@@ -3193,6 +3361,8 @@ def get_schema():
             "mendelian_genes_only": {"type": "boolean"},
             "search": {"type": "string", "description": "Comma-separated search terms, OR-combined. Each term is routed by its shape: a locus id (2-89831737-89831752-CCATT), an Ensembl gene id (ENSG00000102081), a reference region (chr16:11579459-11579529, chr16:11579459 or chr16), or otherwise a gene symbol matched as a substring. Commas inside a region's coordinates are treated as thousands separators, not term separators"},
             "max_variation_cluster_size_diff": {"type": "integer", "description": "Keep loci whose TRExplorer variation cluster is at most this many base pairs larger than the repeat itself. Loci with no variation cluster annotation are kept"},
+            "exclude_vc_depth_filtered": {"type": "boolean", "description": "Drop loci where no variation cluster could be computed because the region had too little coverage in the population dataset the clusters were derived from (VariationClusterFilterReason = DEPTH), shown as a gold crossed-out circle in the VC column"},
+            "exclude_vc_size_filtered": {"type": "boolean", "description": "Drop loci where a variation cluster was computed and then discarded because it was wider than the maximum allowed (VariationClusterFilterReason = EXTENSION), shown as a dark red crossed-out circle in the VC column"},
             # The legacy parameters below are superseded by 'search', which the UI sends instead; they still work for direct API callers.
             "gene_id": {"type": "string"},
             "gene_symbol": {"type": "string"},
@@ -3202,6 +3372,8 @@ def get_schema():
         },
         "sort_options": list(VALID_SORTS),
         "total_loci": app.config.get("TOTAL_LOCI", 0),
+        # None for a database built before the pipeline started recording the sample count
+        "total_samples": app.config.get("TOTAL_SAMPLES"),
         "database_columns": app.config.get("DB_COLUMNS", []),
         "all_tags": app.config["ANNOTATIONS"]["all_tags"],
         "sample_ids": app.config.get("SAMPLE_IDS", []),
@@ -3240,8 +3412,8 @@ def handle_exception(e):
 # ---------------------------------------------------------------------------
 
 
-def configure_app(db_path, sample_table=None, known_loci_json=None, annotations_db="annotations.db",
-                  strchive_loci_json=None):
+def configure_app(db_path, sample_table=None, known_loci_json=None,
+                  annotations_db="annotations.duckdb", strchive_loci_json=None):
     """Populate app.config for a single results database.
 
     This is the shared startup path used by both main() and the test client, so the
@@ -3250,8 +3422,6 @@ def configure_app(db_path, sample_table=None, known_loci_json=None, annotations_
     """
     db_path = os.path.abspath(db_path)
     app.config["DB_PATH"] = db_path
-    # Drop any max-locus-span cached from a previously configured database.
-    app.config.pop("MAX_LOCUS_SPAN", None)
     # The templates still expect a db_labels list (their source-selector block is
     # guarded by `db_labels|length > 1`, so a single entry hides the selector).
     app.config["DB_LABELS"] = ["TRails"]
@@ -3263,11 +3433,15 @@ def configure_app(db_path, sample_table=None, known_loci_json=None, annotations_
         sample_lookup, affected_lookup, analysis_lookup = {}, {}, {}
 
     # Known disease loci (optional, hermetic: no network fetch by default). A
-    # cached STRchive-loci JSON, when supplied, adds the detail-page fallback.
-    if known_loci_json and os.path.exists(known_loci_json):
+    # cached STRchive-loci JSON, when supplied, adds the detail-page fallback. Either catalog is
+    # enough on its own: load_known_disease_loci takes filepath=None to load only the STRchive
+    # fallback, so a STRchive-only invocation still gets its disease details.
+    known_loci_path = known_loci_json if known_loci_json and os.path.exists(known_loci_json) else None
+    strchive_path = strchive_loci_json if strchive_loci_json and os.path.exists(strchive_loci_json) else None
+    if known_loci_path or strchive_path:
         disease_trees, strchive_trees, locus_lookup = load_known_disease_loci(
-            known_loci_json, fetch_strchive=False,
-            strchive_filepath=strchive_loci_json if strchive_loci_json and os.path.exists(strchive_loci_json) else None,
+            known_loci_path, fetch_strchive=False,
+            strchive_filepath=strchive_path,
             build_locus_lookup=True,
         )
     else:
@@ -3287,14 +3461,22 @@ def configure_app(db_path, sample_table=None, known_loci_json=None, annotations_
     app.config["ANNOTATIONS_DB_PATH"] = annotations_db
 
     # Inspect the database: loci columns, total count, present tables.
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = duckdb_compat.connect(db_path, read_only=True)
     try:
         total_loci = conn.execute("SELECT COUNT(*) FROM loci").fetchone()[0]
-        cursor = conn.execute("SELECT * FROM loci LIMIT 1")
-        db_columns = [desc[0] for desc in cursor.description]
-        tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+        # None for a database built before the pipeline started recording the sample count.
+        total_samples = read_sample_count(conn)
+        # LIMIT 0 rather than duckdb_compat.table_columns: the columns are advertised as an
+        # ordered list via /api/v1/schema, and a query's description keeps the table's order
+        # where the catalog lookup returns an unordered set. No row is read either way.
+        db_columns = [desc[0] for desc in conn.execute("SELECT * FROM loci LIMIT 0").description]
+        tables = duckdb_compat.list_tables(conn)
+        # The loci-side phenotype_keyword filter is answered from swim_plot so it selects the same
+        # loci the swim plot shows (see build_api_query), which needs both the table and that
+        # column to be present.
+        has_swim_plot_phenotypes = (
+            "swim_plot" in tables
+            and "phenotype_description" in duckdb_compat.table_columns(conn, "swim_plot"))
         # Sample IDs for the filter dropdown come from the sample table when one
         # is supplied; otherwise fall back to the distinct sample_ids in the
         # swim_plot table so the dropdown is still populated (those IDs are what
@@ -3307,24 +3489,16 @@ def configure_app(db_path, sample_table=None, known_loci_json=None, annotations_
             })
         else:
             sample_ids = []
-        # Which columns each skinny table projects. A filter reading a column the narrow table
-        # does not carry has to fall back to loci, and which columns those are depends on when
-        # the database was built (see skinny_tables.shared_columns).
-        skinny_columns = {
-            ot: {row[1] for row in conn.execute(f"SELECT * FROM pragma_table_info('sk_{ot}')")}
-            for ot in OUTLIER_TYPE_MAP.values() if f"sk_{ot}" in tables
-        }
     finally:
         conn.close()
 
     db_columns_set = set(db_columns)
     app.config["TOTAL_LOCI"] = total_loci
+    app.config["TOTAL_SAMPLES"] = total_samples
     app.config["DB_COLUMNS"] = db_columns
     app.config["DB_COLUMNS_SET"] = db_columns_set
-    app.config["DB_TABLES"] = tables
-    app.config["HAS_SKINNY"] = {f"sk_{ot}" for ot in OUTLIER_TYPE_MAP.values()}.issubset(tables)
-    app.config["SKINNY_COLUMNS"] = skinny_columns
     app.config["HAS_MENDELIAN"] = "mendelian_violations" in tables
+    app.config["HAS_SWIM_PLOT_PHENOTYPES"] = has_swim_plot_phenotypes
     app.config["SAMPLE_IDS"] = sample_ids
 
     # Known-disease-locus filter set + pathogenic-threshold map (from the loci table's
@@ -3332,40 +3506,26 @@ def configure_app(db_path, sample_table=None, known_loci_json=None, annotations_
     known_disease_locus_ids = set()
     known_disease_locus_thresholds = {}
     if "KnownDiseaseLocus" in db_columns_set:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = duckdb_compat.connect(db_path, read_only=True)
         try:
             known_disease_locus_ids = {
                 row[0] for row in conn.execute(
                     "SELECT LocusId FROM loci WHERE KnownDiseaseLocus IS NOT NULL AND KnownDiseaseLocus != ''"
                 )
             }
-            if disease_trees and known_disease_locus_ids:
-                # Only known-disease loci can contribute a threshold (the overlap +
-                # motif test below mirrors how KnownDiseaseLocus was set at build
-                # time), so restrict the scan to that id set instead of every locus.
+            if (disease_trees or strchive_trees) and known_disease_locus_ids:
+                # Only known-disease loci can contribute a threshold (known_disease_pathogenic_min
+                # mirrors how KnownDiseaseLocus was set at build time, STRchive fallback
+                # included), so restrict the scan to that id set instead of every locus.
                 placeholders = ",".join("?" * len(known_disease_locus_ids))
                 for row in conn.execute(
                     f"SELECT LocusId, Chrom, Start0Based, End1Based, Motif FROM loci "
                     f"WHERE LocusId IN ({placeholders})",
                     tuple(known_disease_locus_ids)):
-                    chrom_key = row[1].replace("chr", "") if row[1] else ""
-                    if chrom_key not in disease_trees:
-                        continue
-                    overlaps = disease_trees[chrom_key].overlap(row[2], row[3])
-                    if not (overlaps and row[4]):
-                        continue
-                    for interval in overlaps:
-                        if compute_jaccard(row[2], row[3], interval.begin, interval.end) <= 0.66:
-                            continue
-                        disease_data = interval.data
-                        disease_motifs = [disease_data.get("RepeatUnit", "")] + (disease_data.get("PathogenicMotifs") or [])
-                        if not any(motifs_match(row[4], dm) for dm in disease_motifs):
-                            continue
-                        for disease in disease_data.get("Diseases", []):
-                            pmin = disease.get("PathogenicMin")
-                            if pmin is not None and (row[0] not in known_disease_locus_thresholds or pmin < known_disease_locus_thresholds[row[0]]):
-                                known_disease_locus_thresholds[row[0]] = pmin
-                        break
+                    pathogenic_min = known_disease_pathogenic_min(
+                        row[1], row[2], row[3], row[4], disease_trees, strchive_trees)
+                    if pathogenic_min is not None:
+                        known_disease_locus_thresholds[row[0]] = pathogenic_min
         finally:
             conn.close()
     app.config["KNOWN_DISEASE_LOCUS_IDS"] = known_disease_locus_ids
@@ -3411,13 +3571,16 @@ def main():
         strchive_loci_json=args.strchive_loci_json,
     )
 
-    print(f"Loaded {total_loci:,d} loci")
+    total_samples = app.config["TOTAL_SAMPLES"]
+    if total_samples is None:
+        print(f"Loaded {total_loci:,d} loci (sample count not recorded; rebuild the database to add it)")
+    else:
+        print(f"Loaded {total_loci:,d} loci from {total_samples:,d} genotyped samples")
     print(f"Loaded {len(app.config['LOOKUPS']['sample']):,d} samples")
     print(f"Loaded {len(app.config['ANNOTATIONS']['notes'])} notes, {len(app.config['ANNOTATIONS']['all_tags'])} unique tags")
     for col in ("CanonicalMotif", "IsKnownMotif", "IsInMendelianGene"):
         if col not in app.config["DB_COLUMNS_SET"]:
             print(f"Note: database missing optional column: {col} (using fallback)")
-    print(f"Skinny fast-path: {'ON' if app.config['HAS_SKINNY'] else 'OFF (run the skinny-table build step)'}")
     print(f"Mendelian QC page: {'available' if app.config['HAS_MENDELIAN'] else 'hidden (no mendelian_violations table)'}")
 
     app.config["BIND_HOST"] = args.host

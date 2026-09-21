@@ -6,7 +6,7 @@ analysis columns: the First/Second/Third affected and unaffected allele sizes
 (both per-sample and per-family), the matching affected phenotypes and sample
 ids, and the NumAffectedUnsolved{Samples,Families}AboveUnaffected counts. It
 also adds the gene-derived ``pLI`` / ``inheritance`` columns, and exposes the
-exact 129-name ordered ``OUTPUT_COLUMNS`` list that defines the loci table.
+exact 131-name ordered ``OUTPUT_COLUMNS`` list that defines the loci table.
 
 It is a faithful, standalone port of the corresponding logic in the reference
 ``analyze_results.py`` (parse_outlier_entries, is_unaffected_or_solved_status,
@@ -625,7 +625,7 @@ def add_gene_columns(records, gene_lookup):
     return records
 
 
-# The exact 129-name ordered loci-table column list. The population-distribution-
+# The exact 131-name ordered loci-table column list. The population-distribution-
 # stat columns are added afterward by enrichment, not part of OUTPUT_COLUMNS.
 OUTPUT_COLUMNS = [
     # Core locus info
@@ -798,4 +798,6 @@ OUTPUT_COLUMNS = [
     "NonCodingAnnotations",
     "RepeatMaskerIntervals",
     "VariationClusterSizeDiff",
+    "VariationCluster",
+    "VariationClusterFilterReason",
 ]
