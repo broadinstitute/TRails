@@ -24,10 +24,15 @@ fully-tested unit):
   7. known-disease-locus match + ``CanonicalMotif`` + ``IsKnownMotif`` + ``IsInMendelianGene``
   8. ``analysis_columns.add_gene_columns``               -> pLI / inheritance
   9. ``analysis_columns.add_all_outlier_columns``        -> the affected/unaffected analysis
+     + the affected_unsolved_outliers_above_unaffected rows
  10. ``phenotype_scoring.compute_phenotype_scores``      -> phenotype-score columns + rows
- 11. ``result_database``: loci table + sample-count metadata + swim plot +
-     phenotype tables + (when complete trios exist) Mendelian tables, finalized
-     with an atomic move.
+ 11. ``result_database``: loci table + sample-count and population-gate metadata +
+     swim plot + affected_unsolved_outliers_above_unaffected + phenotype tables +
+     (when complete trios exist) Mendelian tables, finalized with an atomic move.
+
+Steps 9 and 10 count an affected allele only when it exceeds the 99th percentile of
+every --population-gate-cohorts cohort that has one at the locus (default: HPRC256 and
+AoU1027).
 
 CLI:
     python3 build_database.py --repeat-copy-numbers-tsv X --sample-metadata-tsv Y --db out.duckdb
@@ -49,7 +54,8 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
           phenotypes_table=None, gene_table=None, genes_to_phenotype=None,
           known_loci_json=None, n_loci=None, skip_phenotype_scores=False,
           source_label="", fetch_strchive=False, mendelian_threshold=2,
-          n_outlier_sample_ids=10, strchive_loci_json=None):
+          n_outlier_sample_ids=10, strchive_loci_json=None,
+          population_gate_cohorts=analysis_columns.POPULATION_P99_GATE_COHORTS):
     """Read the input TSVs and write the TRails result database to db_path.
 
     Builds every table in memory and populates the DuckDB database directly, with
@@ -83,6 +89,11 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
             Defaults to 10.
         strchive_loci_json: Optional path to a cached STRchive-loci.json file used
             as a known-disease-locus fallback (no network access).
+        population_gate_cohorts: The cohorts whose {cohort}_99thPercentile an
+            affected allele must exceed to count in NumAffectedUnsolved*, in the
+            affected_unsolved_outliers_above_unaffected table and in the phenotype
+            scores. Recorded in the metadata table. Defaults to
+            ``analysis_columns.POPULATION_P99_GATE_COHORTS``.
 
     Returns:
         The path of the written database (``db_path``).
@@ -193,9 +204,10 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
     analysis_columns.add_gene_columns(records, gene_lookup)
 
     # Stage 9: the affected/unaffected outlier analysis (the heart).
-    print("Computing outlier-analysis columns ...")
-    analysis_columns.add_all_outlier_columns(
-        records, sample_lookup, affected_lookup, analysis_lookup)
+    print(f"Computing outlier-analysis columns (population gate cohorts: "
+          f"{', '.join(population_gate_cohorts)}) ...")
+    affected_unsolved_outlier_rows = analysis_columns.add_all_outlier_columns(
+        records, sample_lookup, affected_lookup, analysis_lookup, population_gate_cohorts)
 
     # Stage 10: phenotype scoring (optional).
     per_outlier_phenotype_rows, per_locus_phenotype_rows = [], []
@@ -208,7 +220,7 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
         per_outlier_phenotype_rows, per_locus_phenotype_rows = (
             phenotype_scoring.compute_phenotype_scores(
                 records, participant_to_hpo, gene_lookup, gene_disease_data,
-                affected_lookup, analysis_lookup))
+                affected_lookup, analysis_lookup, population_gate_cohorts))
         print(f"  {len(per_outlier_phenotype_rows):,} per-outlier + "
               f"{len(per_locus_phenotype_rows):,} per-locus phenotype-score rows")
 
@@ -225,10 +237,13 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
         # loci column holds the callset size. Written here so it lands in the temp
         # database that finalize_database moves into place.
         result_database.write_sample_count(connection, len(sample_id_list))
+        result_database.write_population_gate_cohorts(connection, population_gate_cohorts)
 
         swim_rows = swim_plot.generate_swim_plot_table(
             records, sample_lookup, affected_lookup, analysis_lookup)
         result_database.write_swim_plot(connection, swim_rows, columns=swim_plot.SWIM_PLOT_COLUMNS)
+
+        result_database.write_affected_unsolved_outliers_table(connection, affected_unsolved_outlier_rows)
 
         result_database.write_phenotype_tables(
             connection, per_outlier_phenotype_rows, per_locus_phenotype_rows)
@@ -268,9 +283,20 @@ def main():
                         help="alleles match within strictly fewer than this many repeats (default 2)")
     parser.add_argument("--n-outlier-sample-ids", type=int, default=10,
                         help="outlier-sample cap for the histogram builder (default 10)")
+    parser.add_argument("--population-gate-cohorts",
+                        default=",".join(analysis_columns.POPULATION_P99_GATE_COHORTS),
+                        help="comma-separated population cohorts whose 99th percentiles an allele must "
+                             "exceed to count in NumAffectedUnsolved* and the phenotype scores. Choices: "
+                             f"{', '.join(analysis_columns.POPULATION_GATE_COHORT_CHOICES)} "
+                             "(default: %(default)s)")
     parser.add_argument("-n", "--n-loci", type=int, help="limit to the first N loci (for testing)")
     parser.add_argument("--skip-phenotype-scores", action="store_true", help="skip phenotype scoring")
     args = parser.parse_args()
+    try:
+        population_gate_cohorts = analysis_columns.parse_population_gate_cohorts(
+            args.population_gate_cohorts)
+    except ValueError as error:
+        parser.error(str(error))
     build(args.repeat_copy_numbers_tsv, args.sample_metadata_tsv, args.db,
           phenotypes_table=args.phenotypes_table, gene_table=args.gene_table,
           genes_to_phenotype=args.genes_to_phenotype, known_loci_json=args.known_loci_json,
@@ -278,7 +304,8 @@ def main():
           source_label=args.source_label, fetch_strchive=args.fetch_strchive,
           mendelian_threshold=args.mendelian_threshold,
           n_outlier_sample_ids=args.n_outlier_sample_ids,
-          strchive_loci_json=args.strchive_loci_json)
+          strchive_loci_json=args.strchive_loci_json,
+          population_gate_cohorts=population_gate_cohorts)
 
 
 if __name__ == "__main__":

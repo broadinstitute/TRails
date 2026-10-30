@@ -96,10 +96,52 @@
                 <input type="radio" name="require_above_population" value="short-read">
                 <label>Short-read (TenK10K)</label>
             </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="require_above_population" value="all">
+                <label>All (long-read and TenK10K)</label>
+            </div>
         </div>
         <div class="ui checkbox" style="margin-top: 0.5em; margin-left: 1em;">
             <input type="checkbox" name="include_loci_without_population_data">
             <label>Also show loci without population data</label>
+        </div>
+    </div>
+
+    <!-- Group Results By: one row per locus, or per unsolved affected sample or family -->
+    <div class="field">
+        <label style="display: inline;">Group Results By</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="<b>Locus:</b> one row per locus, expanding to the samples at that locus.<br /><br /><b>Unsolved affected sample / family:</b> one row per sample (or family) that <b>#Aff</b> counts at one or more of the loci matching the filters, i.e. affected and not solved, with an allele larger than every unaffected or solved sample's and above the 99th percentiles of the population cohorts the database was built with ({{ population_gate_cohorts | join(', ') }}). A row expands to those loci.<br /><br />The Sample Id and Phenotype filters then pick the samples (in the family view, the families with such a sample) instead of the loci."></i>
+        <div class="radio-group">
+            <div class="ui radio checkbox">
+                <input type="radio" name="group_by" value="locus" checked>
+                <label>Locus</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="group_by" value="sample">
+                <label>Unsolved affected sample</label>
+            </div>
+            <div class="ui radio checkbox">
+                <input type="radio" name="group_by" value="family">
+                <label>Unsolved affected family</label>
+            </div>
+        </div>
+        <div id="group-sort-field" style="margin-top: 0.5em; margin-left: 1em;">
+            <label style="display: inline; font-weight: normal;">Sort samples / families by</label>
+            <div id="group-sort-dropdown" class="ui compact selection dropdown">
+                <input type="hidden" name="group_sort" value="num_loci">
+                <i class="dropdown icon"></i>
+                <div class="text"># of loci</div>
+                <div class="menu">
+                    <div class="item" data-value="num_loci"># of loci</div>
+                    <div class="item" data-value="num_disease_gene_loci"># of loci in disease-associated genes</div>
+                    <div class="item" data-value="best_gene_phenotype_similarity">Best Gene-Pheno</div>
+                    <div class="item" data-value="largest_allele_size">Largest allele</div>
+                    <div class="item" data-value="group_id">Sample / family id</div>
+                </div>
+            </div>
+            <span style="margin-left: 8px;">
+                <label style="display: inline; font-weight: normal; cursor: pointer;"><input type="radio" name="group_sort_direction" value="asc" style="vertical-align: middle;"> ASC</label>
+                <label style="display: inline; font-weight: normal; cursor: pointer; margin-left: 6px;"><input type="radio" name="group_sort_direction" value="desc" checked style="vertical-align: middle;"> DESC</label>
+            </span>
         </div>
     </div>
 
@@ -242,8 +284,8 @@
             <input type="number" name="min_repeats_threshold" min="0" placeholder="e.g., 50">
         </div>
         <div class="field">
-            <label>Min pLI</label>
-            <input type="text" name="min_pli" placeholder="e.g., 0.9">
+            <label title="Minimum Δpop: the affected allele minus the largest population value, using the 99th % / max choice and the population filter's cohorts (every cohort when that filter is off)">Min Δpop (repeats above population)</label>
+            <input type="number" name="min_repeats_above_population" placeholder="e.g., 10">
         </div>
     </div>
     </div>
@@ -322,7 +364,9 @@
                 <div id="results-container">
                     <table id="results-table">
                         <thead>
-                            <tr>
+                            <!-- Grouped views (Group Results By) show #group-header-row instead -->
+                            <tr id="group-header-row" style="display: none;"></tr>
+                            <tr id="locus-header-row">
                                 <th class="col-expand"></th>
                                 <th class="col-row-num">#</th>
                                 <th class="col-locus">Locus</th>
@@ -333,6 +377,7 @@
                                 <th class="col-delta-ref col-numeric">&Delta;ref</th>
                                 <th class="col-delta-pop col-numeric">&Delta;pop</th>
                                 <th class="col-aff-unsolved col-numeric" data-sort="count">#Aff<span class="sort-icon">&#8597;</span></th>
+                                <th class="col-fam-unsolved col-numeric" data-sort="family_count" title="Distinct affected, unsolved families with an allele larger than every unaffected or solved sample's and above the 99th percentiles of the population cohorts the database was built with ({{ population_gate_cohorts | join(', ') }}; #Aff counted by family)">#Fam<span class="sort-icon">&#8597;</span></th>
                                 <th class="col-inheritance">Inher.</th>
                                 <th class="col-gene-pheno">Gene Phenotype</th>
                                 <th class="col-pli col-numeric">pLI</th>
@@ -559,6 +604,15 @@ $(document).ready(function() {
             .then(data => { window._allTagsList = data.tags || []; });
     });
 
+    // Initialize the Group Results By sort dropdown. Choosing a column also picks its natural
+    // direction (GROUP_SORT_NATURAL_DIRECTIONS), which the ASC / DESC radios can then override.
+    $('#group-sort-dropdown').dropdown({
+        onChange: function(value) {
+            if (settingGroupSortFromState) return;
+            $(`input[name="group_sort_direction"][value="${GROUP_SORT_NATURAL_DIRECTIONS[value] || 'desc'}"]`).prop('checked', true);
+        },
+    });
+
     // Initialize sample ID dropdown
     $('#sample-id-filter').dropdown({
         allowAdditions: true,
@@ -579,6 +633,15 @@ $(document).ready(function() {
     Promise.all([tagDropdownReady, populateSampleIdDropdown()]).then(() => {
         // Read URL state and perform initial search after dropdowns are populated
         readStateFromUrl();
+        // A server started with --initial-require-above-population (e.g. for a short-read callset) opens a URL
+        // with no '#' at all (http://host:port/) with that population filter set. It is an ordinary filter from then
+        // on: it shows as a chip and goes in the URL. Removing it leaves a bare 'host/#', which a reload or bookmark
+        // keeps, so checking window.location.hash (which reads '' for both) would set the filter again.
+        if (!window.location.href.includes('#') && INITIAL_REQUIRE_ABOVE_POPULATION) {
+            currentState.require_above_population = INITIAL_REQUIRE_ABOVE_POPULATION;
+            applyStateToUI();
+            replaceStateInUrl();
+        }
         updateTotalLociCount();
         performSearch();
     });
@@ -595,6 +658,9 @@ const API_BASE_URL = window.location.origin + '/api/v1';
 const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
 // Per-source 99th-percentile outlier warnings (keyed by source, then sample_id).
 const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
+
+// Population filter that a page opened with no saved filters starts with ('' for none)
+const INITIAL_REQUIRE_ABOVE_POPULATION = {{ initial_require_above_population | tojson }};
 
 const DEFAULT_STATE = {
     outlier_type: 'all',
@@ -614,7 +680,7 @@ const DEFAULT_STATE = {
     exclude_gene_regions: '',
     min_expansion: '',
     min_repeats_threshold: '',
-    min_pli: '',
+    min_repeats_above_population: '',
     min_sigma_percentile: '',
     motif_size: '',
     motif: '',
@@ -625,20 +691,30 @@ const DEFAULT_STATE = {
     max_variation_cluster_size_diff: '',
     tag: '',
     sort_by: 'count',
+    group_by: 'locus',
+    group_sort: 'num_loci',
+    group_sort_direction: 'desc',
     page: 1,
     page_size: 50,
 };
 
 let currentState = JSON.parse(JSON.stringify(DEFAULT_STATE));
 
+// population_metric only affects which loci match through the two filters that compare against
+// population values: the require_above_population gate and the min Δpop filter.
+function populationMetricAffectsResults() {
+    return Boolean(currentState.require_above_population || currentState.min_repeats_above_population);
+}
+
 // 6.2 Write State to URL
 // Build the '#...' hash that represents the current filter state.
 function buildStateHash() {
     const params = {};
     for (const [key, value] of Object.entries(currentState)) {
-        // population_metric only affects results when require_above_population is set; don't
-        // persist a no-op param to the URL otherwise (matches buildApiUrl / performExport).
-        if (key === 'population_metric' && !currentState.require_above_population) continue;
+        // population_metric is kept even with no population filter, because the table's Δpop and
+        // allele colours use it, and a reload or shared link would otherwise show them against the
+        // default 99th percentile. group_sort and its direction only order the grouped views.
+        if ((key === 'group_sort' || key === 'group_sort_direction') && currentState.group_by === 'locus') continue;
         if (value !== DEFAULT_STATE[key] && value !== '' && value !== false) {
             params[key] = value;
         }
@@ -650,21 +726,23 @@ function buildStateHash() {
     return query ? '#' + query : '';
 }
 
-// Push the current state as a new history entry.
+// Push the current state as a new history entry. The default state goes in as a bare '#' rather
+// than a URL with no fragment at all: only a URL with no '#' gets INITIAL_REQUIRE_ABOVE_POPULATION
+// (see the startup restore), so a user who removed that filter would otherwise get it back on reload.
 function writeStateToUrl() {
     const hash = buildStateHash();
     if (window.location.hash !== hash) {
-        window.history.pushState(null, '', hash || window.location.pathname + window.location.search);
+        window.history.pushState(null, '', hash || '#');
     }
 }
 
 // Rewrite the current URL in place, without adding a history entry. Used when the hash the user
-// arrived on is normalized into an equivalent one (see the legacy-parameter fold below): pushing
+// arrived on is normalized into an equivalent one (see readStateFromUrl): pushing
 // there would make Back return to the original hash, normalize it again, and push forward again.
 function replaceStateInUrl() {
     const hash = buildStateHash();
     if (window.location.hash !== hash) {
-        window.history.replaceState(null, '', hash || window.location.pathname + window.location.search);
+        window.history.replaceState(null, '', hash || '#');
     }
 }
 
@@ -702,11 +780,15 @@ function readStateFromUrl() {
     ].map(term => term.trim()).filter(Boolean);
     if (legacyTerms.length) {
         currentState.search = [currentState.search, ...legacyTerms].filter(Boolean).join(', ');
-        // Normalize the legacy hash in place. writeStateToUrl would otherwise push the folded URL
-        // as a new entry, so Back would land on the legacy hash, fold it again, and push forward
-        // again, trapping the user on this page.
-        replaceStateInUrl();
     }
+
+    // Normalize the arrival hash in place whenever it is not the canonical one: a legacy hash, or
+    // one with a parameter the page no longer has (e.g. min_pli in a bookmark) or that has no
+    // effect (e.g. group_sort with no grouped view). writeStateToUrl would otherwise push the
+    // canonical URL as a new entry, so Back would land on the old hash, normalize it again, and
+    // push forward again, trapping the user on this page. This does nothing when the hash is
+    // already canonical.
+    replaceStateInUrl();
 
     applyStateToUI();
 }
@@ -716,10 +798,13 @@ function applyStateToUI() {
     // Radio buttons
     for (const name of ['outlier_type', 'require_above_unaffected',
                         'require_families_above_unaffected',
-                        'require_above_population']) {
+                        'require_above_population', 'group_by']) {
         const val = currentState[name] || '';
         $(`input[name="${name}"][value="${val}"]`).parent().checkbox('check');
     }
+    setGroupSortDropdown(currentState.group_sort);
+    $(`input[name="group_sort_direction"][value="${currentState.group_sort_direction}"]`).prop('checked', true);
+    $('#group-sort-field').toggle(currentState.group_by !== 'locus');
 
     // Sort: ordered priority pills + matching checkboxes (multi-key)
     renderSortPills();
@@ -758,8 +843,8 @@ function applyStateToUI() {
     }
 
     // Text/number inputs
-    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_pli', 'min_sigma_percentile',
-                        'motif_size', 'motif',
+    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_repeats_above_population',
+                        'min_sigma_percentile', 'motif_size', 'motif',
                         'phenotype_keyword', 'sample_id_like',
                         'search', 'max_variation_cluster_size_diff']) {
         $(`input[name="${name}"]`).val(currentState[name]);
@@ -784,6 +869,9 @@ function readStateFromUI() {
     currentState.require_above_population = $('input[name="require_above_population"]:checked').val() || '';
     currentState.population_metric = $('input[name="population_metric"]:checked').val() || '99th';
     currentState.include_loci_without_population_data = $('input[name="include_loci_without_population_data"]').parent().checkbox('is checked');
+    currentState.group_by = $('input[name="group_by"]:checked').val() || DEFAULT_STATE.group_by;
+    currentState.group_sort = $('#group-sort-dropdown').dropdown('get value') || DEFAULT_STATE.group_sort;
+    currentState.group_sort_direction = $('input[name="group_sort_direction"]:checked').val() || DEFAULT_STATE.group_sort_direction;
 
     // Boolean checkboxes
     currentState.apply_pathogenic_threshold = $('input[name="apply_pathogenic_threshold"]').parent().checkbox('is checked');
@@ -818,8 +906,8 @@ function readStateFromUI() {
     currentState.tag = $('#tag-filter').dropdown('get value') || '';
 
     // Text/number inputs
-    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_pli', 'min_sigma_percentile',
-                        'motif_size', 'motif',
+    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_repeats_above_population',
+                        'min_sigma_percentile', 'motif_size', 'motif',
                         'phenotype_keyword', 'sample_id_like',
                         'search', 'max_variation_cluster_size_diff']) {
         currentState[name] = $(`input[name="${name}"]`).val().trim();
@@ -862,12 +950,12 @@ function buildApiUrl() {
     for (const name of optionalStringParams) {
         if (currentState[name]) params.set(name, currentState[name]);
     }
-    // Only relevant when require_above_population is set; omit the default ('99th') to keep URLs clean.
-    if (currentState.require_above_population && currentState.population_metric === 'max') {
+    // Only relevant when a population filter is set; omit the default ('99th') to keep URLs clean.
+    if (populationMetricAffectsResults() && currentState.population_metric === 'max') {
         params.set('population_metric', 'max');
     }
 
-    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_pli', 'min_sigma_percentile']) {
+    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_repeats_above_population', 'min_sigma_percentile']) {
         if (currentState[name] !== '' && currentState[name] !== undefined) {
             params.set(name, currentState[name]);
         }
@@ -885,6 +973,49 @@ function buildApiUrl() {
     }
 
     return `${API_BASE_URL}/loci?${params.toString()}`;
+}
+
+// Filters the grouped views apply to each row's sample instead of to the loci (the server's
+// SAMPLE_LEVEL_FILTERS)
+const SAMPLE_LEVEL_FILTERS = ['sample_id_keyword', 'sample_id_like', 'phenotype_keyword'];
+
+// The grouped view's URL: the same filters as buildApiUrl, sent to /outlier_samples. The locus
+// sort orders each row's expanded loci instead (buildGroupLociApiUrl), and population_metric
+// always goes along because the rows' Δpop uses it, as the locus table's does.
+function buildGroupedApiUrl() {
+    const url = new URL(buildApiUrl());
+    url.pathname = url.pathname.replace(/\/loci$/, '/outlier_samples');
+    url.searchParams.delete('sort_by');
+    url.searchParams.set('group_by', currentState.group_by);
+    if (currentState.group_sort !== DEFAULT_STATE.group_sort) url.searchParams.set('group_sort', currentState.group_sort);
+    url.searchParams.set('group_sort_direction', currentState.group_sort_direction);
+    if (currentState.population_metric === 'max') url.searchParams.set('population_metric', 'max');
+    return url.toString();
+}
+
+// The grouped view's export (groups_tsv or group_loci_tsv): its query, every row rather than a page
+function buildGroupedExportUrl(format) {
+    const url = new URL(buildGroupedApiUrl());
+    url.pathname = url.pathname.replace(/\/outlier_samples$/, '/outlier_samples/export');
+    url.searchParams.delete('page');
+    url.searchParams.delete('page_size');
+    url.searchParams.set('format', format);
+    return url.toString();
+}
+
+// The loci a grouped row expands to: the same locus filters, restricted to the loci where #Aff
+// counts that sample (or a sample of that family). The sample-level filters already chose the
+// row, so they are left out, which keeps the list's total equal to the row's #Loci.
+const GROUP_LOCI_PAGE_SIZE = 50;
+function buildGroupLociApiUrl(groupId, page) {
+    const url = new URL(buildApiUrl());
+    for (const name of SAMPLE_LEVEL_FILTERS) url.searchParams.delete(name);
+    const restriction = currentState.group_by === 'family'
+        ? 'affected_unsolved_outlier_family_id' : 'affected_unsolved_outlier_sample_id';
+    url.searchParams.set(restriction, groupId);
+    url.searchParams.set('page', page);
+    url.searchParams.set('page_size', GROUP_LOCI_PAGE_SIZE);
+    return url.toString();
 }
 
 // 7.2 Fetch with timeout utility
@@ -1018,7 +1149,8 @@ async function performSearch() {
     $('#results-container').addClass('loading');
 
     try {
-        const response = await fetchWithTimeout(buildApiUrl());
+        const grouped = currentState.group_by !== 'locus';
+        const response = await fetchWithTimeout(grouped ? buildGroupedApiUrl() : buildApiUrl());
         if (requestId !== searchRequestSeq) return;  // superseded by a newer search
         if (!response.ok) {
             const errorData = await response.json();
@@ -1026,7 +1158,7 @@ async function performSearch() {
         }
         const data = await response.json();
         if (requestId !== searchRequestSeq) return;  // superseded while parsing the response
-        renderResults(data);
+        if (grouped) renderGroupedResults(data); else renderResults(data);
         renderSummaryCharts(data);
         updatePaginationControls(data);
         writeStateToUrl();
@@ -1036,7 +1168,7 @@ async function performSearch() {
         console.error('Search error:', error);
         $('#error-text').text(describeFetchError(error));
         $('#error-message').show();
-        $('#results-tbody').html('<tr><td colspan="18" style="color: #888; padding: 20px; text-align: center;">Search failed</td></tr>');
+        $('#results-tbody').html(`<tr><td colspan="${resultsTableColumnCount()}" style="color: #888; padding: 20px; text-align: center;">Search failed</td></tr>`);
         $('.pagination-container').hide();
         $('#summary-charts-container').hide();
     } finally {
@@ -1073,6 +1205,9 @@ async function performExport(format) {
     const savedState = JSON.parse(JSON.stringify(currentState));
     readStateFromUI();
     currentState.page = savedState.page;
+    // The export menu only offers the formats of the table on screen (locus or grouped), so its
+    // grouping is kept too, even if the Group Results By radios were changed without a search.
+    currentState.group_by = savedState.group_by;
     $('.export-dropdown').addClass('loading disabled');
 
     try {
@@ -1085,7 +1220,7 @@ async function performExport(format) {
         if (currentState.require_above_unaffected) params.set('require_above_unaffected', currentState.require_above_unaffected);
         if (currentState.require_families_above_unaffected) params.set('require_families_above_unaffected', currentState.require_families_above_unaffected);
         if (currentState.require_above_population) params.set('require_above_population', currentState.require_above_population);
-        if (currentState.require_above_population && currentState.population_metric === 'max') params.set('population_metric', 'max');
+        if (populationMetricAffectsResults() && currentState.population_metric === 'max') params.set('population_metric', 'max');
         if (currentState.require_above_population && currentState.include_loci_without_population_data) params.set('include_loci_without_population_data', '1');
         if (currentState.apply_pathogenic_threshold) params.set('apply_pathogenic_threshold', '1');
         if (currentState.known_loci_only) params.set('known_loci_only', '1');
@@ -1097,7 +1232,7 @@ async function performExport(format) {
         if (currentState.exclude_gene_regions) params.set('exclude_gene_regions', currentState.exclude_gene_regions);
         if (currentState.min_expansion) params.set('min_expansion', currentState.min_expansion);
         if (currentState.min_repeats_threshold) params.set('min_repeats_threshold', currentState.min_repeats_threshold);
-        if (currentState.min_pli) params.set('min_pli', currentState.min_pli);
+        if (currentState.min_repeats_above_population) params.set('min_repeats_above_population', currentState.min_repeats_above_population);
         if (currentState.min_sigma_percentile) params.set('min_sigma_percentile', currentState.min_sigma_percentile);
         if (currentState.motif_size) params.set('motif_size', currentState.motif_size);
         if (currentState.motif) params.set('motif', currentState.motif);
@@ -1114,7 +1249,9 @@ async function performExport(format) {
         // whole page with the raw API error and lose the user's filters/results. The iframe streams
         // the download straight to disk on success (no large in-memory blob); an error response
         // loads harmlessly inside the iframe, which we surface via alert() without touching the page.
-        const url = `${API_BASE_URL}/export?${params.toString()}`;
+        // The grouped views export from /outlier_samples/export with the grouped table's own query.
+        const url = currentState.group_by === 'locus'
+            ? `${API_BASE_URL}/export?${params.toString()}` : buildGroupedExportUrl(format);
         let iframe = document.getElementById('export-iframe');
         if (!iframe) {
             iframe = document.createElement('iframe');
@@ -1150,22 +1287,27 @@ function updateActiveFiltersBar() {
         include_loci_without_population_data: 'Include without pop.',
         source: 'Source', apply_pathogenic_threshold: 'Path. Threshold', known_loci_only: 'Known Loci', known_motifs_only: 'Known Motifs', mendelian_genes_only: 'Mendelian Genes',
         gene_regions: 'Regions', exclude_gene_regions: 'Excl Regions',
-        min_expansion: 'Min Exp', min_repeats_threshold: 'Min Repeats', min_pli: 'Min pLI', min_sigma_percentile: 'σ Percentile',
+        min_expansion: 'Min Exp', min_repeats_threshold: 'Min Repeats', min_repeats_above_population: 'Min Δpop', min_sigma_percentile: 'σ Percentile',
         motif_size: 'Motif Size',
         motif: 'Motif', phenotype_keyword: 'Phenotype', sample_id_keyword: 'Sample ID',
         sample_id_like: 'Sample Keyword', search: 'Search',
         max_variation_cluster_size_diff: 'Max VC Size Diff', tag: 'Tag',
         exclude_vc_depth_filtered: 'No depth-filtered VC', exclude_vc_size_filtered: 'No size-filtered VC',
+        group_by: 'Group by', group_sort: 'Group sort', group_sort_direction: 'Group sort direction',
     };
     for (const [key, value] of Object.entries(currentState)) {
         if (key === 'page' || key === 'page_size') continue;
         if (key === 'sort_by') continue;  // shown as dedicated priority pills, not a chip
-        // population_metric and include_loci_without_population_data are only meaningful (and only
-        // sent to the API) when require_above_population is set
-        if ((key === 'population_metric' || key === 'include_loci_without_population_data')
-            && !currentState.require_above_population) continue;
+        // include_loci_without_population_data is only meaningful (and only sent to the API) when a
+        // population filter is set. population_metric gets a chip whatever the filters, because the
+        // Δpop column and the allele colours use it even with no population filter.
+        if (key === 'include_loci_without_population_data' && !currentState.require_above_population) continue;
+        if ((key === 'group_sort' || key === 'group_sort_direction') && currentState.group_by === 'locus') continue;
         if (value === DEFAULT_STATE[key] || value === '' || value === false) continue;
-        const display = value === true ? labels[key] : `${escapeHtml(labels[key] || key)}: ${escapeHtml(value)}`;
+        // group_sort shows the sort menu's label rather than its API value
+        const shownValue = key === 'group_sort' ? ($(`#group-sort-dropdown .item[data-value="${value}"]`).text() || value)
+            : key === 'group_sort_direction' ? value.toUpperCase() : value;
+        const display = value === true ? labels[key] : `${escapeHtml(labels[key] || key)}: ${escapeHtml(shownValue)}`;
         chips.push(`<a class="ui small label filter-chip" data-filter="${escapeHtml(key)}">${display}<i class="delete icon"></i></a>`);
     }
     if (chips.length > 0) {
@@ -1180,6 +1322,10 @@ function updateActiveFiltersBar() {
 $(document).on('click', '.filter-chip .delete', function() {
     const key = $(this).closest('.filter-chip').data('filter');
     currentState[key] = DEFAULT_STATE[key];
+    // Like choosing the default column in the sort menu, which also picks its natural direction
+    if (key === 'group_sort') {
+        currentState.group_sort_direction = GROUP_SORT_NATURAL_DIRECTIONS[DEFAULT_STATE.group_sort] || 'desc';
+    }
     applyStateToUI();
     currentState.page = 1;
     performSearch();
@@ -1355,8 +1501,10 @@ function renderSummaryCharts(data) {
     const container = document.getElementById('summary-charts-container');
     if (!container) return;
 
-    // Hide if fewer than 5 results
-    if (!data.total || data.total < 5) {
+    // Hide if fewer than 5 loci are charted. A grouped response's total counts samples or families,
+    // while its charts count the loci those rows span (total_loci).
+    const chartedLoci = data.total_loci != null ? data.total_loci : data.total;
+    if (!chartedLoci || chartedLoci < 5) {
         container.style.display = 'none';
         return;
     }
@@ -1377,11 +1525,19 @@ function renderSummaryCharts(data) {
 // Task 8: Results Table Rendering
 // =========================================================================
 
+// Number of columns of whichever header row (locus or grouped) the results table shows
+function resultsTableColumnCount() {
+    const $row = currentState.group_by === 'locus' ? $('#locus-header-row') : $('#group-header-row');
+    return $row.children('th').length || 1;
+}
+
 // 8.1 Main Render Function
 function renderResults(data) {
+    $('#group-header-row').hide();
+    $('#locus-header-row').show();
     const tbody = $('#results-tbody');
     if (!data.results || data.results.length === 0) {
-        tbody.html('<tr><td colspan="18" style="color: #888; padding: 20px; text-align: center;">No matching results found</td></tr>');
+        tbody.html(`<tr><td colspan="${resultsTableColumnCount()}" style="color: #888; padding: 20px; text-align: center;">No matching results found</td></tr>`);
         return;
     }
 
@@ -1392,6 +1548,180 @@ function renderResults(data) {
     });
     tbody.html(html);
 }
+
+// 8.1b Grouped views: one row per unsolved affected sample or family (/api/v1/outlier_samples).
+// The header cells with data-group-sort sort the rows by that column (group_sort). The sorted
+// column gets the same sorted-active indicator as the locus table's; the ASC / DESC radios name
+// its direction.
+function renderGroupedResults(data) {
+    const isFamily = data.group_by === 'family';
+    const headerCells = [
+        ['col-group-expand', '', null, ''],
+        ['col-row-num', '#', null, ''],
+        ['col-group-id', isFamily ? 'Family' : 'Sample', 'group_id', ''],
+        ...(isFamily
+            ? [['col-group-members', 'Members', null, 'The unsolved affected samples of this family that #Aff counts at one or more of these loci']]
+            : [['col-group-family', 'Family', null, ''], ['col-group-sex', 'Sex', null, ''], ['col-group-status', 'Status', null, 'Affected status / analysis status']]),
+        ['col-group-phenotype', 'Phenotype', null, ''],
+        ['col-group-num-loci col-numeric', '#Loci', 'num_loci', `Loci matching the filters where #Aff counts this ${isFamily ? "family's samples" : 'sample'}`],
+        ['col-group-disease-genes col-numeric', '#DiseaseGeneLoci', 'num_disease_gene_loci', 'How many of those loci are in Mendelian disease genes'],
+        ['col-group-gene-pheno col-numeric', 'Best Gene-Pheno', 'best_gene_phenotype_similarity', `Highest gene-phenotype similarity of ${isFamily ? "this family's samples" : 'this sample'} over those loci`],
+        ['col-group-largest-allele', 'Largest allele', 'largest_allele_size', `The largest allele of ${isFamily ? "this family's samples" : 'this sample'} among those loci, how far it is above the population value (as in the Δpop column), and its locus`],
+    ];
+    $('#group-header-row').html(headerCells.map(([cls, label, sortKey, title]) => {
+        const classes = sortKey && sortKey === currentState.group_sort ? `${cls} sorted-active` : cls;
+        const sortAttrs = sortKey ? ` data-group-sort="${sortKey}"` : '';
+        const sortIcon = sortKey ? '<span class="sort-icon">&#8597;</span>' : '';
+        return `<th class="${classes}"${sortAttrs}${title ? ` title="${escapeHtml(title)}"` : ''}>${label}${sortIcon}</th>`;
+    }).join('')).show();
+    $('#locus-header-row').hide();
+
+    const tbody = $('#results-tbody');
+    if (!data.results || data.results.length === 0) {
+        tbody.html(`<tr><td colspan="${resultsTableColumnCount()}" style="color: #888; padding: 20px; text-align: center;">No matching ${isFamily ? 'families' : 'samples'} found</td></tr>`);
+        return;
+    }
+    const startIndex = (data.page - 1) * data.page_size;
+    tbody.html(data.results.map((group, i) => renderGroupRow(group, startIndex + i, isFamily)).join(''));
+}
+
+function renderGroupRow(group, rowIndex, isFamily) {
+    const statusText = s => `${escapeHtml(s.affected_status || '')} / ${escapeHtml(s.analysis_status || '')}`;
+    const phenotypeHtml = text => !text ? ''
+        : `<span title="${escapeHtml(text)}">${escapeHtml(text.length > 120 ? text.substring(0, 120) + '...' : text)}</span>`;
+
+    let largestHtml = '';
+    if (group.largest_allele_size != null) {
+        const deltaPop = group.largest_allele_delta_population;
+        const deltaPopHtml = deltaPop == null ? ''
+            : ` <span style="${deltaPop > 0 ? 'color: #e65100; font-weight: 600;' : 'color: #2e7d32;'}">(${deltaPop > 0 ? '+' : ''}${Math.round(deltaPop)} vs pop)</span>`;
+        const gene = group.largest_allele_gene_symbol ? ` ${escapeHtml(group.largest_allele_gene_symbol)}` : '';
+        largestHtml = `<div class="cell-main">${group.largest_allele_size}${deltaPopHtml}</div>`
+            + `<div class="cell-sub">${escapeHtml(group.largest_allele_locus_id || '')}${gene}</div>`;
+    }
+    const similarity = group.best_gene_phenotype_similarity;
+    const similarityHtml = similarity == null ? ''
+        : `<span style="${similarity >= 0.5 ? 'color: #e65100; font-weight: 600;' : ''}">${similarity.toFixed(2)}</span>`;
+
+    let identityCells;
+    if (isFamily) {
+        const members = (group.members || []).map(m =>
+            `<div>${escapeHtml(m.sample_id)}${renderMendelianWarning(m.sample_id, currentState.source)} <span class="cell-sub">${escapeHtml(m.sex || '')}, ${statusText(m)}</span></div>`).join('');
+        const phenotypes = [...new Set((group.members || []).map(m => m.phenotype_description).filter(Boolean))].join(' | ');
+        identityCells = `<td class="col-group-id"><div class="cell-main">${escapeHtml(group.family_id)}</div></td>
+        <td class="col-group-members">${members}</td>
+        <td class="col-group-phenotype">${phenotypeHtml(phenotypes)}</td>`;
+    } else {
+        identityCells = `<td class="col-group-id"><div class="cell-main">${escapeHtml(group.sample_id)}${renderMendelianWarning(group.sample_id, currentState.source)}</div></td>
+        <td class="col-group-family">${escapeHtml(group.family_id || '')}</td>
+        <td class="col-group-sex">${escapeHtml(group.sex || '')}</td>
+        <td class="col-group-status">${statusText(group)}</td>
+        <td class="col-group-phenotype">${phenotypeHtml(group.phenotype_description)}</td>`;
+    }
+
+    return `<tr class="group-row" data-group-id="${escapeHtml(group.group_id)}">
+        <td class="col-group-expand"><span class="expand-toggle" title="Show the loci"><i class="chevron right icon"></i></span></td>
+        <td class="col-row-num">${rowIndex + 1}</td>
+        ${identityCells}
+        <td class="col-group-num-loci col-numeric" style="font-weight: 600;">${group.num_loci.toLocaleString()}</td>
+        <td class="col-group-disease-genes col-numeric">${group.num_disease_gene_loci.toLocaleString()}</td>
+        <td class="col-group-gene-pheno col-numeric">${similarityHtml}</td>
+        <td class="col-group-largest-allele">${largestHtml}</td>
+    </tr>`;
+}
+
+// Expand a grouped row into the loci where #Aff counts its sample (or its family's samples).
+// Bound to table cells only, like the locus rows' expand handler: the header cell carries the
+// same class, and a click there has no row to expand.
+$(document).on('click', 'td.col-group-expand', function() {
+    const $row = $(this).closest('.group-row');
+    const $toggle = $(this).find('.expand-toggle');
+    const $existing = $row.next('.group-detail-row');
+    if ($existing.length) {
+        $existing.remove();
+        $toggle.removeClass('expanded').html('<i class="chevron right icon"></i>');
+        refreshCollapseAllButton();
+        return;
+    }
+    $toggle.addClass('expanded').html('<i class="chevron down icon"></i>');
+    const $detail = $(`<tr class="group-detail-row"><td colspan="${$row.children('td').length}">`
+        + `<div class="group-loci" data-group-id="${escapeHtml($row.attr('data-group-id'))}"></div></td></tr>`);
+    $row.after($detail);
+    refreshCollapseAllButton();
+    loadGroupLoci($detail.find('.group-loci'), 1);
+});
+
+$(document).on('click', '.group-loci-page', function() {
+    loadGroupLoci($(this).closest('.group-loci'), parseInt($(this).attr('data-page')));
+});
+
+async function loadGroupLoci($container, page) {
+    const groupId = $container.attr('data-group-id');
+    $container.html('<div class="ui tiny active inline loader"></div> Loading...');
+    try {
+        const response = await fetchWithTimeout(buildGroupLociApiUrl(groupId, page));
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.detail || `HTTP ${response.status}`);
+        }
+        $container.html(renderGroupLociTable(groupId, await response.json()));
+    } catch (error) {
+        $container.html(`<span style="color: red;">Error: ${escapeHtml(error.message)}</span>`);
+    }
+}
+
+// The locus table of one grouped row: the main table's locus columns, without their sort
+// controls (the Sort By choices order it), plus this sample's (or family's) own allele.
+function renderGroupLociTable(groupId, data) {
+    const isFamily = currentState.group_by === 'family';
+    const $header = $('#locus-header-row').clone().removeAttr('id').show();
+    $header.find('th').removeAttr('data-sort').removeClass('sorted-active');
+    $header.find('.sort-icon').remove();
+    $header.find('th.col-allele').after(isFamily
+        ? '<th class="col-selected-allele col-numeric" title="The alleles of this family\'s samples that #Aff counts at the locus">This family</th>'
+        : '<th class="col-selected-allele col-numeric" title="This sample\'s allele at the locus">This sample</th>');
+    const startIndex = (data.page - 1) * data.page_size;
+    const rows = data.results.map((locus, i) => renderLocusRow(locus, startIndex + i)).join('');
+    const first = data.total ? startIndex + 1 : 0;
+    const last = Math.min(startIndex + data.page_size, data.total);
+    const pager = `<div class="group-loci-pager">
+        <b>${escapeHtml(groupId)}</b>: loci ${first.toLocaleString()}-${last.toLocaleString()} of ${data.total.toLocaleString()}, ordered by the Sort By choices
+        <button class="ui mini basic button group-loci-page" data-page="${data.page - 1}" ${data.page <= 1 ? 'disabled' : ''}>Prev</button>
+        <button class="ui mini basic button group-loci-page" data-page="${data.page + 1}" ${data.page >= data.total_pages ? 'disabled' : ''}>Next</button>
+    </div>`;
+    return `${pager}<table class="group-loci-table"><thead>${$header.prop('outerHTML')}</thead><tbody>${rows}</tbody></table>`;
+}
+
+// The direction each group_sort column starts in (the server's GROUPED_SORTS): sample / family id
+// A to Z, everything else largest first
+const GROUP_SORT_NATURAL_DIRECTIONS = {group_id: 'asc'};
+
+// Show a group_sort value in the sort dropdown without its onChange resetting the direction
+let settingGroupSortFromState = false;
+function setGroupSortDropdown(value) {
+    settingGroupSortFromState = true;
+    $('#group-sort-dropdown').dropdown('set selected', value);
+    settingGroupSortFromState = false;
+}
+
+// Sort the grouped rows by a header column. Clicking the column already sorted on flips its
+// direction; another column starts in its natural direction.
+$(document).on('click', '#group-header-row th[data-group-sort]', function() {
+    const sortKey = $(this).attr('data-group-sort');
+    currentState.group_sort_direction = sortKey === currentState.group_sort
+        ? (currentState.group_sort_direction === 'asc' ? 'desc' : 'asc')
+        : (GROUP_SORT_NATURAL_DIRECTIONS[sortKey] || 'desc');
+    currentState.group_sort = sortKey;
+    setGroupSortDropdown(sortKey);
+    $(`input[name="group_sort_direction"][value="${currentState.group_sort_direction}"]`).prop('checked', true);
+    currentState.page = 1;
+    writeStateToUrl();
+    performSearch();
+});
+
+$('input[name="group_by"]').on('change', function() {
+    $('#group-sort-field').toggle($('input[name="group_by"]:checked').val() !== 'locus');
+});
 
 // 8.2 Region Badge Helper
 function getRegionBadge(region) {
@@ -1430,12 +1760,22 @@ function renderLocusRow(locus, rowIndex) {
     const allele = locus.FirstAffectedAlleleSize;
     const refRepeats = locus.NumRepeatsInReference;
     const deltaRef = (allele != null && refRepeats != null) ? allele - refRepeats : null;
+    // Use the same population columns the search filters compare against
+    // (currentState.require_above_population / .population_metric), so Δpop reflects what the
+    // user selected and the Min Δpop filter is a minimum on this column. The cohorts mirror
+    // results_server.population_datasets_compared: short-read -> TenK10K only, long-read ->
+    // HPRC256 and AoU1027, all (or no population filter) -> all three.
+    const popMetric = currentState.population_metric === 'max' ? 'MaxAllele' : '99thPercentile';
+    const popPrefixes = currentState.require_above_population === 'short-read' ? ['TenK10K']
+        : currentState.require_above_population === 'long-read' ? ['HPRC256', 'AoU1027']
+        : ['HPRC256', 'AoU1027', 'TenK10K'];
     const popMaxVal = Math.max(
-        ...[locus.HPRC256_99thPercentile, locus.AoU1027_99thPercentile].filter(v => v != null), -Infinity
+        ...popPrefixes.map(p => locus[`${p}_${popMetric}`]).filter(v => v != null), -Infinity
     );
     const popMax = popMaxVal === -Infinity ? null : popMaxVal;
     const deltaPop = (allele != null && popMax != null) ? allele - popMax : null;
     const nAffUnsolved = locus.NumAffectedUnsolvedSamplesAboveUnaffected || 0;
+    const nFamUnsolved = locus.NumAffectedUnsolvedFamiliesAboveUnaffected || 0;
 
     // Gene display
     const geneName = locus.GeneTableGeneSymbol || '';
@@ -1484,15 +1824,8 @@ function renderLocusRow(locus, rowIndex) {
         : '';
     const locusIdRaw = locus.LocusId || '';
     const locusIdParts = locusIdRaw.split('-');
-    // TRExplorer search URL for this locus (reused by the standalone TRExplorer link below)
-    const trexHref = (locus.Chrom && locus.Start0Based != null && locus.End1Based != null)
-        ? (() => {
-            const chromNum = locus.Chrom.replace('chr', '');
-            const trexLocusId = locus.TRExplorerLocusId || `${chromNum}-${locus.Start0Based}-${locus.End1Based}-${locus.Motif || ''}`;
-            const igvLoc = encodeURIComponent(`${locus.Chrom}:${locus.Start0Based}-${locus.End1Based}`);
-            return `https://trexplorer.broadinstitute.org/#igvLoc=${igvLoc}&showRs=1&q=${encodeURIComponent(trexLocusId)}&source=&igv_gencode=1&igv_segdups=1&igv_36k_map=1&igv_ncannot=1`;
-        })()
-        : '';
+    // TRExplorer URL for this locus (reused by the standalone TRExplorer link below)
+    const trexHref = buildTRExplorerUrl(locus);
     // Locus id display text (truncate the motif portion when it is very long)
     const locusMotifPart = locusIdParts.length >= 4 ? locusIdParts.slice(3).join('-') : '';
     const locusIdTruncated = locusMotifPart.length > motifTruncLen;
@@ -1538,6 +1871,7 @@ function renderLocusRow(locus, rowIndex) {
 
     // Aff unsolved with highlight
     const affUnsolvedStyle = nAffUnsolved > 0 ? 'color: #c62828; font-weight: 600;' : 'color: #888;';
+    const famUnsolvedStyle = nFamUnsolved > 0 ? 'color: #c62828; font-weight: 600;' : 'color: #888;';
 
     // Inheritance
     const inheritance = locus.GeneTableInheritance || locus.inheritance || '';
@@ -1637,6 +1971,17 @@ function renderLocusRow(locus, rowIndex) {
     // Build the locus cell
     const locusCell = `<div class="cell-main">${locusIdDisplay}</div>${badgesRow}${externalLinks ? `<div class="cell-sub">${externalLinks}</div>` : ''}${addButtons}`;
 
+    // In a grouped row's locus list the API adds the row's own sample (or family members') alleles,
+    // shown next to the locus's most expanded affected allele.
+    let selectedAllelesCell = '';
+    if (locus.SelectedSampleOrFamilyAlleles !== undefined) {
+        const selected = locus.SelectedSampleOrFamilyAlleles;
+        const largest = selected.length ? Math.max(...selected.map(a => a.allele_size)) : null;
+        const members = currentState.group_by === 'family' && selected.length
+            ? `<div class="cell-sub">${selected.map(a => `${escapeHtml(a.sample_id)}: ${a.allele_size}`).join('<br>')}</div>` : '';
+        selectedAllelesCell = `<td class="col-selected-allele col-numeric"><div class="cell-main">${largest != null ? largest : ''}</div>${members}</td>`;
+    }
+
     return `<tr class="locus-row" data-locus-id="${escapeHtml(locus.LocusId)}" data-row-index="${rowIndex}">
         <td class="col-expand"><span class="expand-toggle" title="Expand details"><i class="chevron right icon"></i></span></td>
         <td class="col-row-num">${rowIndex + 1}</td>
@@ -1644,10 +1989,11 @@ function renderLocusRow(locus, rowIndex) {
         <td class="col-motif">${motifCell}</td>
         <td class="col-region">${regionBadge}</td>
         <td class="col-gene">${geneCell}</td>
-        <td class="col-allele col-numeric ${alleleColor}">${alleleVal}</td>
+        <td class="col-allele col-numeric ${alleleColor}">${alleleVal}</td>${selectedAllelesCell}
         <td class="col-delta-ref col-numeric" style="${deltaRefColor}">${deltaRefStr}</td>
         <td class="col-delta-pop col-numeric" style="${deltaPopColor}">${deltaPopStr}</td>
         <td class="col-aff-unsolved col-numeric" style="${affUnsolvedStyle}">${nAffUnsolved}</td>
+        <td class="col-fam-unsolved col-numeric" style="${famUnsolvedStyle}">${nFamUnsolved}</td>
         <td class="col-inheritance" style="font-size: 0.92em;">${escapeHtml(inheritance)}</td>
         <td class="col-gene-pheno" style="font-size: 0.85em; color: #555;">${genePhenoHtml}</td>
         <td class="col-pli col-numeric" style="${pliStyle}">${pli}</td>
@@ -1672,6 +2018,13 @@ $('#results-table thead th[data-sort]').on('click', function() {
 // =========================================================================
 // Task 9: Locus Detail Inline Expansion
 // =========================================================================
+
+// A motif longer than maxLength shows its first maxLength bases, "..." and its size, e.g.
+// "TCTTGTGGGACTTCAGGCACTTGAAAGATA... (235bp)"; clicking it opens the full-motif popup.
+function formatMotifForDisplay(motif, maxLength = 30) {
+    if (!motif || motif.length <= maxLength) return escapeHtml(motif || '');
+    return `<span class="motif-truncated" title="Click to see full motif" data-full-motif="${escapeHtml(motif)}">${escapeHtml(motif.substring(0, maxLength))}... (${motif.length}bp)</span>`;
+}
 
 // Motif truncation click handler — show full motif in a popup
 $(document).on('click', '.motif-truncated', function(e) {
@@ -1725,7 +2078,9 @@ $(document).on('click', 'td.col-expand', async function() {
 
     // Show loading
     $toggle.addClass('expanded').html('<i class="chevron down icon"></i>');
-    const $loadingRow = $(`<tr class="locus-detail-row"><td colspan="18" style="padding: 12px 14px; background: #fafafa; border-top: 1px solid #ccc; border-bottom: 2px solid #2185d0;"><div class="ui tiny active inline loader"></div> Loading...</td></tr>`);
+    // Spans the row's own cells: a grouped row's locus list has one more column than the main
+    // table (This sample / This family)
+    const $loadingRow = $(`<tr class="locus-detail-row"><td colspan="${$row.children('td').length}" style="padding: 12px 14px; background: #fafafa; border-top: 1px solid #ccc; border-bottom: 2px solid #2185d0;"><div class="ui tiny active inline loader"></div> Loading...</td></tr>`);
     $row.after($loadingRow);
     refreshCollapseAllButton();
 
@@ -1735,6 +2090,7 @@ $(document).on('click', 'td.col-expand', async function() {
         const detail = await response.json();
         const html = renderLocusDetail(detail, currentState.outlier_type);
         $loadingRow.children('td').html(html);
+        highlightGroupSamplesInDetail($row, $loadingRow);
     } catch (error) {
         // Keep the chevron expanded so it stays consistent with the error detail row left in
         // the DOM; otherwise the next click "collapses" the error row instead of retrying.
@@ -1743,6 +2099,15 @@ $(document).on('click', 'td.col-expand', async function() {
 });
 
 // 9.2 Detail Rendering
+// Mirrors analysis_columns.is_unaffected_or_solved_status, the rule behind #Aff, #Fam and the grouped
+// view: every sample that is neither unaffected nor solved counts, including samples with an unknown
+// affected status and Partially Solved ones.
+function isAffectedUnsolvedSample(s) {
+    const affected = (s.affected_status || '').trim().toLowerCase();
+    const analysis = (s.analysis_status || '').trim().toLowerCase();
+    return affected !== 'unaffected' && !['solved', 'unaffected', 'probably solved'].includes(analysis);
+}
+
 function renderLocusDetail(detail, outlierType) {
     const otMap = {all: 'AllAlleles', short: 'ShortAlleles', hemi: 'HemizygousAlleles'};
     const ot = otMap[outlierType];
@@ -1906,9 +2271,12 @@ function renderLocusDetail(detail, outlierType) {
 
         // Row CSS class by status
         let rowClass = 'sample-unknown';
-        if (isAffectedStatus(s.affected_status) && s.analysis_status === 'Unsolved') rowClass = 'sample-affected-unsolved';
+        if (isAffectedUnsolvedSample(s)) rowClass = 'sample-affected-unsolved';
         else if (isAffectedStatus(s.affected_status)) rowClass = 'sample-affected-solved';
         else if (s.affected_status === 'Unaffected') rowClass = 'sample-unaffected';
+        // The Affected quick filter goes by the sample's own affected status, which an unknown-status
+        // sample colored as affected-unsolved above does not have
+        if (isAffectedStatus(s.affected_status)) rowClass += ' sample-status-affected';
 
         // D10: Expandable phenotype text in detail panel
         let phenTrunc = '';
@@ -1920,10 +2288,10 @@ function renderLocusDetail(detail, outlierType) {
             }
         }
 
-        html += `<tr class="${rowClass}">`;
+        html += `<tr class="${rowClass}" data-sample-id="${escapeHtml(s.sample_id)}" data-family-id="${escapeHtml(s.family_id || '')}">`;
 
         html += `<td style="text-align: right; font-weight: 600;">${s.allele_size}</td>`;
-        html += `<td>${escapeHtml(locus.Motif || '')}</td>`;
+        html += `<td>${formatMotifForDisplay(locus.Motif)}</td>`;
         if (hasSex) html += `<td>${escapeHtml(s.sex || '')}</td>`;
         html += `<td>${renderMendelianWarning(s.sample_id, currentState.source)}${escapeHtml(s.sample_id || '')}</td>`;
         html += `<td>${escapeHtml(s.family_id || '')}</td>`;
@@ -2008,13 +2376,13 @@ function renderLocusDetail(detail, outlierType) {
     }
 
     // C6: Affected-unsolved summary
-    const affUnsolved = samples.filter(s => isAffectedStatus(s.affected_status) && s.analysis_status === 'Unsolved');
+    const affUnsolved = samples.filter(isAffectedUnsolvedSample);
     if (affUnsolved.length > 0) {
         html += '<div style="margin-top: 8px; padding: 6px 10px; background: #fff5f5; border-left: 4px solid #c62828; border-radius: 3px;">';
         html += '<div style="font-weight: 600; font-size: 0.92em; color: #c62828; margin-bottom: 4px;">Affected Unsolved Summary:</div>';
         html += '<table class="invisible-table affected-unsolved-table"><tbody>';
         for (const s of affUnsolved) {
-            html += `<tr style="font-size: 0.92em; color: #c62828;"><td class="aff-allele">${s.allele_size} x ${escapeHtml(locus.Motif || '')}</td><td class="aff-sample">${escapeHtml(s.sample_id)}</td><td class="aff-phenotype">${escapeHtml(s.phenotype_description ? s.phenotype_description.substring(0, 120) : '')}</td></tr>`;
+            html += `<tr style="font-size: 0.92em; color: #c62828;"><td class="aff-allele">${s.allele_size} x ${formatMotifForDisplay(locus.Motif)}</td><td class="aff-sample">${escapeHtml(s.sample_id)}</td><td class="aff-phenotype">${escapeHtml(s.phenotype_description ? s.phenotype_description.substring(0, 120) : '')}</td></tr>`;
         }
         html += '</tbody></table>';
         html += '</div>';
@@ -2075,13 +2443,19 @@ $(document).on('click', '.collapse-detail-btn', function() {
 // The Collapse all button has nothing to do when no locus is expanded, so it is only shown while
 // at least one detail panel is open. Called from every place that opens or closes one.
 function refreshCollapseAllButton() {
-    $('.collapse-all-btn').toggle($('.locus-detail-row').length > 0);
+    $('.collapse-all-btn').toggle($('.locus-detail-row, .group-detail-row').length > 0);
 }
 
 // Collapse every expanded locus at once, with the same slide animation as collapsing one.
+// Expanded sample or family rows (grouped views) close too, taking their loci with them.
 $(document).on('click', '.collapse-all-btn', function() {
+    $('.group-row .expand-toggle').removeClass('expanded').html('<i class="chevron right icon"></i>');
+    $('.group-detail-row').remove();
     const $detailRows = $('.locus-detail-row');
-    if (!$detailRows.length) return;
+    if (!$detailRows.length) {
+        refreshCollapseAllButton();
+        return;
+    }
     // Reset every chevron up front rather than per row: the rows themselves go away in the
     // animation callbacks below, and their locus rows stay put.
     $('.locus-row .expand-toggle').removeClass('expanded').html('<i class="chevron right icon"></i>');
@@ -2105,10 +2479,11 @@ $(document).on('click', '.detail-filter-btn', function() {
         const $row = $(this);
         if ($row.find('.threshold-marker').length > 0) { $row.show(); return; }
         if (filter === 'all') { $row.show(); return; }
-        const status = $row.attr('class') || '';
-        if (filter === 'affected') $row.toggle(status.includes('sample-affected'));
-        else if (filter === 'affected-unsolved') $row.toggle(status === 'sample-affected-unsolved');
-        else if (filter === 'unaffected') $row.toggle(status === 'sample-unaffected');
+        // Test class membership: a grouped view adds 'selected-group-sample' to the group's own rows,
+        // so comparing the whole class attribute would hide exactly those rows.
+        if (filter === 'affected') $row.toggle($row.hasClass('sample-status-affected'));
+        else if (filter === 'affected-unsolved') $row.toggle($row.hasClass('sample-affected-unsolved'));
+        else if (filter === 'unaffected') $row.toggle($row.hasClass('sample-unaffected'));
         else if (filter === 'above-pop') {
             const $popMarker = $panel.find('.threshold-population');
             if ($popMarker.length === 0) {
@@ -2149,11 +2524,14 @@ function updatePaginationControls(data) {
     const nFirst = (page - 1) * pageSize + 1;
     const nLast = Math.min(nFirst + pageSize - 1, total);
 
+    // The grouped views count samples or families, across the loci they span
+    const groupedTotalText = !data.group_by ? ''
+        : ` ${data.group_by === 'family' ? 'families' : 'samples'} across ${data.total_loci.toLocaleString()} loci`;
     const paginationHtml = `
         <div class="total-results">
-            Showing ${nFirst.toLocaleString()}&ndash;${nLast.toLocaleString()} of ${total.toLocaleString()}
+            Showing ${nFirst.toLocaleString()}&ndash;${nLast.toLocaleString()} of ${total.toLocaleString()}${groupedTotalText}
             <button class="ui mini basic button collapse-all-btn" style="margin-left: 12px; display: none;"
-                    title="Collapse every expanded locus on this page">
+                    title="Collapse every expanded row on this page">
                 <i class="chevron up icon"></i> Collapse all
             </button>
         </div>
@@ -2163,13 +2541,15 @@ function updatePaginationControls(data) {
                 <input type="hidden" name="export-format">
                 <i class="dropdown icon"></i>
                 <div class="default text">Select format</div>
-                <div class="menu">
+                <div class="menu">${data.group_by ? `
+                    <div class="item" data-value="groups_tsv">TSV: one row per ${data.group_by === 'family' ? 'family' : 'sample'}</div>
+                    <div class="item" data-value="group_loci_tsv">TSV: one row per ${data.group_by === 'family' ? 'family member' : 'sample'} and locus</div>` : `
                     <div class="item" data-value="bed">BED</div>
                     <div class="item" data-value="tsv">TSV</div>
                     <div class="item" data-value="json">JSON</div>
                     <div class="divider"></div>
                     <div class="header">Tool input formats:</div>
-                    <div class="item" data-value="expansion_hunter">ExpansionHunter</div>
+                    <div class="item" data-value="expansion_hunter">ExpansionHunter</div>`}
                 </div>
             </div>
         </div>
@@ -2318,6 +2698,17 @@ async function removeTag(locusId, tag) {
     return response.json();
 }
 
+// Under a grouped row, highlight that row's sample (or its family's samples) in the locus's detail
+// panel. Shared by the expand handler and refreshDetailPanel, so a refresh keeps the highlight.
+function highlightGroupSamplesInDetail($locusRow, $detailRow) {
+    const groupId = $locusRow.closest('.group-loci').attr('data-group-id');
+    if (groupId === undefined) return;
+    const attribute = currentState.group_by === 'family' ? 'data-family-id' : 'data-sample-id';
+    $detailRow.find(`tr[${attribute}]`).filter(function() {
+        return $(this).attr(attribute) === groupId;
+    }).addClass('selected-group-sample');
+}
+
 async function refreshDetailPanel(locusId) {
     const $row = $(`tr.locus-row[data-locus-id="${locusId}"]`);
     const $detailRow = $row.next('.locus-detail-row');
@@ -2329,6 +2720,10 @@ async function refreshDetailPanel(locusId) {
         const detail = await response.json();
         const html = renderLocusDetail(detail, currentState.outlier_type);
         $detailRow.children('td').html(html);
+        // The same locus can be open under several grouped rows, each with its own sample.
+        $row.each(function() {
+            highlightGroupSamplesInDetail($(this), $(this).next('.locus-detail-row'));
+        });
     } catch (error) {
         console.error('Refresh detail error:', error);
     }

@@ -6,6 +6,32 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/semantic-ui/2.5.0/semantic.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
+<script>
+// Used by index_page_template.html and swim_plot_template.html, which both include this header.
+
+// TRExplorer columns the locus links open with (TRExplorer's showColumns URL parameter)
+const TREXPLORER_LINK_COLUMNS = [
+    'ReferenceRegion', 'ReferenceMotif', 'ReferenceRepeatPurity', 'variationCluster',
+    'GencodeGeneName', 'GencodeGeneRegion', 'VamosMotifFrequencies', 'HPRC256_AlleleHistogram',
+    'HPRC256_Stdev', 'AoU1027_Stdev', 'Source', 'RepeatMaskerIntervals', 'NonCodingAnnotations',
+    'Tanudisastro2024_SignificantCellTypes', 'Manigbas2024_AssociatedTraits', 'encode4MpraExpression',
+    'zhang2025Mpra', 'spliceAI',
+];
+
+// TRExplorer URL for a locus: its IGV view, the search for its TRExplorer locus id (or, without one,
+// this database's chrom-start-end-motif), the IGV tracks and the columns above. Returns '' when the
+// locus has no coordinates.
+function buildTRExplorerUrl(locus) {
+    if (!locus.Chrom || locus.Start0Based == null || locus.End1Based == null) return '';
+    const chromNum = locus.Chrom.replace('chr', '');
+    const trexLocusId = locus.TRExplorerLocusId || `${chromNum}-${locus.Start0Based}-${locus.End1Based}-${locus.Motif || ''}`;
+    const igvLoc = encodeURIComponent(`${locus.Chrom}:${locus.Start0Based}-${locus.End1Based}`);
+    return `https://trexplorer.broadinstitute.org/#igvLoc=${igvLoc}&showRs=1&q=${encodeURIComponent(trexLocusId)}`
+        + '&source=&igv_gencode=1&igv_segdups=1&igv_36k_map=1&igv_ncannot=1'
+        + `&showColumns=${encodeURIComponent(TREXPLORER_LINK_COLUMNS.join(','))}`;
+}
+</script>
+
 <style>
 /* === Page Layout === */
 body {
@@ -100,13 +126,17 @@ body {
 }
 /* Only columns with a data-sort attribute are actually sortable (the click handler
    binds to th[data-sort]), so scope the clickable affordance to those headers. */
-#results-table thead th[data-sort] { cursor: pointer; }
-#results-table thead th[data-sort]:hover { color: #000; }
+#results-table thead th[data-sort],
+#results-table thead th[data-group-sort] { cursor: pointer; }
+#results-table thead th[data-sort]:hover,
+#results-table thead th[data-group-sort]:hover { color: #000; }
 #results-table thead th .sort-icon { color: #bbb; margin-left: 3px; font-size: 0.8em; }
 /* Each sortable field's direction is fixed on the server (SORT_MAPPING in results_server.py:
    Region ascends, the rest descend) and a header click only adds or removes that field from the
    sort list, so the indicator marks a column as part of the active sort instead of naming a
-   direction. That is also what the static up-down glyph in the header says. */
+   direction. That is also what the static up-down glyph in the header says. The grouped views'
+   header (Group Results By) marks its one sorted column the same way; the ASC / DESC radios next
+   to the group sort menu name that column's direction. */
 #results-table thead th.sorted-active .sort-icon { color: #333; }
 
 /* Right-align numeric columns */
@@ -123,6 +153,7 @@ body {
 #results-table .col-delta-ref { width: 65px; }
 #results-table .col-delta-pop { width: 65px; }
 #results-table .col-aff-unsolved { width: 55px; }
+#results-table .col-fam-unsolved { width: 55px; }
 #results-table .col-inheritance  { width: 60px; }
 #results-table .col-gene-pheno   { width: 180px; }
 #results-table .col-pli       { width: 50px; }
@@ -131,6 +162,39 @@ body {
 #results-table .col-vc        { width: 100px; white-space: nowrap; }
 #results-table .col-gene-pheno-sim { width: 85px; }
 #results-table .col-pairwise-sim   { width: 95px; }
+#results-table .col-selected-allele { width: 80px; }
+
+/* The Group Results By sort dropdown (a compact Semantic UI selection dropdown, so as wide as the
+   chosen text): Semantic UI fixes a selection menu to the dropdown's width and wraps its items,
+   so let the menu grow to its longest item and keep every item on one line */
+#group-sort-dropdown { margin-left: 4px; }
+#group-sort-dropdown .menu { width: auto; }
+#group-sort-dropdown .menu > .item { white-space: nowrap; }
+
+/* Grouped views (Group Results By): one row per sample or family, expanding to its loci */
+#results-table .col-group-expand { width: 28px; text-align: center; cursor: pointer; }
+#results-table .col-group-id { width: 190px; }
+#results-table .col-group-members { width: 260px; }
+#results-table .col-group-family { width: 150px; }
+#results-table .col-group-sex { width: 60px; }
+#results-table .col-group-status { width: 150px; }
+/* A width of its own: in the fixed layout an unsized column only gets the space the others leave,
+   which is none at common screen widths */
+#results-table .col-group-phenotype { width: 240px; }
+#results-table .col-group-num-loci,
+#results-table .col-group-disease-genes { width: 100px; }
+#results-table .col-group-gene-pheno { width: 125px; }
+#results-table .col-group-largest-allele { width: 230px; }
+#results-table tr.group-row { border-bottom: 1px solid #eee; }
+#results-table tr.group-detail-row > td { padding: 8px 10px 14px 28px; background: #fafafa; border-bottom: 2px solid #2185d0; }
+#results-table .group-loci-table { width: 100%; }
+/* Like the per-sample sub-table's, this nested header would otherwise inherit the main table's
+   sticky positioning and draw over the main header while scrolling */
+#results-table .group-loci-table thead th { position: static; }
+#results-table .group-loci-pager { margin-bottom: 6px; color: #555; }
+#results-table .group-loci-pager .button { margin-left: 6px; }
+/* Under a grouped row, that row's sample (or its family's samples) in a locus's per-sample table */
+#results-table tbody tr.locus-detail-row tr.selected-group-sample > td { background-color: #fff3cd; }
 
 /* Data rows */
 #results-table tbody tr.locus-row {

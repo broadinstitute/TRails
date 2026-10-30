@@ -110,6 +110,10 @@
                                 <input type="radio" name="swim_require_above_population" value="short-read">
                                 <label>Short-read (TenK10K)</label>
                             </div>
+                            <div class="ui radio checkbox">
+                                <input type="radio" name="swim_require_above_population" value="all">
+                                <label>All (long-read and TenK10K)</label>
+                            </div>
                         </div>
                         <div class="ui checkbox" style="margin-top: 0.5em; margin-left: 1em;">
                             <input type="checkbox" id="swim_include_loci_without_population_data">
@@ -213,10 +217,6 @@
                             <label>Search</label>
                             <input type="text" name="swim_search" placeholder="e.g., FMR1, ENSG00000102081, 2-89831737-89831752-CCATT, chr16:11579459-11579529" title="Gene symbols, Ensembl gene IDs, locus IDs and reference regions in one box. Each comma-separated term is routed by its shape, and a locus is kept if it matches any term.">
                         </div>
-                        <div class="field">
-                            <label>Min pLI</label>
-                            <input type="text" name="swim_min_pli" placeholder="e.g., 0.9">
-                        </div>
                     </div>
                     <div class="column">
                         <div class="field">
@@ -262,7 +262,7 @@
                 <span id="swim-legend-swatch-unaffected" style="margin-left: 16px; display: inline-block; width: 14px; height: 14px; border-radius: 50%; vertical-align: middle; margin-right: 4px;"></span> Unaffected
                 <span id="swim-legend-swatch-unknown" style="margin-left: 16px; display: inline-block; width: 14px; height: 14px; border-radius: 50%; vertical-align: middle; margin-right: 4px;"></span> Unknown
                 <span style="margin-left: 20px; border-left: 1px solid #ccc; padding-left: 12px;">Shapes:</span>
-                <span style="margin-left: 8px;">&#9733;</span> True/Candidate
+                <span style="margin-left: 8px;">&#9650;</span> True/Candidate
                 <span style="margin-left: 12px;">&#9632;</span> Intergenic
                 <span style="margin-left: 12px;">&#9679;</span> Other
                 <span id="swim-legend-counts" style="margin-left: 20px; color: #888;"></span>
@@ -325,6 +325,10 @@ const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
 // Per-source 99th-percentile outlier warnings (keyed by source, then sample_id).
 const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
 
+// /api/v1/swim_plot_data returns at most this many alleles per motif size, the largest ones (the
+// LIMIT in results_server.get_swim_plot_data)
+const SWIM_PLOT_MAX_ALLELES_PER_MOTIF_SIZE = 500;
+
 // Chart instance and raw data storage
 let swimChart = null;
 let swimRawData = [];
@@ -381,8 +385,7 @@ function getSwimParams() {
 
     // Text/number inputs (only include if non-empty)
     const textFields = [
-        'motif_size', 'motif', 'search', 'max_variation_cluster_size_diff',
-        'min_pli', 'phenotype_keyword',
+        'motif_size', 'motif', 'search', 'max_variation_cluster_size_diff', 'phenotype_keyword',
         'min_expansion', 'sample_id_like', 'min_sigma_percentile'
     ];
     textFields.forEach(field => {
@@ -550,11 +553,13 @@ function renderSwimChart(data) {
         const colors = statusColor(item.affected_status);
         bgColors.push(colors.bg);
         borderColors.push(colors.border);
-        // Determine point style: star for a "true"/"candidate" tag, rect for intergenic, circle otherwise
+        // Determine point style: triangle for a "true"/"candidate" tag, rect for intergenic, circle
+        // otherwise. Not Chart.js's 'star': it is drawn from line segments only, so with this
+        // dataset's 0.5px border the points meant to stand out showed as faint hairline asterisks.
         let style = 'circle';
         const tags = (item.tags || '').toString().toLowerCase();
         if (tags.includes('true') || tags.includes('candidate')) {
-            style = 'star';
+            style = 'triangle';
         } else if (item.gene_region === 'intergenic') {
             style = 'rect';
         }
@@ -709,8 +714,15 @@ function updateSwimLegend(data) {
         else unknown++;
     });
     const total = data.length;
+    // Say so when a motif size reached the server's cap, so the counts are not read as complete.
+    const allelesPerMotifSize = {};
+    swimRawData.forEach(item => {
+        allelesPerMotifSize[item.motif_category] = (allelesPerMotifSize[item.motif_category] || 0) + 1;
+    });
+    const capped = Object.values(allelesPerMotifSize).some(n => n >= SWIM_PLOT_MAX_ALLELES_PER_MOTIF_SIZE);
     $('#swim-legend-counts').text(
         total + ' dots: ' + affected + ' affected, ' + unaffected + ' unaffected, ' + unknown + ' unknown'
+        + (capped ? ' (only the ' + SWIM_PLOT_MAX_ALLELES_PER_MOTIF_SIZE + ' largest alleles per motif size are shown)' : '')
     );
     // Color the legend swatches from STATUS_COLORS so they always match the plotted points.
     $('#swim-legend-swatch-affected').css('background', STATUS_COLORS['Affected'].bg);
@@ -795,15 +807,11 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
         ucscLink = '<a href="' + escapeHtml(ucscUrl) + '" target="_blank" style="color: #2185d0;">UCSC Genome Browser</a>';
     }
 
-    // Build TRExplorer link
-    let trexLink = '';
-    if (locus.TRExplorerLocusId) {
-        const igvLoc = encodeURIComponent((locus.Chrom || '') + ':' + (locus.Start0Based || 0) + '-' + (locus.End1Based || 0));
-        const q = encodeURIComponent(locus.TRExplorerLocusId);
-        const trexUrl = 'https://trexplorer.broadinstitute.org/#showIGV=1&igvLoc=' + igvLoc
-            + '&showRs=1&q=' + q + '&source=&igv_gencode=1&igv_segdups=1&igv_36k_map=1&igv_ncannot=1';
-        trexLink = '<a href="' + escapeHtml(trexUrl) + '" target="_blank" style="color: #2185d0;">TRExplorer</a>';
-    }
+    // Build TRExplorer link, the same URL as the main table's (buildTRExplorerUrl in header_template.html)
+    const trexUrl = buildTRExplorerUrl(locus);
+    const trexLink = trexUrl
+        ? '<a href="' + escapeHtml(trexUrl) + '" target="_blank" style="color: #2185d0;">TRExplorer</a>'
+        : '';
 
     const externalLinks = [ucscLink, trexLink].filter(Boolean).join(' &nbsp;|&nbsp; ');
 
@@ -1239,7 +1247,7 @@ function refreshSwimModal() {
     if (_currentModalItem) showDotDetail(_currentModalItem);
 }
 
-// The chart encodes a "true"/"candidate" tag as a star (see renderSwimChart), and it reads those
+// The chart encodes a "true"/"candidate" tag as a triangle (see renderSwimChart), and it reads those
 // tags off swimRawData rather than off the modal. Refreshing the tag menus and the modal alone
 // would therefore leave the plotted shapes disagreeing with the tags the user just edited, until
 // the whole plot is reloaded. The add/remove endpoints return the locus's updated tag list, so

@@ -58,7 +58,14 @@ URL in your web browser to begin your analysis using TRails interface.
 
 Useful `trails.py` flags: 
 `--rebuild` (force a rebuild), `--port` / `--host`, `-n / --n-loci N` (limit to the first N
-loci, for a quick test).
+loci, for a quick test), `--population-gate-cohorts` (the population cohorts whose 99th
+percentiles an affected allele must exceed to count in the #Aff / #Fam columns and the
+phenotype scores: comma-separated `HPRC256`, `AoU1027`, `TenK10K`; default `HPRC256,AoU1027`.
+Add `TenK10K` for a short-read callset. The percentiles are read from the
+`HPRC256_99thPercentile` / `AoU1027_99thPercentile` / `TenK10K_99thPercentile` columns of the
+repeat-copy-numbers TSV, when present. Changing it rebuilds the database),
+`--initial-require-above-population long-read|short-read|all` (the population filter the page
+starts with when it is opened with no saved filters, e.g. `all` for a short-read callset).
 
 ## Inputs
 

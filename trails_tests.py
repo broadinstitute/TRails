@@ -1,58 +1,13 @@
-"""Unit tests for trails.py, the launcher.
+"""Unit tests for trails.py, the launcher."""
 
-The one thing here that a user cannot get back by re-running the build is their notes and
-tags: they are typed in by hand in the results server, not derived from the input TSVs. The
-DuckDB port renamed the file they live in, so these tests cover the migration that carries
-them across.
-"""
-
+import argparse
+import json
 import os
 import shutil
-import sqlite3
 import tempfile
 import unittest
 
-import duckdb_compat
 import trails
-
-
-def write_legacy_annotations(path, notes=(), tags=()):
-    """Builds a SQLite annotations database shaped the way the pre-DuckDB TRails wrote it.
-
-    Args:
-        path: Where to create the file.
-        notes: (locus_id, note_text, created_at, updated_at) tuples.
-        tags: (locus_id, tag, created_at) tuples.
-    """
-    conn = sqlite3.connect(path)
-    conn.execute("""CREATE TABLE notes (
-        locus_id TEXT PRIMARY KEY,
-        note_text TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    )""")
-    conn.execute("""CREATE TABLE tags (
-        locus_id TEXT NOT NULL,
-        tag TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY (locus_id, tag)
-    )""")
-    conn.executemany("INSERT INTO notes VALUES (?, ?, ?, ?)", list(notes))
-    conn.executemany("INSERT INTO tags VALUES (?, ?, ?)", list(tags))
-    conn.commit()
-    conn.close()
-
-
-def read_migrated(path):
-    """Returns the (notes, tags) rows of a DuckDB annotations database."""
-    conn = duckdb_compat.connect(path, read_only=True)
-    try:
-        return (conn.execute("SELECT locus_id, note_text, created_at, updated_at FROM notes "
-                             "ORDER BY locus_id").fetchall(),
-                conn.execute("SELECT locus_id, tag, created_at FROM tags "
-                             "ORDER BY locus_id, tag").fetchall())
-    finally:
-        conn.close()
 
 
 class BuildSourceFilesTests(unittest.TestCase):
@@ -121,153 +76,69 @@ class BuildSourceFilesTests(unittest.TestCase):
         self.assertEqual([n for n in names if n.endswith("_tests.py")], [])
 
 
-class LegacyAnnotationsPathTests(unittest.TestCase):
-
-    def test_derives_the_sqlite_path_the_previous_version_used(self):
-        self.assertEqual(
-            trails.legacy_annotations_db_path("/data/cohort.with_analysis_columns.duckdb"),
-            "/data/cohort.with_analysis_columns.db.annotations.db")
-
-    def test_a_db_path_that_is_already_sqlite_named_keeps_its_name(self):
-        # --db can name anything; only the ".duckdb" the port introduced is swapped back.
-        self.assertEqual(trails.legacy_annotations_db_path("/data/cohort.db"),
-                         "/data/cohort.db.annotations.db")
-
-
-class MigrateLegacyAnnotationsTests(unittest.TestCase):
+class BuildManifestFlagsTests(unittest.TestCase):
+    """The manifest decides whether a database is reused, so its flags must compare exactly."""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self.annotations_db = os.path.join(self.tmpdir, "cohort.duckdb.annotations.duckdb")
-        self.legacy_path = os.path.join(self.tmpdir, "cohort.db.annotations.db")
+        self.db_path = os.path.join(self.tmpdir, "result.duckdb")
+        self.manifest_path = self.db_path + ".build_manifest.json"
+        with open(self.db_path, "w") as f:
+            f.write("a database")
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir)
 
-    def test_notes_and_tags_arrive_intact(self):
-        write_legacy_annotations(
-            self.legacy_path,
-            notes=[("1-100-110-AT", "candidate, check IGV", "2026-01-02 03:04:05",
-                    "2026-01-09 10:11:12"),
-                   ("2-1-9-CAG", "ruled out", "2026-02-02 02:02:02", "2026-02-02 02:02:02")],
-            tags=[("1-100-110-AT", "followup", "2026-01-02 03:04:05"),
-                  ("1-100-110-AT", "novel", "2026-01-03 03:04:05"),
-                  ("2-1-9-CAG", "followup", "2026-02-02 02:02:02")])
+    def manifest_for(self, population_gate_cohorts):
+        """Returns the manifest trails.main would build for this gate and no input files."""
+        args = argparse.Namespace(n_loci=None, skip_phenotype_scores=False, source_label="",
+                                  population_gate_cohorts=population_gate_cohorts)
+        return trails.build_manifest({}, trails.build_flags(args))
 
-        self.assertEqual(
-            trails.migrate_legacy_annotations(self.annotations_db, self.legacy_path), (2, 3))
+    def write_manifest(self, manifest):
+        with open(self.manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
 
-        notes, tags = read_migrated(self.annotations_db)
-        self.assertEqual(notes, [
-            ("1-100-110-AT", "candidate, check IGV", "2026-01-02 03:04:05",
-             "2026-01-09 10:11:12"),
-            ("2-1-9-CAG", "ruled out", "2026-02-02 02:02:02", "2026-02-02 02:02:02")])
-        self.assertEqual(tags, [
-            ("1-100-110-AT", "followup", "2026-01-02 03:04:05"),
-            ("1-100-110-AT", "novel", "2026-01-03 03:04:05"),
-            ("2-1-9-CAG", "followup", "2026-02-02 02:02:02")])
+    def test_an_unchanged_gate_reuses_the_database(self):
+        self.write_manifest(self.manifest_for(("HPRC256", "AoU1027")))
+        self.assertFalse(trails.needs_rebuild(
+            self.db_path, self.manifest_path, self.manifest_for(("HPRC256", "AoU1027")), False))
 
-    def test_the_legacy_file_is_left_untouched(self):
-        write_legacy_annotations(
-            self.legacy_path, notes=[("1-1-10-A", "keep me", "t1", "t2")])
-        before = open(self.legacy_path, "rb").read()
-        trails.migrate_legacy_annotations(self.annotations_db, self.legacy_path)
-        self.assertEqual(open(self.legacy_path, "rb").read(), before)
+    def test_a_different_gate_forces_a_rebuild(self):
+        self.write_manifest(self.manifest_for(("HPRC256", "AoU1027")))
+        self.assertTrue(trails.needs_rebuild(
+            self.db_path, self.manifest_path, self.manifest_for(("HPRC256", "AoU1027", "TenK10K")), False))
 
-    def test_no_legacy_file_is_a_no_op(self):
-        self.assertEqual(
-            trails.migrate_legacy_annotations(self.annotations_db, self.legacy_path), (0, 0))
-        self.assertFalse(os.path.exists(self.annotations_db))
 
-    def test_an_existing_annotations_database_is_never_overwritten(self):
-        # The second run must not copy the old notes back over notes written since.
-        write_legacy_annotations(self.legacy_path, notes=[("1-1-10-A", "old", "t1", "t2")])
-        conn = duckdb_compat.connect(self.annotations_db)
-        conn.execute("CREATE TABLE notes (locus_id TEXT PRIMARY KEY, note_text TEXT NOT NULL, "
-                     "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
-        conn.execute("INSERT INTO notes VALUES ('1-1-10-A', 'new', 't3', 't4')")
-        conn.commit()
-        conn.close()
+class InitialRequireAbovePopulationTests(unittest.TestCase):
+    """trails.py validates --initial-require-above-population itself and forwards it to the server."""
 
-        self.assertEqual(
-            trails.migrate_legacy_annotations(self.annotations_db, self.legacy_path), (0, 0))
-        conn = duckdb_compat.connect(self.annotations_db, read_only=True)
+    def test_choices_match_the_server(self):
+        # Imported here, not at the top: only this test needs flask.
+        import results_server
+        self.assertEqual(trails.INITIAL_REQUIRE_ABOVE_POPULATION_CHOICES,
+                         list(results_server.POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION))
+
+    def server_command_for(self, initial_require_above_population):
+        """Returns the results_server.py command line serve() would run."""
+        args = argparse.Namespace(sample_metadata_tsv="samples.tsv", port=None, host=None,
+                                  initial_require_above_population=initial_require_above_population)
+        real_run = trails.subprocess.run
+        commands = []
+        trails.subprocess.run = lambda cmd, check: commands.append(cmd)
         try:
-            self.assertEqual(conn.execute("SELECT note_text FROM notes").fetchone()[0], "new")
+            trails.serve("/data/cohort.duckdb", args)
         finally:
-            conn.close()
+            trails.subprocess.run = real_run
+        return commands[0]
 
-    def test_an_unreadable_legacy_file_does_not_stop_the_launcher(self):
-        with open(self.legacy_path, "w") as f:
-            f.write("this is not a SQLite database")
-        self.assertEqual(
-            trails.migrate_legacy_annotations(self.annotations_db, self.legacy_path), (0, 0))
-        self.assertFalse(os.path.exists(self.annotations_db))
+    def test_a_chosen_value_is_forwarded(self):
+        command = self.server_command_for("all")
+        flag_position = command.index("--initial-require-above-population")
+        self.assertEqual(command[flag_position + 1], "all")
 
-    def test_an_empty_legacy_file_writes_no_database(self):
-        write_legacy_annotations(self.legacy_path)
-        self.assertEqual(
-            trails.migrate_legacy_annotations(self.annotations_db, self.legacy_path), (0, 0))
-        self.assertFalse(os.path.exists(self.annotations_db))
-
-    def test_tags_still_migrate_when_the_notes_table_is_missing(self):
-        conn = sqlite3.connect(self.legacy_path)
-        conn.execute("CREATE TABLE tags (locus_id TEXT NOT NULL, tag TEXT NOT NULL, "
-                     "created_at TEXT NOT NULL, PRIMARY KEY (locus_id, tag))")
-        conn.execute("INSERT INTO tags VALUES ('1-1-10-A', 'followup', 't1')")
-        conn.commit()
-        conn.close()
-
-        self.assertEqual(
-            trails.migrate_legacy_annotations(self.annotations_db, self.legacy_path), (0, 1))
-        notes, tags = read_migrated(self.annotations_db)
-        self.assertEqual(notes, [])
-        self.assertEqual(tags, [("1-1-10-A", "followup", "t1")])
-
-    def test_a_legacy_path_with_uri_punctuation_is_read(self):
-        # "#" and "?" end the path in a SQLite file: URI unless they are escaped, so an
-        # unescaped path made SQLite open a different (empty) file and the user's notes and
-        # tags were left behind. The destination is written to a plain directory here
-        # because duckdb 1.5 cannot create a database under a directory whose name contains
-        # "?": it splits the path at that character when it names the write-ahead log.
-        awkward_dir = os.path.join(self.tmpdir, "run#3?draft")
-        os.makedirs(awkward_dir)
-        legacy_path = os.path.join(awkward_dir, "cohort.db.annotations.db")
-        write_legacy_annotations(
-            legacy_path,
-            notes=[("1-100-110-AT", "candidate", "t1", "t2")],
-            tags=[("1-100-110-AT", "followup", "t1")])
-
-        self.assertEqual(
-            trails.migrate_legacy_annotations(self.annotations_db, legacy_path), (1, 1))
-
-        notes, tags = read_migrated(self.annotations_db)
-        self.assertEqual(notes, [("1-100-110-AT", "candidate", "t1", "t2")])
-        self.assertEqual(tags, [("1-100-110-AT", "followup", "t1")])
-
-    def test_a_hash_in_the_data_directory_migrates_end_to_end(self):
-        # The real layout: both databases sit in the user's data directory.
-        awkward_dir = os.path.join(self.tmpdir, "run#3")
-        os.makedirs(awkward_dir)
-        legacy_path = os.path.join(awkward_dir, "cohort.db.annotations.db")
-        annotations_db = os.path.join(awkward_dir, "cohort.duckdb.annotations.duckdb")
-        write_legacy_annotations(
-            legacy_path,
-            notes=[("1-100-110-AT", "candidate", "t1", "t2")],
-            tags=[("1-100-110-AT", "followup", "t1")])
-
-        self.assertEqual(trails.migrate_legacy_annotations(annotations_db, legacy_path), (1, 1))
-
-        notes, tags = read_migrated(annotations_db)
-        self.assertEqual(notes, [("1-100-110-AT", "candidate", "t1", "t2")])
-        self.assertEqual(tags, [("1-100-110-AT", "followup", "t1")])
-
-    def test_no_temporary_file_is_left_behind(self):
-        write_legacy_annotations(self.legacy_path, notes=[("1-1-10-A", "n", "t1", "t2")])
-        trails.migrate_legacy_annotations(self.annotations_db, self.legacy_path)
-        self.assertEqual(
-            sorted(os.listdir(self.tmpdir)),
-            sorted([os.path.basename(self.legacy_path), os.path.basename(self.annotations_db)]))
+    def test_no_value_forwards_no_flag(self):
+        self.assertNotIn("--initial-require-above-population", self.server_command_for(None))
 
 
 if __name__ == "__main__":

@@ -83,6 +83,17 @@ spelling; otherwise it is passed through verbatim under your own header. The pre
 specific cohort/version tokens (not the bare cohort abbreviation), so a sample genuinely named
 e.g. `AoU_0001` is still read as a sample.
 
+*Population gate.* The `HPRC256_99thPercentile`, `AoU1027_99thPercentile` and
+`TenK10K_99thPercentile` columns also gate the precomputed `NumAffectedUnsolved*` counts (the
+#Aff / #Fam columns), the `affected_unsolved_outliers_above_unaffected` table and the phenotype
+scores: an affected allele counts only when it is larger than the 99th percentile of every
+cohort named by `--population-gate-cohorts` that has a value at the locus. The default is
+`HPRC256,AoU1027` (the long-read cohorts); the choices are `HPRC256`, `AoU1027` and `TenK10K`,
+comma-separated, e.g. `HPRC256,AoU1027,TenK10K` to also gate on the short-read TenK10K cohort.
+A locus where none of the chosen cohorts has a value is not gated. The same all-alleles
+percentile gates every outlier type. The build records the chosen cohorts in the `metadata`
+table, and `trails.py` rebuilds the database when the flag changes.
+
 Both rules live in one place in the code, which is the source of truth if this table ever falls
 behind: `ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED` and `ANNOTATION_COLUMN_PREFIXES` in
 `input_tables.py` (applied by `_is_annotation_column`).
@@ -154,7 +165,7 @@ documented here only as the internal data model, for contributors. Each record c
 | `AllAlleleHistogram` | **required** | `allele:count` pairs, comma-separated, e.g. `9x:6,10x:4086,11x:178` |
 | `ShortAlleleHistogram` | **required** | same format (shorter allele of each genotype); may be empty |
 | `HemizygousAlleleHistogram` | **required** | same format; may be empty |
-| `OutlierSampleIds_AllAlleles` | **required** | `allele:sample_id[:purity[:methylation]]` entries, comma-separated, **sorted by allele size DESC**, e.g. `11x:GSS225379,11x:PMGRC-111-107-2` |
+| `OutlierSampleIds_AllAlleles` | **required** | `allele:sample_id` entries, comma-separated, **sorted by allele size DESC**, e.g. `11x:GSS225379,11x:PMGRC-111-107-2` |
 | `OutlierSampleIds_ShortAlleles` | **required** | same format (short alleles) |
 | `OutlierSampleIds_HemizygousAlleles` | **required** | same format (hemizygous) |
 | `ReferenceRegion` | optional | `chrom:start-end`; computed from `LocusId` if absent |
@@ -170,14 +181,15 @@ ExpansionHunter export) — optional/ignored.
 ### 5. Generated result database  *(server input; built for you)*
 
 `trails.py` builds a single `*.with_analysis_columns.duckdb` (DuckDB) and points the server at
-it (`results_server.py --db <path>`). You don't author it. It contains 5 tables, plus the two
+it (`results_server.py --db <path>`). You don't author it. It contains 6 tables, plus the two
 optional Mendelian-QC tables of section 6:
 
 | Table | Contents |
 |-------|----------|
 | `loci` | one row per locus (the analysis output columns + annotations) |
 | `swim_plot` | one row per outlier allele (sample, allele size, affected status, motif, gene, …) |
-| `metadata` | build facts the server reads, currently just the callset's sample count |
+| `affected_unsolved_outliers_above_unaffected` | one row per (locus, outlier type, sample) that the #Aff count counts: `LocusId`, `outlier_type`, `sample_id`, `family_id` (NULL when the sample has none) and the sample's largest counted `allele_size`. The Group Results By view reads it. Always present, possibly empty |
+| `metadata` | build facts: the callset's sample count (`num_samples`) and the `--population-gate-cohorts` value the build used (`population_gate_cohorts`, comma-separated) |
 | `per_locus_phenotype_scores` | gene/phenotype similarity per locus *(only if a phenotype TSV was supplied)* |
 | `per_outlier_phenotype_scores` | gene/phenotype similarity per outlier sample *(only if a phenotype TSV was supplied)* |
 
@@ -189,13 +201,9 @@ ends in `.db`, the path `trails.py` now derives ends in `.duckdb`, so the first 
 upgrade simply rebuilds from your input TSVs. The old `.db` file is left alone; delete it
 yourself once you are happy with the new one.
 
-Your *annotations* (notes and tags) are different: you typed them in, so no rebuild can
-reproduce them. The first run after the upgrade copies them out of the old
-`*.with_analysis_columns.db.annotations.db` into the new
-`*.with_analysis_columns.duckdb.annotations.duckdb` and prints how many notes and tags it
-moved. The copy is one-way and runs only while the new file does not exist yet, so a later
-run never overwrites notes you have added since. The old annotations file is only read, never
-written or deleted: keep it until you have confirmed your notes and tags are in the new TRails.
+Notes and tags from an older, SQLite-based TRails are not carried over either. They stay in the
+old `*.with_analysis_columns.db.annotations.db`, which TRails leaves alone, and the new
+`*.with_analysis_columns.duckdb.annotations.duckdb` starts empty.
 
 ### 6. Mendelian-violation QC  *(optional)*
 

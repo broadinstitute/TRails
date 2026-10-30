@@ -1,4 +1,4 @@
-"""Unit tests for the merged Search box and the variation cluster filters.
+"""Unit tests for the merged Search box, the variation cluster filters and the population filters.
 
 The Search box replaced four separate filters (Gene Symbol(s), Gene ID, Locus Id(s) and
 Reference Region), so the two things worth pinning down are:
@@ -276,6 +276,132 @@ class SearchQueryTests(unittest.TestCase):
                              self._query())
         finally:
             results_server.app.config["DB_COLUMNS_SET"] = original
+
+
+class PopulationFilterTestCase(unittest.TestCase):
+    """Runs build_api_query against a small loci table of FirstAffectedAlleleSize_AllAlleles and
+    population columns, given as rows of LOCI under the column names COLUMNS (after LocusId)."""
+
+    COLUMNS = ()
+    LOCI = ()
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.db_path = os.path.join(cls.tmpdir, "population_filter.duckdb")
+        conn = duckdb_compat.connect(cls.db_path)
+        column_definitions = ", ".join(f"{c} {'INTEGER' if c.startswith('FirstAffected') else 'DOUBLE'}"
+                                       for c in cls.COLUMNS)
+        conn.execute(f"CREATE TABLE loci (LocusId TEXT, {column_definitions}, OutlierSampleIds_AllAlleles TEXT)")
+        conn.executemany(f"INSERT INTO loci VALUES (?, {', '.join('?' * len(cls.COLUMNS))}, '1x:sample')", cls.LOCI)
+        conn.commit()
+        conn.close()
+
+    def setUp(self):
+        self._saved = results_server.app.config.get("DB_COLUMNS_SET")
+        conn = duckdb_compat.connect(self.db_path, read_only=True)
+        try:
+            results_server.app.config["DB_COLUMNS_SET"] = duckdb_compat.table_columns(conn, "loci")
+        finally:
+            conn.close()
+
+    def tearDown(self):
+        if self._saved is None:
+            results_server.app.config.pop("DB_COLUMNS_SET", None)
+        else:
+            results_server.app.config["DB_COLUMNS_SET"] = self._saved
+
+    def _query(self, **extra_params):
+        params = dict({"outlier_type": "all", "page": 1, "page_size": 50}, **extra_params)
+        select_query, _, _, _, _, sql_params_with_pagination = results_server.build_api_query(params)
+        conn = duckdb_compat.connect(self.db_path, read_only=True)
+        try:
+            return {row[0] for row in conn.execute(select_query, sql_params_with_pagination)}
+        finally:
+            conn.close()
+
+
+class MinRepeatsAbovePopulationTests(PopulationFilterTestCase):
+    """min_repeats_above_population keeps the loci whose Δpop column on the page is at least N.
+
+    Δpop is the allele minus the largest of the cohort values, which the page rounds to a whole
+    number: A 10, B 9.4 (shown as 9), C none, D -10, E 10.5 (shown as 11).
+    """
+
+    COLUMNS = ("FirstAffectedAlleleSize_AllAlleles", "HPRC256_99thPercentile", "TenK10K_99thPercentile",
+               "HPRC256_MaxAllele")
+    LOCI = (
+        ("A", 50, 40, 30.4, 45),
+        ("B", 50, None, 40.6, None),
+        ("C", 50, None, None, None),
+        ("D", 30, 40, 20, None),
+        ("E", 50, None, 39.5, None),
+    )
+
+    def test_matches_the_rounded_delta_pop_shown_on_the_page(self):
+        self.assertEqual(self._query(min_repeats_above_population=9), {"A", "B", "E"})
+        self.assertEqual(self._query(min_repeats_above_population=10), {"A", "E"})
+        self.assertEqual(self._query(min_repeats_above_population=11), {"E"})
+        self.assertEqual(self._query(min_repeats_above_population=12), set())
+
+    def test_negative_minimum_still_drops_loci_without_population_data(self):
+        self.assertEqual(self._query(min_repeats_above_population=-10), {"A", "B", "D", "E"})
+
+    def test_uses_the_cohorts_of_the_population_gate(self):
+        # Long-read leaves only HPRC256, which B and E lack. Short-read leaves only TenK10K, so A's
+        # Δpop becomes 19.6, shown as 20. "all" is every cohort, the same as no gate.
+        self.assertEqual(
+            self._query(min_repeats_above_population=10, require_above_population="long-read"), {"A"})
+        self.assertEqual(
+            self._query(min_repeats_above_population=20, require_above_population="short-read"), {"A"})
+        self.assertEqual(
+            self._query(min_repeats_above_population=9, require_above_population="all"),
+            self._query(min_repeats_above_population=9))
+
+    def test_uses_the_population_metric(self):
+        self.assertEqual(self._query(min_repeats_above_population=5, population_metric="max"), {"A"})
+        self.assertEqual(self._query(min_repeats_above_population=6, population_metric="max"), set())
+
+    def test_matches_nothing_without_population_columns(self):
+        results_server.app.config["DB_COLUMNS_SET"] = {"LocusId", "FirstAffectedAlleleSize_AllAlleles",
+                                                        "OutlierSampleIds_AllAlleles"}
+        self.assertEqual(self._query(min_repeats_above_population=-1000), set())
+
+    def test_is_validated(self):
+        with results_server.app.test_request_context(
+                "/api/v1/loci?outlier_type=all&min_repeats_above_population=3"):
+            params, error_response = results_server.validate_params()
+        self.assertIsNone(error_response)
+        self.assertEqual(params["min_repeats_above_population"], 3)
+        with results_server.app.test_request_context(
+                "/api/v1/loci?outlier_type=all&min_repeats_above_population=3.5"):
+            _, error_response = results_server.validate_params()
+        self.assertIn("min_repeats_above_population must be an integer", error_response[0].get_json()["detail"][0])
+
+
+class RequireAbovePopulationTests(PopulationFilterTestCase):
+    """The require_above_population gate over the long-read cohorts, TenK10K, or both ("all")."""
+
+    COLUMNS = ("FirstAffectedAlleleSize_AllAlleles", "HPRC256_99thPercentile", "TenK10K_99thPercentile")
+    LOCI = (
+        ("A", 20, 10, 15),  # above both cohorts
+        ("B", 20, 10, 25),  # above the long-read cohort only
+        ("C", 20, 30, 5),   # above TenK10K only
+    )
+
+    def test_each_gate_compares_against_its_cohorts(self):
+        self.assertEqual(self._query(require_above_population="long-read"), {"A", "B"})
+        self.assertEqual(self._query(require_above_population="short-read"), {"A", "C"})
+        self.assertEqual(self._query(require_above_population="all"), {"A"})
+
+    def test_all_is_a_valid_value(self):
+        with results_server.app.test_request_context("/api/v1/loci?outlier_type=all&require_above_population=all"):
+            params, error_response = results_server.validate_params()
+        self.assertIsNone(error_response)
+        self.assertEqual(params["require_above_population"], "all")
+        with results_server.app.test_request_context("/api/v1/loci?outlier_type=all&require_above_population=some"):
+            _, error_response = results_server.validate_params()
+        self.assertIsNotNone(error_response)
 
 
 class SplitSearchTermsTests(unittest.TestCase):

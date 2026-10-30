@@ -9,15 +9,17 @@ from analysis_columns import (
     add_all_outlier_columns,
     add_gene_columns,
     collect_samples_single_pass,
-    compute_number_of_affected_unsolved_families_above_unaffected,
-    compute_number_of_affected_unsolved_samples_above_unaffected,
+    count_affected_unsolved_samples_and_families,
+    find_affected_unsolved_samples_above_unaffected,
     get_population_p99_threshold,
     is_above_population_p99,
     is_above_unaffected,
     is_affected_unsolved,
     is_missing_outlier_value,
     is_unaffected_or_solved_status,
+    list_affected_unsolved_outliers,
     parse_outlier_entries,
+    parse_population_gate_cohorts,
 )
 
 
@@ -123,6 +125,25 @@ class PopulationThresholdTests(unittest.TestCase):
         # No cohort data -> include.
         self.assertTrue(is_above_population_p99(1, {}))
 
+    def test_population_gate_cohorts_choose_the_columns_read(self):
+        row = {"HPRC256_99thPercentile": 30, "AoU1027_99thPercentile": 45,
+               "TenK10K_99thPercentile": 60}
+        # The default gate is the long-read cohorts only, so TenK10K is ignored.
+        self.assertEqual(get_population_p99_threshold(row), 45)
+        self.assertEqual(get_population_p99_threshold(row, ("HPRC256",)), 30)
+        self.assertEqual(get_population_p99_threshold(row, ("HPRC256", "AoU1027", "TenK10K")), 60)
+        self.assertTrue(is_above_population_p99(50, row))
+        self.assertFalse(is_above_population_p99(50, row, ("HPRC256", "AoU1027", "TenK10K")))
+        self.assertTrue(is_above_population_p99(31, row, ("HPRC256",)))
+
+    def test_parse_population_gate_cohorts(self):
+        self.assertEqual(parse_population_gate_cohorts("HPRC256,AoU1027"), ("HPRC256", "AoU1027"))
+        self.assertEqual(parse_population_gate_cohorts("TenK10K, HPRC256"), ("TenK10K", "HPRC256"))
+        with self.assertRaisesRegex(ValueError, r"value\(s\): HPRC\. Choices"):
+            parse_population_gate_cohorts("HPRC,AoU1027")
+        with self.assertRaises(ValueError):
+            parse_population_gate_cohorts("")
+
     def test_is_above_unaffected(self):
         self.assertTrue(is_above_unaffected(5, {}, "AllAlleles"))  # NULL first unaffected
         self.assertFalse(is_above_unaffected(0, {}, "AllAlleles"))
@@ -205,16 +226,31 @@ class NumAffectedUnsolvedSamplesTests(unittest.TestCase):
     def _parsed(self, row):
         return {ot: parse_outlier_entries(row.get(f"OutlierSampleIds_{ot}")) for ot in OUTLIER_TYPES}
 
+    def _counts(self, row, affected_lookup, analysis_lookup, sample_lookup=None,
+                population_gate_cohorts=analysis_columns.POPULATION_P99_GATE_COHORTS):
+        """Returns (sample counts, family counts) the way add_all_outlier_columns computes them."""
+        samples = find_affected_unsolved_samples_above_unaffected(
+            row, affected_lookup, analysis_lookup, self._parsed(row), population_gate_cohorts)
+        return count_affected_unsolved_samples_and_families(samples, sample_lookup or {})
+
     def test_stop_at_first_unaffected(self):
         # Descending: a1(50), a2(40), then an unaffected at 30 stops the walk.
         row = {"OutlierSampleIds_AllAlleles": make_outlier_string(
             [(50, "a1"), (40, "a2"), (30, "u1"), (20, "a3")])}
         affected_lookup = {"a1": "affected", "a2": "affected", "a3": "affected", "u1": "unaffected"}
         analysis_lookup = {k: "unsolved" for k in affected_lookup}
-        counts = compute_number_of_affected_unsolved_samples_above_unaffected(
-            row, affected_lookup, analysis_lookup, self._parsed(row))
+        sample_counts, _ = self._counts(row, affected_lookup, analysis_lookup)
         # a1 and a2 counted; the break at u1 means a3 (below) is never reached.
-        self.assertEqual(counts[0], 2)
+        self.assertEqual(sample_counts[0], 2)
+
+    def test_tie_with_unaffected_is_not_above(self):
+        # a2 shares allele 40 with the unaffected u1, so only a1 is above every unaffected.
+        row = {"OutlierSampleIds_AllAlleles": make_outlier_string(
+            [(50, "a1"), (40, "a2"), (40, "u1")])}
+        affected_lookup = {"a1": "affected", "a2": "affected", "u1": "unaffected"}
+        analysis_lookup = {k: "unsolved" for k in affected_lookup}
+        sample_counts, _ = self._counts(row, affected_lookup, analysis_lookup)
+        self.assertEqual(sample_counts[0], 1)
 
     def test_stop_at_or_below_p99(self):
         # p99 = 40, so only the allele strictly above 40 (a1 at 50) is counted.
@@ -224,44 +260,95 @@ class NumAffectedUnsolvedSamplesTests(unittest.TestCase):
         }
         affected_lookup = {"a1": "affected", "a2": "affected", "a3": "affected"}
         analysis_lookup = {k: "unsolved" for k in affected_lookup}
-        counts = compute_number_of_affected_unsolved_samples_above_unaffected(
-            row, affected_lookup, analysis_lookup, self._parsed(row))
-        self.assertEqual(counts[0], 1)
+        sample_counts, _ = self._counts(row, affected_lookup, analysis_lookup)
+        self.assertEqual(sample_counts[0], 1)
+
+    def test_population_gate_cohorts_choose_the_threshold(self):
+        # TenK10K's 99th percentile of 45 only gates when it is one of the gate cohorts.
+        row = {
+            "OutlierSampleIds_AllAlleles": make_outlier_string([(50, "a1"), (40, "a2"), (30, "a3")]),
+            "HPRC256_99thPercentile": 35,
+            "TenK10K_99thPercentile": 45,
+        }
+        affected_lookup = {"a1": "affected", "a2": "affected", "a3": "affected"}
+        analysis_lookup = {k: "unsolved" for k in affected_lookup}
+        self.assertEqual(self._counts(row, affected_lookup, analysis_lookup)[0][0], 2)
+        self.assertEqual(self._counts(row, affected_lookup, analysis_lookup,
+                                      population_gate_cohorts=("HPRC256", "TenK10K"))[0][0], 1)
+        self.assertEqual(self._counts(row, affected_lookup, analysis_lookup,
+                                      population_gate_cohorts=("AoU1027",))[0][0], 3)
 
     def test_missing_outlier_column_is_none(self):
         row = {"OutlierSampleIds_AllAlleles": ""}
-        counts = compute_number_of_affected_unsolved_samples_above_unaffected(
-            row, {}, {}, self._parsed(row))
-        self.assertIsNone(counts[0])
+        sample_counts, family_counts = self._counts(row, {}, {})
+        self.assertIsNone(sample_counts[0])
+        self.assertIsNone(family_counts[0])
 
     def test_distinct_sample_dedup_across_alleles(self):
-        # The same sample at two allele sizes counts once.
+        # The same sample at two allele sizes counts once, at its larger allele.
         row = {"OutlierSampleIds_AllAlleles": make_outlier_string([(50, "a1"), (45, "a1")])}
         affected_lookup = {"a1": "affected"}
         analysis_lookup = {"a1": "unsolved"}
-        counts = compute_number_of_affected_unsolved_samples_above_unaffected(
+        samples = find_affected_unsolved_samples_above_unaffected(
             row, affected_lookup, analysis_lookup, self._parsed(row))
-        self.assertEqual(counts[0], 1)
+        self.assertEqual(samples[0], {"a1": 50})
+        self.assertEqual(self._counts(row, affected_lookup, analysis_lookup)[0][0], 1)
 
-    def test_families_variant_dedups_by_family(self):
-        # a1 and a2 share F1 -> one distinct family above unaffected.
+    def test_families_dedup_by_family(self):
+        # a1 and a2 share F1 -> two samples but one distinct family above unaffected.
         row = {"OutlierSampleIds_AllAlleles": make_outlier_string([(50, "a1"), (45, "a2")])}
         affected_lookup = {"a1": "affected", "a2": "affected"}
         analysis_lookup = {"a1": "unsolved", "a2": "unsolved"}
         sample_lookup = {"a1": {"family_id": "F1"}, "a2": {"family_id": "F1"}}
-        counts = compute_number_of_affected_unsolved_families_above_unaffected(
-            row, affected_lookup, analysis_lookup, sample_lookup, self._parsed(row))
-        self.assertEqual(counts[0], 1)
+        sample_counts, family_counts = self._counts(row, affected_lookup, analysis_lookup, sample_lookup)
+        self.assertEqual(sample_counts[0], 2)
+        self.assertEqual(family_counts[0], 1)
 
-    def test_families_variant_stop_at_unaffected(self):
+    def test_families_stop_at_unaffected(self):
         row = {"OutlierSampleIds_AllAlleles": make_outlier_string(
             [(50, "a1"), (40, "u1"), (30, "a2")])}
         affected_lookup = {"a1": "affected", "a2": "affected", "u1": "unaffected"}
         analysis_lookup = {k: "unsolved" for k in affected_lookup}
         sample_lookup = {"a1": {"family_id": "F1"}, "a2": {"family_id": "F2"}, "u1": {"family_id": "F3"}}
-        counts = compute_number_of_affected_unsolved_families_above_unaffected(
-            row, affected_lookup, analysis_lookup, sample_lookup, self._parsed(row))
-        self.assertEqual(counts[0], 1)
+        _, family_counts = self._counts(row, affected_lookup, analysis_lookup, sample_lookup)
+        self.assertEqual(family_counts[0], 1)
+
+    def test_sample_without_family_counts_toward_samples_only(self):
+        # a2 has a blank family_id and "ghost" has no metadata row at all.
+        row = {"OutlierSampleIds_AllAlleles": make_outlier_string(
+            [(50, "a1"), (45, "a2"), (40, "ghost")])}
+        affected_lookup = {"a1": "affected", "a2": "affected"}
+        analysis_lookup = {"a1": "unsolved", "a2": "unsolved"}
+        sample_lookup = {"a1": {"family_id": "F1"}, "a2": {"family_id": ""}}
+        sample_counts, family_counts = self._counts(row, affected_lookup, analysis_lookup, sample_lookup)
+        self.assertEqual(sample_counts[0], 3)
+        self.assertEqual(family_counts[0], 1)
+
+
+class ListAffectedUnsolvedOutliersTests(unittest.TestCase):
+
+    def test_one_row_per_counted_sample_sorted_by_sample(self):
+        row = {
+            "OutlierSampleIds_AllAlleles": make_outlier_string(
+                [(50, "a2"), (45, "a1"), (45, "a2"), (30, "u1"), (20, "a3")]),
+            "OutlierSampleIds_ShortAlleles": "",
+            "OutlierSampleIds_HemizygousAlleles": make_outlier_string([(12, "a3")]),
+        }
+        affected_lookup = {"a1": "affected", "a2": "affected", "a3": "affected", "u1": "unaffected"}
+        analysis_lookup = {k: "unsolved" for k in affected_lookup}
+        sample_lookup = {"a1": {"family_id": "F1"}, "a2": {"family_id": float("nan")}}
+        parsed = {ot: parse_outlier_entries(row[f"OutlierSampleIds_{ot}"]) for ot in OUTLIER_TYPES}
+        samples = find_affected_unsolved_samples_above_unaffected(
+            row, affected_lookup, analysis_lookup, parsed)
+        self.assertEqual(list_affected_unsolved_outliers("L1", samples, sample_lookup), [
+            {"LocusId": "L1", "outlier_type": "AllAlleles", "sample_id": "a1",
+             "family_id": "F1", "allele_size": 45},
+            # a2's larger allele; its NaN family_id becomes None.
+            {"LocusId": "L1", "outlier_type": "AllAlleles", "sample_id": "a2",
+             "family_id": None, "allele_size": 50},
+            {"LocusId": "L1", "outlier_type": "HemizygousAlleles", "sample_id": "a3",
+             "family_id": None, "allele_size": 12},
+        ])
 
 
 class AddAllOutlierColumnsTests(unittest.TestCase):
@@ -335,6 +422,30 @@ class AddAllOutlierColumnsTests(unittest.TestCase):
         self.assertEqual(records[0]["FirstAffectedAlleleSize_AllAlleles_ByFamily"], 50)
         self.assertEqual(records[0]["SecondAffectedAlleleSize_AllAlleles_ByFamily"], 30)
         self.assertIsNone(records[0]["ThirdAffectedAlleleSize_AllAlleles_ByFamily"])
+
+    def test_returns_the_rows_the_counts_count_under_the_given_gate(self):
+        records = [{
+            "LocusId": "L",
+            "OutlierSampleIds_AllAlleles": make_outlier_string([(50, "a1"), (40, "a2"), (30, "a3")]),
+            "OutlierSampleIds_ShortAlleles": "",
+            "OutlierSampleIds_HemizygousAlleles": "",
+            "TenK10K_99thPercentile": 35,
+        }]
+        sample_lookup = {"a1": {"family_id": "F1"}, "a2": {"family_id": "F1"}, "a3": {"family_id": "F2"}}
+        affected_lookup = {"a1": "affected", "a2": "affected", "a3": "affected"}
+        analysis_lookup = {k: "unsolved" for k in affected_lookup}
+
+        rows = add_all_outlier_columns(records, sample_lookup, affected_lookup, analysis_lookup)
+        self.assertEqual([row["sample_id"] for row in rows], ["a1", "a2", "a3"])
+        self.assertEqual(records[0]["NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles"], 3)
+        self.assertEqual(records[0]["NumAffectedUnsolvedFamiliesAboveUnaffected_AllAlleles"], 2)
+
+        # With TenK10K gating, a3's allele of 30 is at or below its 99th percentile.
+        rows = add_all_outlier_columns(records, sample_lookup, affected_lookup, analysis_lookup,
+                                       ("HPRC256", "AoU1027", "TenK10K"))
+        self.assertEqual([row["sample_id"] for row in rows], ["a1", "a2"])
+        self.assertEqual(records[0]["NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles"], 2)
+        self.assertEqual(records[0]["NumAffectedUnsolvedFamiliesAboveUnaffected_AllAlleles"], 1)
 
 
 class AddGeneColumnsTests(unittest.TestCase):

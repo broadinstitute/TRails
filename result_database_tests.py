@@ -335,6 +335,73 @@ class WriteMendelianTablesTests(unittest.TestCase):
                 "SELECT autosome_violations FROM mendelian_violations").fetchone(), (2,))
 
 
+class PopulationGateCohortsTests(unittest.TestCase):
+
+    def setUp(self):
+        self.connection = duckdb_compat.connect(":memory:")
+
+    def tearDown(self):
+        self.connection.close()
+
+    def test_round_trip_through_the_metadata_table(self):
+        # A database built before the cohorts were recorded, with and without a metadata
+        # table, was gated by the default.
+        self.assertEqual(result_database.read_population_gate_cohorts(self.connection),
+                         ("HPRC256", "AoU1027"))
+        result_database.write_sample_count(self.connection, 10)
+        self.assertEqual(result_database.read_population_gate_cohorts(self.connection),
+                         ("HPRC256", "AoU1027"))
+
+        result_database.write_population_gate_cohorts(self.connection, ("HPRC256", "AoU1027", "TenK10K"))
+        self.assertEqual(result_database.read_population_gate_cohorts(self.connection),
+                         ("HPRC256", "AoU1027", "TenK10K"))
+        # Stored comma-joined, the analysis code's format, beside the sample count.
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (result_database.POPULATION_GATE_COHORTS_KEY,)).fetchone(),
+            ("HPRC256,AoU1027,TenK10K",))
+        self.assertEqual(result_database.read_sample_count(self.connection), 10)
+
+    def test_writing_first_creates_the_metadata_table(self):
+        result_database.write_population_gate_cohorts(self.connection, ("TenK10K",))
+        self.assertEqual(result_database.read_population_gate_cohorts(self.connection), ("TenK10K",))
+        self.assertIsNone(result_database.read_sample_count(self.connection))
+
+
+class WriteAffectedUnsolvedOutliersTableTests(unittest.TestCase):
+
+    def setUp(self):
+        self.connection = duckdb_compat.connect(":memory:")
+
+    def tearDown(self):
+        self.connection.close()
+
+    def declared_types(self):
+        return [tuple(row[:2]) for row in self.connection.execute(
+            f"DESCRIBE {result_database.AFFECTED_UNSOLVED_OUTLIERS_TABLE}").fetchall()]
+
+    def test_empty_rows_still_create_the_declared_table(self):
+        self.assertEqual(result_database.write_affected_unsolved_outliers_table(self.connection, []), 0)
+        self.assertEqual(self.declared_types(), [
+            ("LocusId", "VARCHAR"), ("outlier_type", "VARCHAR"), ("sample_id", "VARCHAR"),
+            ("family_id", "VARCHAR"), ("allele_size", "INTEGER")])
+
+    def test_rows_are_stored_by_outlier_type_sample_and_locus(self):
+        rows = [
+            {"LocusId": "L2", "outlier_type": "ShortAlleles", "sample_id": "S1", "family_id": "F1", "allele_size": 9},
+            {"LocusId": "L2", "outlier_type": "AllAlleles", "sample_id": "S2", "family_id": None, "allele_size": 40},
+            {"LocusId": "L1", "outlier_type": "AllAlleles", "sample_id": "S2", "family_id": None, "allele_size": 30},
+            {"LocusId": "L3", "outlier_type": "AllAlleles", "sample_id": "S1", "family_id": "F1", "allele_size": 50},
+        ]
+        self.assertEqual(result_database.write_affected_unsolved_outliers_table(self.connection, rows), 4)
+        self.assertEqual(
+            self.connection.execute(
+                f"SELECT * FROM {result_database.AFFECTED_UNSOLVED_OUTLIERS_TABLE}").fetchall(),
+            [("L3", "AllAlleles", "S1", "F1", 50), ("L1", "AllAlleles", "S2", None, 30),
+             ("L2", "AllAlleles", "S2", None, 40), ("L2", "ShortAlleles", "S1", "F1", 9)])
+
+
 class OpenAndFinalizeTests(unittest.TestCase):
 
     def test_open_new_database_uses_tmp_path(self):

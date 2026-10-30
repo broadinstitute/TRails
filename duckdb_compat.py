@@ -92,10 +92,9 @@ def _bound_params(params):
 
     ``params`` may be any iterable, including a generator, but the result is materialized:
     duckdb 1.0.x rejects a generator with "executemany requires a list of parameter sets to
-    be provided", and requirements.txt allows duckdb 1.0. The only caller that matters is
-    the notes/tags migration in trails.py, which passes one row per note or tag the user
-    typed, so holding them all costs nothing. The bulk loads go through insert_rows, which
-    streams a chunk at a time and never comes through here.
+    be provided", and requirements.txt allows duckdb 1.0. The callers are the test fixtures,
+    which pass a handful of rows each, so holding them all costs nothing. The bulk loads go
+    through insert_rows, which streams a chunk at a time and never comes through here.
     """
     return [[_bound_value(value) for value in row] for row in params]
 

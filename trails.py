@@ -28,6 +28,9 @@ import os
 import subprocess
 import sys
 
+# analysis_columns imports only the standard library, so it can be imported here, before
+# ensure_dependencies has installed anything; build_database cannot (see run_build).
+import analysis_columns
 import trails_setup
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +53,11 @@ OPTIONAL_MODULES = ["pyhpo", "requests"]
 # Written after the one optional-dependency install attempt, so a package that will not build here
 # does not make every later run re-try (and re-wait for) the same failing pip invocation.
 OPTIONAL_INSTALL_MARKER = os.path.join(SCRIPT_DIR, ".trails_optional_deps_attempted")
+
+# The values results_server.py --initial-require-above-population accepts (the keys of its
+# POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION). Copied rather than imported: importing the
+# server would pull it into the build's code fingerprint. trails_tests.py checks the two agree.
+INITIAL_REQUIRE_ABOVE_POPULATION_CHOICES = ["long-read", "short-read", "all"]
 
 
 def _has_module(name):
@@ -186,6 +194,22 @@ def default_db_path(tsv_path, work_dir):
     return os.path.join(work_dir, base + ".with_analysis_columns.duckdb")
 
 
+def build_flags(args):
+    """Return {name: value} for every trails.py flag that affects the built DB, for the manifest.
+
+    Every value is one that survives the manifest's JSON round trip unchanged, since
+    needs_rebuild compares the manifest read back from disk with a freshly built one.
+
+    Args:
+        args: The parsed trails.py command line.
+    """
+    return {"n_loci": args.n_loci, "skip_phenotype_scores": args.skip_phenotype_scores,
+            "source_label": args.source_label,
+            # Comma-joined rather than a tuple: the manifest read back from JSON holds a list,
+            # which never equals a tuple, so a tuple here would force a rebuild on every run.
+            "population_gate_cohorts": ",".join(args.population_gate_cohorts)}
+
+
 def build_manifest(inputs, flags):
     """Return the build manifest: input sha256s + build flags + the TRails commit.
 
@@ -222,114 +246,10 @@ def run_build(args, db_path, genes_to_phenotype, known_loci_json, strchive_loci_
         phenotypes_table=args.phenotypes_table, gene_table=args.gene_table,
         genes_to_phenotype=genes_to_phenotype, known_loci_json=known_loci_json,
         strchive_loci_json=strchive_loci_json, source_label=args.source_label,
-        n_loci=args.n_loci, skip_phenotype_scores=args.skip_phenotype_scores)
+        n_loci=args.n_loci, skip_phenotype_scores=args.skip_phenotype_scores,
+        population_gate_cohorts=args.population_gate_cohorts)
     if not os.path.exists(db_path):
         sys.exit(f"ERROR: build_database did not produce {db_path}")
-
-
-def legacy_annotations_db_path(db_path):
-    """Return the SQLite annotations path a pre-DuckDB TRails would have written.
-
-    Notes and tags lived in "<result database>.annotations.db" next to a result database
-    whose own name ended in ".db". The result database now ends in ".duckdb", so swap the
-    extension back to name the file the previous version left behind.
-    """
-    base = os.path.abspath(db_path)
-    if base.endswith(".duckdb"):
-        base = base[:-len(".duckdb")] + ".db"
-    return base + ".annotations.db"
-
-
-def migrate_legacy_annotations(annotations_db, legacy_path):
-    """Copy notes and tags out of a pre-DuckDB SQLite annotations database, once.
-
-    Notes and tags are typed in by hand in the results server, so they are the one thing in
-    TRails a rebuild cannot reproduce. This runs only when the DuckDB annotations database
-    does not exist yet, and it reads the SQLite file without writing to it, so the old copy
-    survives the upgrade either way.
-
-    Args:
-        annotations_db: The DuckDB annotations database the server is about to open.
-        legacy_path: The SQLite annotations database a previous version would have written.
-
-    Returns:
-        A ``(num_notes, num_tags)`` tuple; ``(0, 0)`` when there was nothing to migrate.
-    """
-    if os.path.exists(annotations_db) or not os.path.exists(legacy_path):
-        return 0, 0
-
-    # The only sqlite3 use left in TRails: the file being read here IS a SQLite database,
-    # and reading it is this function's whole job. Imported here rather than at the top of
-    # the module so it stays visibly local to the migration and nobody takes it for a sign
-    # that TRails still runs on SQLite.
-    import sqlite3
-    import urllib.parse
-
-    # The path goes into the URI percent-escaped: SQLite reads an unescaped "?" as the start
-    # of the query parameters and an unescaped "#" as the start of the fragment, so a path
-    # containing either would be truncated, and SQLite would quietly open (and create) a
-    # different file than the one holding the user's notes.
-    uri = "file:" + urllib.parse.quote(os.path.abspath(legacy_path)) + "?mode=ro"
-    try:
-        legacy = sqlite3.connect(uri, uri=True)
-    except sqlite3.Error as error:
-        print(f"NOTE: could not open the previous annotations database {legacy_path}: {error}")
-        return 0, 0
-    notes = []
-    tags = []
-    try:
-        # Each table is read on its own: an unreadable or missing tags table must not cost
-        # the user their notes, and a file from an older schema may have only one of them.
-        for sql, destination in (
-                ("SELECT locus_id, note_text, created_at, updated_at FROM notes", notes),
-                ("SELECT locus_id, tag, created_at FROM tags", tags)):
-            try:
-                destination.extend(legacy.execute(sql).fetchall())
-            except sqlite3.Error as error:
-                print(f"NOTE: skipping part of {legacy_path}: {error}")
-    finally:
-        legacy.close()
-
-    if not notes and not tags:
-        return 0, 0
-
-    import duckdb_compat
-
-    # Built at a temporary path and moved into place, so an interrupted migration cannot
-    # leave a half-copied database behind that the next run would take for a finished one.
-    tmp_path = annotations_db + ".migration.tmp"
-    for stale_path in (tmp_path, tmp_path + ".wal"):
-        if os.path.exists(stale_path):
-            os.remove(stale_path)
-    try:
-        connection = duckdb_compat.connect(tmp_path)
-        try:
-            # The same schema results_server.load_annotations creates.
-            connection.execute(
-                "CREATE TABLE notes (locus_id TEXT PRIMARY KEY, note_text TEXT NOT NULL, "
-                "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
-            connection.execute(
-                "CREATE TABLE tags (locus_id TEXT NOT NULL, tag TEXT NOT NULL, "
-                "created_at TEXT NOT NULL, PRIMARY KEY (locus_id, tag))")
-            if notes:
-                connection.executemany("INSERT INTO notes VALUES (?, ?, ?, ?)", notes)
-            if tags:
-                connection.executemany("INSERT INTO tags VALUES (?, ?, ?)", tags)
-            connection.commit()
-        finally:
-            connection.close()
-        os.replace(tmp_path, annotations_db)
-    except (duckdb_compat.Error, OSError) as error:
-        for leftover in (tmp_path, tmp_path + ".wal"):
-            if os.path.exists(leftover):
-                os.remove(leftover)
-        print(f"NOTE: could not migrate the notes and tags in {legacy_path}: {error}. They are "
-              f"still in that file; delete {annotations_db} and re-run TRails to try again.")
-        return 0, 0
-
-    print(f"Migrated {len(notes):,} note(s) and {len(tags):,} tag(s) from {legacy_path} "
-          f"into {annotations_db}. The original file is left untouched.")
-    return len(notes), len(tags)
 
 
 def serve(db_path, args, known_loci_json=None, strchive_loci_json=None):
@@ -340,13 +260,12 @@ def serve(db_path, args, known_loci_json=None, strchive_loci_json=None):
     # filename instead: anchoring on the directory alone would make every result database in that
     # directory share one note/tag store, and notes are keyed by LocusId only.
     annotations_db = os.path.abspath(db_path) + ".annotations.duckdb"
-    # An upgrade from the SQLite version renamed the result database, and with it this
-    # path. Bring the previous notes and tags across before the server creates an empty one.
-    migrate_legacy_annotations(annotations_db, legacy_annotations_db_path(db_path))
     for flag, value in [("--sample-table", args.sample_metadata_tsv),
                         ("--annotations-db", annotations_db),
                         ("--known-loci-json", known_loci_json),
                         ("--strchive-loci-json", strchive_loci_json),
+                        ("--initial-require-above-population",
+                         args.initial_require_above_population),
                         ("--port", args.port),
                         ("--host", args.host)]:
         if value:
@@ -380,11 +299,25 @@ def main():
     parser.add_argument("-n", "--n-loci", type=int, help="limit to the first N loci (for testing)")
     parser.add_argument("--skip-phenotype-scores", action="store_true",
                         help="skip phenotype scoring (faster build)")
+    parser.add_argument("--population-gate-cohorts",
+                        default=",".join(analysis_columns.POPULATION_P99_GATE_COHORTS),
+                        help="comma-separated population cohorts whose 99th percentiles an allele must "
+                             "exceed to count in the #Aff / #Fam outlier counts and the phenotype scores. "
+                             f"Choices: {', '.join(analysis_columns.POPULATION_GATE_COHORT_CHOICES)} "
+                             "(default: %(default)s). Changing it rebuilds the database")
     parser.add_argument("--rebuild", action="store_true", help="force a rebuild even if inputs are unchanged")
     parser.add_argument("--no-serve", action="store_true", help="build the DB but do not start the server")
+    parser.add_argument("--initial-require-above-population", choices=INITIAL_REQUIRE_ABOVE_POPULATION_CHOICES,
+                        help="population filter the page starts with when opened with no saved filters, "
+                             "e.g. 'all' for a short-read callset (forwarded to results_server.py)")
     parser.add_argument("--port", help="server port (forwarded to results_server.py)")
     parser.add_argument("--host", help="server host (forwarded to results_server.py)")
     args = parser.parse_args()
+    try:
+        args.population_gate_cohorts = analysis_columns.parse_population_gate_cohorts(
+            args.population_gate_cohorts)
+    except ValueError as error:
+        parser.error(str(error))
 
     os.makedirs(args.work_dir, exist_ok=True)
 
@@ -407,8 +340,7 @@ def main():
                 "genes_to_phenotype": genes_to_phenotype,
                 "known_loci_json": known_loci_json,
                 "strchive_loci_json": strchive_loci_json},
-        flags={"n_loci": args.n_loci, "skip_phenotype_scores": args.skip_phenotype_scores,
-               "source_label": args.source_label})
+        flags=build_flags(args))
 
     if needs_rebuild(db_path, manifest_path, manifest, args.rebuild):
         run_build(args, db_path, genes_to_phenotype, known_loci_json, strchive_loci_json)

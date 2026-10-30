@@ -189,6 +189,19 @@ class GetQualifyingSamplesTests(ForceJaccardTestCase):
         qualifying = get_qualifying_samples(row, "AllAlleles", affected, analysis, hpo)
         self.assertEqual([entry[0] for entry in qualifying], ["s_big"])
 
+    def test_gate_uses_the_population_gate_cohorts(self):
+        # TenK10K's 99th percentile only gates when it is one of the gate cohorts.
+        row = self._base_row("40x:s_big,30x:s_small")
+        row["TenK10K_99thPercentile"] = 35
+        affected = {"s_big": "affected", "s_small": "affected"}
+        analysis = {"s_big": "unsolved", "s_small": "unsolved"}
+        hpo = {"s_big": {"HP:A"}, "s_small": {"HP:B"}}
+        qualifying = get_qualifying_samples(row, "AllAlleles", affected, analysis, hpo)
+        self.assertEqual([entry[0] for entry in qualifying], ["s_big", "s_small"])
+        qualifying = get_qualifying_samples(row, "AllAlleles", affected, analysis, hpo,
+                                            ("HPRC256", "AoU1027", "TenK10K"))
+        self.assertEqual([entry[0] for entry in qualifying], ["s_big"])
+
     def test_descending_order_and_dedup_keep_largest(self):
         # s_dup appears at two allele sizes (50 and 35); dedup keeps the 50 entry.
         row = self._base_row("50x:s_dup,45x:s_other,35x:s_dup")

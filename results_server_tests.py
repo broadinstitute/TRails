@@ -391,6 +391,30 @@ class ResultsServerTests(unittest.TestCase):
         # The readviz request route is gone, so its handler script must not appear.
         self.assertNotIn("/readviz/request", response.get_data(as_text=True))
 
+    def test_initial_require_above_population_reaches_the_index_page(self):
+        self.addCleanup(setattr, sys, "argv", sys.argv)
+        sys.argv = ["results_server.py", "--db", "unused.duckdb", "--initial-require-above-population", "all"]
+        self.assertEqual(results_server.parse_args().initial_require_above_population, "all")
+        sys.argv = ["results_server.py", "--db", "unused.duckdb"]
+        self.assertEqual(results_server.parse_args().initial_require_above_population, "")
+
+        render_arguments = {}
+
+        class _RecordingTemplate:
+            def render(self, **kwargs):
+                render_arguments.update(kwargs)
+                return ""
+
+        original_get_template = results_server.jinja2_env.get_template
+        results_server.jinja2_env.get_template = lambda name: _RecordingTemplate()
+        self.addCleanup(setattr, results_server.jinja2_env, "get_template", original_get_template)
+        self.addCleanup(results_server.app.config.pop, "INITIAL_REQUIRE_ABOVE_POPULATION", None)
+        self.assertEqual(self.client.get("/").status_code, 200)
+        self.assertEqual(render_arguments["initial_require_above_population"], "")
+        results_server.app.config["INITIAL_REQUIRE_ABOVE_POPULATION"] = "all"
+        self.client.get("/")
+        self.assertEqual(render_arguments["initial_require_above_population"], "all")
+
     # -- Reference region filter -------------------------------------------------
 
     def test_parse_reference_region_formats(self):
@@ -1285,6 +1309,26 @@ class ExportPhenotypeScoreQueryCountTests(unittest.TestCase):
         self.assertEqual(data["metadata"]["total_loci"], 2)
         self.assertEqual(len(self._score_queries(recorded_queries)), 1)
 
+    def test_only_the_exported_loci_scores_are_loaded(self):
+        # A score table can hold millions of rows, so loading every locus's scores made even a
+        # one-locus export slow.
+        conn = duckdb_compat.connect(self.db_path, read_only=True)
+        try:
+            scores = results_server.fetch_phenotype_scores_of_exported_loci(
+                conn, "SELECT * FROM loci WHERE LocusId = ? ORDER BY LocusId", ["chr2-200-209-AAG"])
+        finally:
+            conn.close()
+        self.assertEqual(set(scores), {"chr2-200-209-AAG"})
+        self.assertEqual(scores["chr2-200-209-AAG"]["per_outlier"]["AllAlleles"][0]["sample_id"], "sampleC")
+
+    def test_a_filtered_json_export_carries_its_loci_scores(self):
+        response = self.client.get("/api/v1/export?outlier_type=all&format=json&gene_symbol=GENE1")
+        self.assertEqual(response.status_code, 200)
+        loci = json.loads(gzip.decompress(response.get_data()))["loci"]
+        self.assertEqual([locus["LocusId"] for locus in loci], ["chr1-100-110-AT"])
+        samples = {s["Sample ID"]: s for s in loci[0]["Samples"]["AllAlleleOutliers"]}
+        self.assertEqual(samples["sampleA"]["Gene-Pheno Sim"], 0.75)
+
 
 def _build_db_with_only_the_first_phenotype_column(path):
     """Loci carrying FirstAffectedPhenotype_AllAlleles only, and no swim_plot table."""
@@ -1399,6 +1443,66 @@ class PhenotypeKeywordWithoutAnyPhenotypeColumnTests(unittest.TestCase):
         # above is the filter working and not an empty database.
         unfiltered = self.client.get("/api/v1/loci?outlier_type=all")
         self.assertEqual(unfiltered.get_json()["total"], 1)
+
+
+def _build_db_with_family_counts(path):
+    """Two loci whose #Aff and #Fam counts put them in opposite orders."""
+    conn = duckdb_compat.connect(path)
+    conn.execute("""CREATE TABLE loci (
+        LocusId TEXT, Chrom TEXT, Start0Based INTEGER, End1Based INTEGER, Motif TEXT, MotifSize INTEGER,
+        gene_region_rank INTEGER, FirstAffectedAlleleSize_AllAlleles INTEGER,
+        NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles INTEGER,
+        NumAffectedUnsolvedFamiliesAboveUnaffected_AllAlleles INTEGER,
+        OutlierSampleIds_AllAlleles TEXT)""")
+    conn.executemany("INSERT INTO loci VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+        # Three samples of one family
+        ("chr1-100-110-AT", "chr1", 100, 110, "AT", 2, 1, 9, 3, 1, "9x:sampleA,8x:sampleB,7x:sampleC"),
+        # Two samples of two families
+        ("chr2-200-209-AAG", "chr2", 200, 209, "AAG", 3, 1, 9, 2, 2, "9x:sampleD,8x:sampleE"),
+    ])
+    conn.commit()
+    conn.close()
+
+
+class FamilyCountTests(unittest.TestCase):
+    """Each locus carries its #Fam count, and sort_by=family_count orders by it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
+        _build_db_with_family_counts(cls.db_path)
+        cls._saved_config = dict(results_server.app.config)
+        results_server.configure_app(cls.db_path, annotations_db=os.path.join(cls.tmpdir, "annotations.duckdb"))
+        results_server.app.config["TESTING"] = True
+        cls.client = results_server.app.test_client()
+
+    @classmethod
+    def tearDownClass(cls):
+        results_server.app.config.clear()
+        results_server.app.config.update(cls._saved_config)
+
+    def _loci(self, query=""):
+        response = self.client.get(f"/api/v1/loci?outlier_type=all{query}")
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return response.get_json()["results"]
+
+    def test_each_locus_carries_the_family_count(self):
+        self.assertEqual({r["LocusId"]: r["NumAffectedUnsolvedFamiliesAboveUnaffected"] for r in self._loci()},
+                         {"chr1-100-110-AT": 1, "chr2-200-209-AAG": 2})
+
+    def test_sort_by_family_count(self):
+        self.assertEqual([r["LocusId"] for r in self._loci()], ["chr1-100-110-AT", "chr2-200-209-AAG"])
+        self.assertEqual([r["LocusId"] for r in self._loci("&sort_by=family_count")],
+                         ["chr2-200-209-AAG", "chr1-100-110-AT"])
+
+    def test_the_tsv_export_has_the_family_count_column(self):
+        response = self.client.get("/api/v1/export?outlier_type=all&format=tsv&sort_by=family_count")
+        self.assertEqual(response.status_code, 200)
+        lines = gzip.decompress(response.get_data()).decode().splitlines()
+        rows = [dict(zip(lines[0].split("\t"), line.split("\t"))) for line in lines[1:]]
+        self.assertEqual([(r["LocusId"], r["NumAffectedUnsolvedFamiliesAboveUnaffected"]) for r in rows],
+                         [("chr2-200-209-AAG", "2"), ("chr1-100-110-AT", "1")])
 
 
 def _load_results_server_without_locus_annotations():

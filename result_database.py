@@ -21,8 +21,12 @@ Tables written:
   written only when phenotype scoring produced rows.
 - ``mendelian_violations`` / ``mendelian_violations_per_motif``: optional,
   written into this same database only when at least one complete trio existed.
-- ``metadata``: a small key/value table of build-time facts, currently just the
-  number of samples the database was built from.
+- ``affected_unsolved_outliers_above_unaffected``: one row per (locus, outlier
+  type, sample) that NumAffectedUnsolvedSamplesAboveUnaffected counts; always
+  written, even when empty.
+- ``metadata``: a small key/value table of build-time facts: the number of
+  samples the database was built from, and the population cohorts that gated the
+  NumAffectedUnsolved* counts and the phenotype scores.
 
 Column order for the secondary tables is taken from the insertion order of the
 keys of the first row dict (Python dicts preserve insertion order), so the
@@ -36,6 +40,7 @@ the filesystem move).
 import os
 
 import duckdb_compat
+from analysis_columns import POPULATION_P99_GATE_COHORTS
 
 
 # The three outlier types, in the canonical order used throughout TRails.
@@ -45,6 +50,24 @@ OUTLIER_TYPES = ("AllAlleles", "ShortAlleles", "HemizygousAlleles")
 # results server reads it through ``read_sample_count`` to show "N loci, N samples".
 METADATA_TABLE = "metadata"
 SAMPLE_COUNT_KEY = "num_samples"
+# The metadata key that records which cohorts' 99th percentiles gated the NumAffectedUnsolved*
+# counts and the phenotype scores (build_database --population-gate-cohorts).
+POPULATION_GATE_COHORTS_KEY = "population_gate_cohorts"
+
+# One row per (locus, outlier type, sample) that NumAffectedUnsolvedSamplesAboveUnaffected
+# counts. The results server's Group Results By view lists loci by these samples or families.
+AFFECTED_UNSOLVED_OUTLIERS_TABLE = "affected_unsolved_outliers_above_unaffected"
+# Its columns, in order, with the types write_affected_unsolved_outliers_table declares: the
+# locus, the outlier type, the sample, the sample's family (NULL for a sample without one) and
+# the sample's largest allele above the thresholds. The types are declared rather than read off
+# the rows, so the schema is the same whatever the cohort, including when there are no rows.
+AFFECTED_UNSOLVED_OUTLIERS_COLUMN_TYPES = {
+    "LocusId": "VARCHAR",
+    "outlier_type": "VARCHAR",
+    "sample_id": "VARCHAR",
+    "family_id": "VARCHAR",
+    "allele_size": "INTEGER",
+}
 
 # Columns that hold numbers rather than text. DuckDB columns are statically typed, so
 # ``write_table_from_dicts`` reads each column's type off the values it is handed; this
@@ -256,6 +279,42 @@ def write_loci_table(connection, records, output_columns, extra_columns=None):
     return row_count
 
 
+def _write_metadata_value(connection, key, value):
+    """Writes one key/value row of ``metadata``, creating the table if it does not exist yet.
+
+    The row is written with ``INSERT OR REPLACE``, so rebuilding or re-recording a value is
+    idempotent. The caller commits.
+
+    Args:
+        connection: An open duckdb_compat connection.
+        key: The metadata key.
+        value: The value, as a string.
+    """
+    connection.execute(
+        f"CREATE TABLE IF NOT EXISTS {METADATA_TABLE} "
+        f"(key TEXT PRIMARY KEY, value VARCHAR)")
+    connection.execute(
+        f"INSERT OR REPLACE INTO {METADATA_TABLE} (key, value) VALUES (?, ?)", (key, value))
+
+
+def _read_metadata_value(connection, key):
+    """Returns the string stored under ``key`` in ``metadata``, or None when absent.
+
+    Args:
+        connection: An open duckdb_compat connection to a results database.
+        key: The metadata key.
+
+    Returns:
+        The stored value, or ``None`` when the database predates the metadata table or
+        has no row for ``key``.
+    """
+    if METADATA_TABLE not in duckdb_compat.list_tables(connection):
+        return None
+    row = connection.execute(
+        f"SELECT value FROM {METADATA_TABLE} WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
 def write_sample_count(connection, num_samples):
     """Records how many samples the database was built from, in ``metadata``.
 
@@ -272,12 +331,7 @@ def write_sample_count(connection, num_samples):
             not the number of rows in the sample-metadata TSV (which may list
             samples the matrix never genotyped).
     """
-    connection.execute(
-        f"CREATE TABLE IF NOT EXISTS {METADATA_TABLE} "
-        f"(key TEXT PRIMARY KEY, value VARCHAR)")
-    connection.execute(
-        f"INSERT OR REPLACE INTO {METADATA_TABLE} (key, value) VALUES (?, ?)",
-        (SAMPLE_COUNT_KEY, str(num_samples)))
+    _write_metadata_value(connection, SAMPLE_COUNT_KEY, str(num_samples))
     print(f"  {METADATA_TABLE}: {num_samples:,} samples")
 
 
@@ -291,11 +345,39 @@ def read_sample_count(connection):
         The recorded number of samples as an int, or ``None`` when the database
         predates the metadata table or has no sample-count row.
     """
-    if METADATA_TABLE not in duckdb_compat.list_tables(connection):
-        return None
-    row = connection.execute(
-        f"SELECT value FROM {METADATA_TABLE} WHERE key = ?", (SAMPLE_COUNT_KEY,)).fetchone()
-    return int(row[0]) if row else None
+    value = _read_metadata_value(connection, SAMPLE_COUNT_KEY)
+    return int(value) if value is not None else None
+
+
+def write_population_gate_cohorts(connection, population_gate_cohorts):
+    """Records in ``metadata`` which cohorts gated the NumAffectedUnsolved* counts and phenotype scores.
+
+    Stored comma-joined (e.g. ``HPRC256,AoU1027``), the format the analysis code's own
+    databases use. Like ``write_sample_count``, it creates the table if needed and the
+    caller commits.
+
+    Args:
+        connection: An open duckdb_compat connection.
+        population_gate_cohorts: The cohorts whose 99th percentiles an allele had to exceed
+            (build_database --population-gate-cohorts).
+    """
+    _write_metadata_value(connection, POPULATION_GATE_COHORTS_KEY, ",".join(population_gate_cohorts))
+    print(f"  {METADATA_TABLE}: population gate cohorts {', '.join(population_gate_cohorts)}")
+
+
+def read_population_gate_cohorts(connection):
+    """Returns the cohorts whose 99th percentiles gated a database's counts and phenotype scores.
+
+    Args:
+        connection: An open duckdb_compat connection to a results database.
+
+    Returns:
+        A tuple of cohort names. A database built before the cohorts were recorded has no
+        entry, and every such database was gated by the default,
+        ``analysis_columns.POPULATION_P99_GATE_COHORTS``, which is returned for it.
+    """
+    value = _read_metadata_value(connection, POPULATION_GATE_COHORTS_KEY)
+    return tuple(value.split(",")) if value is not None else POPULATION_P99_GATE_COHORTS
 
 
 def write_swim_plot(connection, swim_rows, columns=None):
@@ -412,6 +494,35 @@ def _write_mendelian_table(connection, table_name, rows):
         connection, table_name, rows, column_order=column_order,
         primary_key_column="sample_id",
         integer_columns=[c for c in column_order if c != "sample_id"])
+
+
+def write_affected_unsolved_outliers_table(connection, rows):
+    """Writes the ``affected_unsolved_outliers_above_unaffected`` table.
+
+    One row per (locus, outlier type, sample) that NumAffectedUnsolvedSamplesAboveUnaffected
+    counts. The table is written even with no rows, so the results server finds it in every
+    database. Its columns are declared from ``AFFECTED_UNSOLVED_OUTLIERS_COLUMN_TYPES``. Rows
+    are stored sorted by outlier type, sample and locus, which keeps a single sample's rows
+    together for the server's per-sample lookups.
+
+    Args:
+        connection: An open duckdb_compat connection.
+        rows: A list of row dicts from ``analysis_columns.list_affected_unsolved_outliers``.
+
+    Returns:
+        The number of rows written.
+    """
+    column_definitions = ", ".join(
+        f"{column} {column_type}" for column, column_type in AFFECTED_UNSOLVED_OUTLIERS_COLUMN_TYPES.items())
+    connection.execute(f"DROP TABLE IF EXISTS {AFFECTED_UNSOLVED_OUTLIERS_TABLE}")
+    connection.execute(f"CREATE TABLE {AFFECTED_UNSOLVED_OUTLIERS_TABLE} ({column_definitions})")
+    duckdb_compat.insert_rows(
+        connection, AFFECTED_UNSOLVED_OUTLIERS_TABLE, list(AFFECTED_UNSOLVED_OUTLIERS_COLUMN_TYPES),
+        sorted(rows, key=lambda row: (row["outlier_type"], row["sample_id"], row["LocusId"])))
+    connection.commit()
+
+    print(f"  {AFFECTED_UNSOLVED_OUTLIERS_TABLE}: {len(rows):,} rows")
+    return len(rows)
 
 
 def finalize_database(connection, tmp_path, final_path):

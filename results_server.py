@@ -36,8 +36,10 @@ import duckdb_compat
 # Standalone motif primitive (no str_analysis dependency, no sys.path insertion).
 from motif_utilities import COMPLEMENT, compute_canonical_motif
 
-# The number of samples the database was built from, recorded in its metadata table.
-from result_database import read_sample_count
+# The number of samples the database was built from and the cohorts that gated its #Aff / #Fam
+# counts, both recorded in its metadata table, and the table of the (locus, sample) pairs #Aff
+# counts, which the grouped view reads.
+from result_database import AFFECTED_UNSOLVED_OUTLIERS_TABLE, read_population_gate_cohorts, read_sample_count
 
 # The bases compute_canonical_motif can canonicalize. Deriving this from motif_utilities.COMPLEMENT
 # rather than spelling the alphabet out here keeps the two from drifting: anything outside the table
@@ -119,6 +121,19 @@ except ImportError as import_error:
 
 OUTLIER_TYPE_MAP = {"all": "AllAlleles", "short": "ShortAlleles", "hemi": "HemizygousAlleles"}
 
+# Population cohorts whose {cohort}_99thPercentile and {cohort}_MaxAllele columns the population
+# filters and the page's Δpop column compare an affected allele against
+LONG_READ_POPULATION_DATASETS = ("HPRC256", "AoU1027")
+POPULATION_DATASETS = LONG_READ_POPULATION_DATASETS + ("TenK10K",)
+
+# The cohorts each require_above_population value compares against ("all" is for short-read callsets, which are
+# compared against both kinds of cohort)
+POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION = {
+    "long-read": LONG_READ_POPULATION_DATASETS,
+    "short-read": ("TenK10K",),
+    "all": POPULATION_DATASETS,
+}
+
 # Labels for export filenames (build_export_filename). Kept in sync with the "labels" advertised
 # for outlier_type via /api/v1/schema ("Long Allele"/"Biallelic"/"Hemizygous").
 FILENAME_OUTLIER_TYPE_LABELS = {"all": "long_allele", "short": "biallelic", "hemi": "hemizygous"}
@@ -180,6 +195,7 @@ LIST_COLUMNS_OT_SPECIFIC = [
     "ThirdAffectedAlleleSize",
     "FirstUnaffectedAlleleSize",
     "NumAffectedUnsolvedSamplesAboveUnaffected",
+    "NumAffectedUnsolvedFamiliesAboveUnaffected",
     "FirstAffectedSampleId",
     "FirstAffectedPhenotype",
     "MaxGenePhenoSim",
@@ -585,6 +601,13 @@ def parse_args():
         "--annotations-db",
         default="annotations.duckdb",
         help="Path to annotations DuckDB database for notes/tags (default: annotations.duckdb).",
+    )
+    parser.add_argument(
+        "--initial-require-above-population",
+        choices=[""] + list(POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION),
+        default="",
+        help="Population filter that the page starts with when it is opened with no saved filters, e.g. 'all' "
+             "for a short-read callset (default: none).",
     )
     parser.add_argument(
         "--debug",
@@ -1073,14 +1096,18 @@ def validate_params():
 
     rap = request.args.get("require_above_population")
     if rap:
-        if rap not in ("long-read", "short-read"):
-            errors.append(f"require_above_population must be one of: long-read, short-read — got '{rap}'")
+        if rap not in POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION:
+            errors.append(f"require_above_population must be one of: "
+                          f"{', '.join(POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION)}; got '{rap}'")
         else:
             params["require_above_population"] = rap
 
     if request.args.get("include_loci_without_population_data") in ("1", "true"):
         params["include_loci_without_population_data"] = True
 
+    # population_metric: which population column require_above_population and
+    # min_repeats_above_population compare against, "99th" (default) or "max". The grouped view's
+    # Δpop values and its exports use it too, whether or not a population filter is set.
     pm = request.args.get("population_metric")
     if pm:
         if pm not in ("99th", "max"):
@@ -1105,6 +1132,14 @@ def validate_params():
             params["min_repeats_threshold"] = parse_int64(request.args["min_repeats_threshold"])
         except ValueError:
             errors.append(f"min_repeats_threshold must be an integer, got '{request.args['min_repeats_threshold']}'")
+
+    # min_repeats_above_population: the smallest Δpop the page's results table may show, i.e. the
+    # affected allele minus the largest population value (see build_api_where_clause)
+    if request.args.get("min_repeats_above_population"):
+        try:
+            params["min_repeats_above_population"] = parse_int64(request.args["min_repeats_above_population"])
+        except ValueError:
+            errors.append(f"min_repeats_above_population must be an integer, got '{request.args['min_repeats_above_population']}'")
 
     if request.args.get("gene_regions"):
         regions = [r.strip() for r in request.args["gene_regions"].split(",")]
@@ -1222,6 +1257,12 @@ def validate_params():
     if request.args.get("tag"):
         params["tag"] = request.args["tag"].strip()
 
+    # Keep the loci where #Aff counts this sample, or one of this family's samples. A row of the
+    # grouped view (/api/v1/outlier_samples) expands to these loci.
+    for name in ("affected_unsolved_outlier_sample_id", "affected_unsolved_outlier_family_id"):
+        if request.args.get(name, "").strip():
+            params[name] = request.args[name].strip()
+
     if request.args.get("sort_by"):
         sort_fields = []
         for sort_field in request.args["sort_by"].split(","):
@@ -1239,6 +1280,57 @@ def validate_params():
         return None, (jsonify({"error": "Invalid parameters", "detail": errors}), 400)
 
     return params, None
+
+
+def has_affected_unsolved_outliers_table():
+    """Whether the database has the table the grouped view needs.
+
+    A database built before the build wrote AFFECTED_UNSOLVED_OUTLIERS_TABLE lacks it until it is
+    rebuilt.
+
+    Returns:
+        True when the table exists.
+    """
+    return AFFECTED_UNSOLVED_OUTLIERS_TABLE in app.config.get("DB_TABLES", set())
+
+
+def population_datasets_compared(require_above_population):
+    """The population cohorts that Δpop and the population filters compare an allele against.
+
+    Mirrors renderLocusRow in index_page_template.html: the cohorts of the
+    require_above_population gate when it is set, and every cohort otherwise.
+
+    Args:
+        require_above_population: "long-read", "short-read", "all", or None when the gate is off.
+
+    Returns:
+        Tuple of cohort prefixes.
+    """
+    return POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION.get(require_above_population, POPULATION_DATASETS)
+
+
+def compute_delta_population(allele_size, locus_row, params):
+    """An allele minus the largest population value, as the page's Δpop column computes it.
+
+    Uses the cohorts of population_datasets_compared and the population_metric parameter.
+
+    Args:
+        allele_size: The allele size to compare, in repeat units.
+        locus_row: dict of the locus's loci-table columns.
+        params: dict of validated query parameters.
+
+    Returns:
+        The difference, or None when the allele or every population value is missing.
+    """
+    metric = "MaxAllele" if params.get("population_metric") == "max" else "99thPercentile"
+    values = []
+    for dataset in population_datasets_compared(params.get("require_above_population")):
+        value = locus_row.get(f"{dataset}_{metric}")
+        if value is not None and not (isinstance(value, float) and math.isnan(value)):
+            values.append(value)
+    if allele_size is None or not values:
+        return None
+    return allele_size - max(values)
 
 
 def build_api_order_by(params, source_columns):
@@ -1353,12 +1445,18 @@ def reference_region_clause(parsed_region):
     return " AND ".join(region_clauses), region_params
 
 
-def build_api_query(params):
-    """Build the SQL queries from validated API query parameters.
+def build_api_where_clause(params):
+    """Build the WHERE clause that picks the loci matching validated API query parameters.
+
+    Shared by build_api_query (the locus list, its count, the charts and the export) and by
+    /api/v1/outlier_samples, which groups the same loci by sample or family, so the two views
+    always filter identically.
+
+    Args:
+        params: dict of validated query parameters from validate_params().
 
     Returns:
-        Tuple (select_query, count_query, motif_count_query, gene_region_count_query,
-        sql_params, sql_params_with_pagination).
+        Tuple (where, sql_params): a condition on the `loci` table and its parameters.
     """
     ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
     source_columns = app.config.get("DB_COLUMNS_SET", set())
@@ -1405,8 +1503,7 @@ def build_api_query(params):
     if "require_above_population" in params:
         include_without_data = params.get("include_loci_without_population_data", False)
         m = "MaxAllele" if params.get("population_metric") == "max" else "99thPercentile"
-        pop_datasets = (["HPRC256", "AoU1027"]
-                        if params["require_above_population"] == "long-read" else ["TenK10K"])
+        pop_datasets = POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION[params["require_above_population"]]
         present = [d for d in pop_datasets if f"{d}_{m}" in source_columns]
         above_terms = [f"(loci.{d}_{m} IS NULL OR loci.FirstAffectedAlleleSize_{ot} > loci.{d}_{m})"
                        for d in present]
@@ -1438,6 +1535,26 @@ def build_api_query(params):
             sql_params.append(params["min_repeats_threshold"])
         else:
             clauses.append("1=0")
+
+    # Min repeats above population, i.e. a minimum on the page's Δpop column (see renderLocusRow in
+    # index_page_template.html): the affected allele minus the largest value among the population
+    # cohorts. Like Δpop, it uses the cohorts and population metric of the require_above_population
+    # gate, or every cohort when that gate is off, and a locus with no population data has no Δpop,
+    # so it never passes. Every cohort with data must be at least N - 0.5 below the allele, not N,
+    # because the page rounds Δpop to a whole number and some TenK10K percentiles are fractional: a
+    # difference rounds to N or more exactly when it is at least N - 0.5.
+    if "min_repeats_above_population" in params:
+        m = "MaxAllele" if params.get("population_metric") == "max" else "99thPercentile"
+        pop_columns = [f"loci.{d}_{m}" for d in population_datasets_compared(params.get("require_above_population"))
+                       if f"{d}_{m}" in source_columns]
+        if pop_columns and f"FirstAffectedAlleleSize_{ot}" in source_columns:
+            has_population_data = " OR ".join(f"{c} IS NOT NULL" for c in pop_columns)
+            above_terms = " AND ".join(f"({c} IS NULL OR loci.FirstAffectedAlleleSize_{ot} - {c} >= ?)"
+                                       for c in pop_columns)
+            clauses.append(f"(({has_population_data}) AND {above_terms})")
+            sql_params.extend([params["min_repeats_above_population"] - 0.5] * len(pop_columns))
+        else:
+            clauses.append("1=0")  # no population columns (or no affected allele) -> no locus has a Δpop
 
     if "gene_regions" in params:
         db_regions = []
@@ -1687,7 +1804,31 @@ def build_api_query(params):
         else:
             clauses.append("1=0")
 
-    where = " AND ".join(clauses) if clauses else "1=1"
+    # The loci where #Aff counts one sample, or one family's samples (the loci a row of the grouped
+    # view expands to). A database without the table cannot say, so nothing matches.
+    for param_name, column in (("affected_unsolved_outlier_sample_id", "sample_id"),
+                               ("affected_unsolved_outlier_family_id", "family_id")):
+        if param_name not in params:
+            continue
+        if not has_affected_unsolved_outliers_table():
+            clauses.append("1=0")
+            continue
+        clauses.append(f"loci.LocusId IN (SELECT LocusId FROM {AFFECTED_UNSOLVED_OUTLIERS_TABLE} "
+                       f"WHERE outlier_type = ? AND {column} = ?)")
+        sql_params.extend([ot, params[param_name]])
+
+    return " AND ".join(clauses) if clauses else "1=1", sql_params
+
+
+def build_api_query(params):
+    """Build the SQL queries from validated API query parameters.
+
+    Returns:
+        Tuple (select_query, count_query, motif_count_query, gene_region_count_query,
+        sql_params, sql_params_with_pagination).
+    """
+    source_columns = app.config.get("DB_COLUMNS_SET", set())
+    where, sql_params = build_api_where_clause(params)
     motif_count_col = "CanonicalMotif" if "CanonicalMotif" in source_columns else "Motif"
     # gene_region is an optional annotation column. Without it the region summary simply has
     # nothing to report; querying for it anyway would fail the whole /api/v1/loci request.
@@ -1769,46 +1910,64 @@ def parse_outlier_samples(outlier_string, sample_lookup, affected_lookup, analys
             except ValueError:
                 pass
 
-        sample_row = sample_lookup.get(sample_id, {})
-
-        # Prefer the raw sample-row affected_status for display/export so
-        # "possibly affected" is preserved; affected_lookup collapses it to
-        # "affected" for analysis logic only (see swim_plot._normalize_affected_status,
-        # which mirrors this). Fall back to affected_lookup when the sample has no
-        # usable raw status.
-        affected_raw = str(sample_row.get("affected_status") or "").strip()
-        if affected_raw.lower() in BLANK_STATUS_VALUES:
-            affected_raw = affected_lookup.get(sample_id, "unknown") or "unknown"
-        if affected_raw.lower() == "affected":
-            affected_display = "Affected"
-        elif affected_raw.lower() == "unaffected":
-            affected_display = "Unaffected"
-        else:
-            affected_display = affected_raw.title()
-
-        analysis_raw = analysis_lookup.get(sample_id, "unknown")
-        if analysis_raw == "solved":
-            analysis_display = "Solved"
-        elif analysis_raw == "unsolved":
-            analysis_display = "Unsolved"
-        elif analysis_raw == "unaffected":
-            analysis_display = "Unaffected"
-        else:
-            analysis_display = analysis_raw.title() if analysis_raw else "Unknown"
-
         results.append({
             "allele_size": allele_size,
-            "sample_id": sample_id,
-            "family_id": sample_row.get("family_id"),
-            "affected_status": affected_display,
-            "analysis_status": analysis_display,
-            "sex": sample_row.get("sex"),
-            "ancestry": sample_row.get("ancestry"),
-            "phenotype_description": sample_row.get("phenotype_description"),
+            **describe_sample(sample_id, sample_lookup, affected_lookup, analysis_lookup),
             "purity": purity,
             "methylation": methylation,
         })
     return results
+
+
+def describe_sample(sample_id, sample_lookup, affected_lookup, analysis_lookup):
+    """Return the sample-table fields the page shows for a sample, with statuses title-cased.
+
+    Args:
+        sample_id: Sample identifier.
+        sample_lookup: dict mapping sample_id to row data.
+        affected_lookup: dict mapping sample_id to affected status.
+        analysis_lookup: dict mapping sample_id to analysis status.
+
+    Returns:
+        dict with sample_id, family_id, affected_status, analysis_status, sex, ancestry and
+        phenotype_description.
+    """
+    sample_row = sample_lookup.get(sample_id, {})
+
+    # Prefer the raw sample-row affected_status for display/export so
+    # "possibly affected" is preserved; affected_lookup collapses it to
+    # "affected" for analysis logic only (see swim_plot._normalize_affected_status,
+    # which mirrors this). Fall back to affected_lookup when the sample has no
+    # usable raw status.
+    affected_raw = str(sample_row.get("affected_status") or "").strip()
+    if affected_raw.lower() in BLANK_STATUS_VALUES:
+        affected_raw = affected_lookup.get(sample_id, "unknown") or "unknown"
+    if affected_raw.lower() == "affected":
+        affected_display = "Affected"
+    elif affected_raw.lower() == "unaffected":
+        affected_display = "Unaffected"
+    else:
+        affected_display = affected_raw.title()
+
+    analysis_raw = analysis_lookup.get(sample_id, "unknown")
+    if analysis_raw == "solved":
+        analysis_display = "Solved"
+    elif analysis_raw == "unsolved":
+        analysis_display = "Unsolved"
+    elif analysis_raw == "unaffected":
+        analysis_display = "Unaffected"
+    else:
+        analysis_display = analysis_raw.title() if analysis_raw else "Unknown"
+
+    return {
+        "sample_id": sample_id,
+        "family_id": sample_row.get("family_id"),
+        "affected_status": affected_display,
+        "analysis_status": analysis_display,
+        "sex": sample_row.get("sex"),
+        "ancestry": sample_row.get("ancestry"),
+        "phenotype_description": sample_row.get("phenotype_description"),
+    }
 
 
 def build_sample_details(row_dict, raw_row, conn, lookups, phenotype_scores=None):
@@ -1816,7 +1975,7 @@ def build_sample_details(row_dict, raw_row, conn, lookups, phenotype_scores=None
 
     Args:
         phenotype_scores: Optional pre-fetched {'per_outlier': ..., 'per_locus': ...}
-            dict for this locus (see fetch_all_phenotype_scores) — avoids one
+            dict for this locus (see fetch_phenotype_scores_of_exported_loci) — avoids one
             fetch_phenotype_scores() DB round trip per call when the caller already
             bulk-loaded scores for the whole result set. Falls back to fetching
             per-locus from conn when not supplied.
@@ -2123,15 +2282,20 @@ def fetch_phenotype_scores(conn, locus_id):
     return result
 
 
-def fetch_all_phenotype_scores(conn):
-    """Bulk-load phenotype scores for every locus in one pass.
+def fetch_phenotype_scores_of_exported_loci(conn, export_query, export_query_params):
+    """Bulk-load the phenotype scores of the loci an export query returns, in one pass.
 
     Same per-locus output shape as fetch_phenotype_scores(), but issues two queries
     total instead of one query per locus. Used by exports that enrich every row with
     per-sample details, where calling fetch_phenotype_scores() per row would mean N
-    SQL round trips for an N-locus export — the per_outlier/per_locus_phenotype_scores
-    tables are small enough (low hundreds of thousands of rows) to hold in memory in
-    full for the lifetime of one export request.
+    SQL round trips for an N-locus export. Only the exported loci are loaded: a
+    per_outlier_phenotype_scores table can hold millions of rows, which take several
+    GB as Python dicts, so loading every locus made even a one-locus export slow.
+
+    Args:
+        conn: DuckDB database connection.
+        export_query: The export's SELECT over loci (it returns a LocusId column).
+        export_query_params: The parameters of export_query.
 
     Returns:
         dict mapping locus_id to the same {'per_outlier': ..., 'per_locus': ...}
@@ -2142,15 +2306,18 @@ def fetch_all_phenotype_scores(conn):
         return {}
 
     results = collections.defaultdict(lambda: {"per_outlier": {}, "per_locus": {}})
+    exported_loci_filter = f"WHERE locus_id IN (SELECT LocusId FROM ({export_query}) AS exported_loci)"
 
     rows = conn.execute(
-        """SELECT locus_id, sample_id, outlier_type, allele_size, gene_symbol,
+        f"""SELECT locus_id, sample_id, outlier_type, allele_size, gene_symbol,
                   gene_phenotype_similarity, gene_phenotype_overlap_count,
                   n_matching_diseases, best_matching_disease, best_disease_inheritance,
                   pairwise_similarity_to_next, pairwise_shared_count_raw,
                   pairwise_shared_count_ic, next_sample_id
            FROM per_outlier_phenotype_scores
-           ORDER BY locus_id, outlier_type, allele_size DESC"""
+           {exported_loci_filter}
+           ORDER BY locus_id, outlier_type, allele_size DESC""",
+        list(export_query_params),
     ).fetchall()
     for row in rows:
         locus_id, outlier_type = row[0], row[2]
@@ -2175,10 +2342,12 @@ def fetch_all_phenotype_scores(conn):
 
     if "per_locus_phenotype_scores" in tables:
         rows = conn.execute(
-            """SELECT locus_id, outlier_type, num_qualifying_samples, sum_pairwise_similarity,
+            f"""SELECT locus_id, outlier_type, num_qualifying_samples, sum_pairwise_similarity,
                       sum_pairwise_shared_raw, sum_pairwise_shared_ic,
                       max_gene_phenotype_similarity, qualifying_sample_ids
-               FROM per_locus_phenotype_scores"""
+               FROM per_locus_phenotype_scores
+               {exported_loci_filter}""",
+            list(export_query_params),
         ).fetchall()
         for row in rows:
             locus_id, outlier_type = row[0], row[1]
@@ -2222,6 +2391,8 @@ def index():
         has_mendelian=app.config.get("HAS_MENDELIAN", False),
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
         outlier_warnings_by_source={app.config["DB_LABELS"][0]: app.config.get("OUTLIER_WARNINGS", {})},
+        initial_require_above_population=app.config.get("INITIAL_REQUIRE_ABOVE_POPULATION", ""),
+        population_gate_cohorts=app.config.get("POPULATION_GATE_COHORTS", ()),
     )
 
 
@@ -2422,6 +2593,7 @@ def get_loci():
         motif_rows = conn.execute(motif_count_query, sql_params).fetchall()
         gene_region_rows = (conn.execute(gene_region_count_query, sql_params).fetchall()
                             if gene_region_count_query else [])
+        selected_alleles = fetch_selected_sample_or_family_alleles(conn, params, [dict(row)["LocusId"] for row in rows])
     finally:
         conn.close()
 
@@ -2430,6 +2602,9 @@ def get_loci():
 
     total_pages = math.ceil(total / params["page_size"]) if total > 0 else 0
     results = [row_to_list_dict(row, ot) for row in rows]
+    if selected_alleles is not None:
+        for r in results:
+            r["SelectedSampleOrFamilyAlleles"] = selected_alleles.get(r["LocusId"], [])
 
     ann = app.config["ANNOTATIONS"]
     pathogenic_thresholds = app.config.get("KNOWN_DISEASE_LOCUS_THRESHOLDS", {})
@@ -2458,6 +2633,432 @@ def get_loci():
         "motif_counts": motif_counts,
         "gene_region_counts": gene_region_counts,
     })
+
+
+def fetch_selected_sample_or_family_alleles(conn, params, locus_ids):
+    """The selected sample's (or family's) own alleles at each locus of a restricted locus list.
+
+    When /api/v1/loci is restricted to one sample or family (see build_api_where_clause), the
+    page shows that sample's allele next to the locus's top affected allele.
+
+    Args:
+        conn: Open connection to the database.
+        params: dict of validated query parameters.
+        locus_ids: LocusIds of the page of results.
+
+    Returns:
+        None when the list is not restricted to a sample or family, else a dict mapping LocusId
+        to a list of {"sample_id", "allele_size"} dicts, largest allele first.
+    """
+    for param_name, column in (("affected_unsolved_outlier_sample_id", "sample_id"),
+                               ("affected_unsolved_outlier_family_id", "family_id")):
+        if param_name in params:
+            break
+    else:
+        return None
+    if not locus_ids or not has_affected_unsolved_outliers_table():
+        return {}
+    ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
+    rows = conn.execute(
+        f"SELECT LocusId, sample_id, allele_size FROM {AFFECTED_UNSOLVED_OUTLIERS_TABLE} "
+        f"WHERE outlier_type = ? AND {column} = ? AND LocusId IN ({','.join('?' * len(locus_ids))}) "
+        f"ORDER BY LocusId, allele_size DESC, sample_id",
+        [ot, params[param_name]] + list(locus_ids)).fetchall()
+    alleles = collections.defaultdict(list)
+    for locus_id, sample_id, allele_size in rows:
+        alleles[locus_id].append({"sample_id": sample_id, "allele_size": allele_size})
+    return alleles
+
+
+# group_sort values of /api/v1/outlier_samples: the groups CTE column each one sorts by, and the
+# direction it sorts in unless group_sort_direction says otherwise
+GROUPED_SORTS = {
+    "num_loci": ("num_loci", "desc"),
+    "num_disease_gene_loci": ("num_disease_gene_loci", "desc"),
+    "best_gene_phenotype_similarity": ("best_gene_phenotype_similarity", "desc"),
+    "largest_allele_size": ("largest_allele_size", "desc"),
+    "group_id": ("group_id", "asc"),
+}
+
+# Filters that describe a sample rather than a locus. The grouped view applies them to each row's
+# own sample (its id, or its own phenotype), where the locus view matches a locus's outlier list
+# or the phenotypes of its outlier samples.
+SAMPLE_LEVEL_FILTERS = ("sample_id_keyword", "sample_id_like", "phenotype_keyword")
+
+
+def find_samples_passing_sample_level_filters(params, sample_lookup):
+    """The samples that pass the grouped view's sample-level filters.
+
+    Matching ignores case. sample_id_keyword matches whole sample ids, sample_id_like any part of
+    one, and phenotype_keyword any part of the sample's phenotype description. Keywords of one
+    filter are ORed, and the filters are ANDed.
+
+    Args:
+        params: dict of validated query parameters.
+        sample_lookup: dict mapping sample_id to its sample-table row, or to a dict holding only
+            its family_id for a sample in the outlier table that has no sample-table row.
+
+    Returns:
+        Sorted list of sample ids, or None when no sample-level filter is set.
+    """
+    if not any(name in params for name in SAMPLE_LEVEL_FILTERS):
+        return None
+    exact_ids = {kw.lower() for kw in params.get("sample_id_keyword", [])}
+    passing = []
+    for sample_id, sample_row in sample_lookup.items():
+        if exact_ids and sample_id.lower() not in exact_ids:
+            continue
+        if "sample_id_like" in params and not any(kw.lower() in sample_id.lower()
+                                                  for kw in params["sample_id_like"]):
+            continue
+        if "phenotype_keyword" in params:
+            phenotype = sample_row.get("phenotype_description")
+            phenotype = phenotype.lower() if isinstance(phenotype, str) else ""
+            if not any(kw.lower() in phenotype for kw in params["phenotype_keyword"]):
+                continue
+        passing.append(sample_id)
+    return sorted(passing)
+
+
+def validate_grouped_params():
+    """Validate the grouped view's parameters: every /api/v1/loci one, plus group_by, group_sort and
+    group_sort_direction ("asc" or "desc", by default group_sort's own direction in GROUPED_SORTS).
+
+    Returns:
+        Tuple (params, group_by, group_sort, group_sort_direction, error_response).
+        error_response is not None when the request is invalid or the database has no
+        AFFECTED_UNSOLVED_OUTLIERS_TABLE.
+    """
+    def invalid(response):
+        return None, None, None, None, response
+
+    params, error = validate_params()
+    if error:
+        return invalid(error)
+    group_by = request.args.get("group_by", "")
+    if group_by not in ("sample", "family"):
+        return invalid((jsonify({"error": "Invalid parameter", "detail": f"group_by must be one of: sample, family; got '{group_by}'"}), 400))
+    group_sort = request.args.get("group_sort") or "num_loci"
+    if group_sort not in GROUPED_SORTS:
+        return invalid((jsonify({"error": "Invalid parameter", "detail": f"group_sort must be one of: {', '.join(GROUPED_SORTS)}; got '{group_sort}'"}), 400))
+    group_sort_direction = request.args.get("group_sort_direction") or GROUPED_SORTS[group_sort][1]
+    if group_sort_direction not in ("asc", "desc"):
+        return invalid((jsonify({"error": "Invalid parameter", "detail": f"group_sort_direction must be one of: asc, desc; got '{group_sort_direction}'"}), 400))
+    if not has_affected_unsolved_outliers_table():
+        return invalid((jsonify({"error": "Not available", "detail": f"The database has no {AFFECTED_UNSOLVED_OUTLIERS_TABLE} "
+                                 f"table. Rebuild it with trails.py and restart the server."}), 400))
+    return params, group_by, group_sort, group_sort_direction, None
+
+
+def build_grouped_ctes(params, group_by):
+    """The SQL common to the grouped view and its export.
+
+    A sample belongs under a locus when #Aff counts it there (AFFECTED_UNSOLVED_OUTLIERS_TABLE):
+    affected status not "unaffected", analysis status not solved, and an allele above every
+    unaffected or solved sample's and above the population 99th percentile. A family's rows are
+    its samples' rows, so a sample without a family_id appears only when grouping by sample.
+    Sample-level filters (SAMPLE_LEVEL_FILTERS) pick samples instead of loci, or in the family
+    view the families with at least one such sample. A group's num_loci is therefore exactly the
+    number of loci /api/v1/loci returns for it with the same filters, minus those, plus
+    affected_unsolved_outlier_sample_id (or _family_id).
+
+    Args:
+        params: dict of validated query parameters.
+        group_by: "sample" or "family".
+
+    Returns:
+        Tuple (ctes, ctes_params, group_column). ctes is a "WITH ..." prefix that defines
+        matching_loci (the loci matching the locus filters, with their disease-gene flag, motif
+        and gene region), pairs (the samples #Aff counts at them that pass the sample-level
+        filters, with family_id and allele_size) and groups (one row per sample or family:
+        group_id, num_loci, num_disease_gene_loci, largest_allele_size and
+        best_gene_phenotype_similarity). group_column is the pairs column holding the group id.
+    """
+    ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
+    lookups = app.config["LOOKUPS"]
+    where, where_params = build_api_where_clause({k: v for k, v in params.items() if k not in SAMPLE_LEVEL_FILTERS})
+    source_columns = app.config.get("DB_COLUMNS_SET", set())
+    disease_gene_column = "loci.IsInMendelianGene" if "IsInMendelianGene" in source_columns else "NULL"
+    motif_count_col = "CanonicalMotif" if "CanonicalMotif" in source_columns else "Motif"
+    gene_region_column = "loci.gene_region" if not source_columns or "gene_region" in source_columns else "NULL"
+    group_column = "pairs.sample_id" if group_by == "sample" else "pairs.family_id"
+
+    # The (locus, sample) rows behind the view: the samples #Aff counts at the matching loci
+    pair_conditions = ["p.outlier_type = ?"]
+    pair_params = [ot]
+    if group_by == "family":
+        pair_conditions.append("p.family_id IS NOT NULL")
+    # The sample-level filters see every sample of the outlier table, with the family the build
+    # recorded for it, and every sample-table row (the only source of phenotypes)
+    sample_rows = {sample_id: {"family_id": family_id}
+                   for sample_id, family_id in app.config.get("OUTLIER_TABLE_FAMILY_ID_BY_SAMPLE", {}).items()}
+    sample_rows.update(lookups["sample"])
+    passing_samples = find_samples_passing_sample_level_filters(params, sample_rows)
+    if passing_samples is not None:
+        # In the family view the filters pick whole families: those with a sample that passes
+        if group_by == "family":
+            passing_column = "p.family_id"
+            passing_ids = sorted({family_id for family_id in (sample_rows[s].get("family_id") for s in passing_samples)
+                                  if isinstance(family_id, str) and family_id})
+        else:
+            passing_column, passing_ids = "p.sample_id", passing_samples
+        if passing_ids:
+            pair_conditions.append(f"{passing_column} IN ({','.join('?' * len(passing_ids))})")
+            pair_params.extend(passing_ids)
+        else:
+            pair_conditions.append("1=0")
+    if "per_outlier_phenotype_scores" in app.config.get("DB_TABLES", set()):
+        best_similarity = "MAX(s.gene_phenotype_similarity)"
+        phenotype_join = ("LEFT JOIN per_outlier_phenotype_scores s ON s.locus_id = pairs.LocusId "
+                          "AND s.sample_id = pairs.sample_id AND s.outlier_type = ?")
+        phenotype_join_params = [ot]
+    else:
+        best_similarity, phenotype_join, phenotype_join_params = "NULL", "", []
+    ctes = (f"WITH matching_loci AS (SELECT loci.LocusId, {disease_gene_column} AS is_in_disease_gene, "
+            f"loci.{motif_count_col} AS motif, {gene_region_column} AS gene_region FROM loci WHERE {where}), "
+            f"pairs AS (SELECT p.LocusId, p.sample_id, p.family_id, p.allele_size, m.is_in_disease_gene "
+            f"FROM {AFFECTED_UNSOLVED_OUTLIERS_TABLE} p JOIN matching_loci m ON m.LocusId = p.LocusId "
+            f"WHERE {' AND '.join(pair_conditions)}), "
+            f"groups AS (SELECT {group_column} AS group_id, "
+            f"COUNT(DISTINCT pairs.LocusId) AS num_loci, "
+            f"COUNT(DISTINCT CASE WHEN pairs.is_in_disease_gene = 1 THEN pairs.LocusId END) AS num_disease_gene_loci, "
+            f"MAX(pairs.allele_size) AS largest_allele_size, "
+            f"{best_similarity} AS best_gene_phenotype_similarity "
+            f"FROM pairs {phenotype_join} GROUP BY {group_column}) ")
+    return ctes, where_params + pair_params + phenotype_join_params, group_column
+
+
+def grouped_order_by(group_sort, group_sort_direction):
+    """ORDER BY terms (over the groups CTE's columns) that put the groups in group_sort's order.
+
+    A group with no value (no gene-phenotype score) goes last in either direction. Ties are
+    broken by #Loci, then by group id.
+
+    Args:
+        group_sort: A GROUPED_SORTS key.
+        group_sort_direction: "asc" or "desc".
+
+    Returns:
+        The ORDER BY terms, without the "ORDER BY" keyword.
+    """
+    column = GROUPED_SORTS[group_sort][0]
+    return f"{column} {group_sort_direction.upper()} NULLS LAST, num_loci DESC, group_id"
+
+
+def describe_groups(conn, ctes, ctes_params, group_column, group_rows, group_by, params):
+    """Complete rows of the groups CTE with what the grouped view shows for each.
+
+    Adds each group's largest allele's locus, gene and Δpop (compute_delta_population), and
+    the sample's sample-table fields, or a family's samples among the pairs.
+
+    Args:
+        conn: Open connection to the database.
+        ctes, ctes_params, group_column: from build_grouped_ctes.
+        group_rows: dicts of groups CTE rows.
+        group_by: "sample" or "family".
+        params: dict of validated query parameters.
+
+    Returns:
+        List of dicts, one per group row, in the same order.
+    """
+    lookups = app.config["LOOKUPS"]
+    group_ids = [row["group_id"] for row in group_rows]
+    largest_allele_loci = {}
+    members = collections.defaultdict(set)
+    if group_ids:
+        in_groups = f"{group_column} IN ({','.join('?' * len(group_ids))})"
+        # Each group's largest allele and the locus it is at (ties go to the smallest LocusId)
+        for group_id, locus_id in conn.execute(
+                f"{ctes}SELECT group_id, LocusId FROM (SELECT {group_column} AS group_id, pairs.LocusId, "
+                f"ROW_NUMBER() OVER (PARTITION BY {group_column} ORDER BY pairs.allele_size DESC, pairs.LocusId) AS rank_in_group "
+                f"FROM pairs WHERE {in_groups}) ranked WHERE rank_in_group = 1",
+                ctes_params + group_ids).fetchall():
+            largest_allele_loci[group_id] = locus_id
+        if group_by == "family":
+            for family_id, sample_id in conn.execute(
+                    f"{ctes}SELECT DISTINCT pairs.family_id, pairs.sample_id FROM pairs WHERE {in_groups}",
+                    ctes_params + group_ids).fetchall():
+                members[family_id].add(sample_id)
+    locus_rows = {}
+    if largest_allele_loci:
+        locus_ids = sorted(set(largest_allele_loci.values()))
+        for row in conn.execute(f"SELECT * FROM loci WHERE LocusId IN ({','.join('?' * len(locus_ids))})", locus_ids):
+            row = dict(row)
+            locus_rows[row["LocusId"]] = row
+
+    results = []
+    for row in group_rows:
+        locus_id = largest_allele_loci.get(row["group_id"])
+        locus_row = locus_rows.get(locus_id, {})
+        result = {
+            "group_id": row["group_id"],
+            "num_loci": row["num_loci"],
+            "num_disease_gene_loci": row["num_disease_gene_loci"],
+            "best_gene_phenotype_similarity": row["best_gene_phenotype_similarity"],
+            "largest_allele_size": row["largest_allele_size"],
+            "largest_allele_locus_id": locus_id,
+            "largest_allele_gene_symbol": locus_row.get("GeneTableGeneSymbol"),
+            "largest_allele_delta_population": compute_delta_population(row["largest_allele_size"], locus_row, params),
+        }
+        if group_by == "sample":
+            result.update(describe_sample(row["group_id"], lookups["sample"], lookups["affected"], lookups["analysis"]))
+            # The family the build recorded, which the family view groups by, rather than the sample
+            # table's, which is empty for a sample with no row there
+            result["family_id"] = app.config.get("OUTLIER_TABLE_FAMILY_ID_BY_SAMPLE", {}).get(row["group_id"])
+        else:
+            result["family_id"] = row["group_id"]
+            result["members"] = [describe_sample(sample_id, lookups["sample"], lookups["affected"], lookups["analysis"])
+                                 for sample_id in sorted(members[row["group_id"]])]
+        results.append(result)
+    return results
+
+
+@app.route("/api/v1/outlier_samples")
+def get_outlier_samples():
+    """The loci matching the filters, grouped by affected unsolved sample or by family.
+
+    Takes every /api/v1/loci parameter, plus group_by ("sample" or "family"), group_sort (a
+    GROUPED_SORTS key, default "num_loci") and group_sort_direction ("asc" or "desc"). See
+    build_grouped_ctes for which samples a group holds and how the filters apply.
+    """
+    params, group_by, group_sort, group_sort_direction, error = validate_grouped_params()
+    if error:
+        return error
+    ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
+    ctes, ctes_params, group_column = build_grouped_ctes(params, group_by)
+    totals_query = f"{ctes}SELECT COUNT(DISTINCT {group_column}), COUNT(DISTINCT pairs.LocusId) FROM pairs"
+    page_query = f"{ctes}SELECT * FROM groups ORDER BY {grouped_order_by(group_sort, group_sort_direction)} LIMIT ? OFFSET ?"
+    # The charts count the loci the rows span
+    chart_loci = "FROM matching_loci WHERE LocusId IN (SELECT LocusId FROM pairs)"
+    motif_count_query = f"{ctes}SELECT motif, COUNT(*) AS count {chart_loci} GROUP BY motif ORDER BY count DESC, motif"
+    gene_region_count_query = f"{ctes}SELECT gene_region, COUNT(*) AS count {chart_loci} GROUP BY gene_region"
+
+    conn = get_db()
+    try:
+        total_groups, total_loci = conn.execute(totals_query, ctes_params).fetchone()
+        group_rows = [dict(row) for row in conn.execute(
+            page_query, ctes_params + [params["page_size"], (params["page"] - 1) * params["page_size"]])]
+        motif_rows = conn.execute(motif_count_query, ctes_params).fetchall()
+        gene_region_rows = conn.execute(gene_region_count_query, ctes_params).fetchall()
+        results = describe_groups(conn, ctes, ctes_params, group_column, group_rows, group_by, params)
+    finally:
+        conn.close()
+
+    return jsonify({
+        "group_by": group_by,
+        "group_sort": group_sort,
+        "group_sort_direction": group_sort_direction,
+        "total": total_groups,
+        "total_loci": total_loci,
+        "page": params["page"],
+        "page_size": params["page_size"],
+        "total_pages": math.ceil(total_groups / params["page_size"]) if total_groups else 0,
+        "outlier_type": ot,
+        "results": results,
+        "motif_counts": {row[0]: row[1] for row in motif_rows if row[0]},
+        "gene_region_counts": {row[0]: row[1] for row in gene_region_rows if row[0]},
+    })
+
+
+# format values of /api/v1/outlier_samples/export: one row per sample (or family), or one row
+# per sample (or family) and locus
+GROUPED_EXPORT_FORMATS = ("groups_tsv", "group_loci_tsv")
+
+# Sample-table fields the grouped exports write for each sample, after the group id
+GROUPED_EXPORT_SAMPLE_FIELDS = ["sex", "affected_status", "analysis_status", "phenotype_description"]
+
+
+def format_tsv_line(values):
+    """One TSV line: a missing value (None or NaN) as an empty field, tabs and newlines as spaces."""
+    return "\t".join("" if v is None or (isinstance(v, float) and math.isnan(v))
+                     else str(v).replace("\t", " ").replace("\n", " ") for v in values) + "\n"
+
+
+@app.route("/api/v1/outlier_samples/export")
+def export_outlier_samples():
+    """Download the grouped view as gzip-compressed TSV.
+
+    Takes the /api/v1/outlier_samples parameters (page and page_size are ignored) and format:
+      groups_tsv: one row per sample (or family), in the grouped view's order, with the columns
+        the view shows.
+      group_loci_tsv: one row per sample and locus (the pairs behind the view), groups in the
+        view's order and, within a group, the largest allele first. Each row carries the
+        sample's sample-table fields, its own allele and that allele's Δpop, then the columns of
+        the locus TSV export.
+    """
+    params, group_by, group_sort, group_sort_direction, error = validate_grouped_params()
+    if error:
+        return error
+    order_by = grouped_order_by(group_sort, group_sort_direction)
+    export_format = request.args.get("format", "")
+    if export_format not in GROUPED_EXPORT_FORMATS:
+        return jsonify({"error": "Invalid parameter", "detail": f"format must be one of: {', '.join(GROUPED_EXPORT_FORMATS)}; got '{export_format}'"}), 400
+    ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
+    ctes, ctes_params, group_column = build_grouped_ctes(params, group_by)
+    group_noun = "samples" if group_by == "sample" else "families"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    lookups = app.config["LOOKUPS"]
+
+    conn = get_db()
+    if export_format == "groups_tsv":
+        try:
+            group_rows = [dict(row) for row in conn.execute(
+                f"{ctes}SELECT * FROM groups ORDER BY {order_by}", ctes_params)]
+            groups = describe_groups(conn, ctes, ctes_params, group_column, group_rows, group_by, params)
+        finally:
+            conn.close()
+        group_columns = ["num_loci", "num_disease_gene_loci", "best_gene_phenotype_similarity", "largest_allele_size",
+                         "largest_allele_delta_population", "largest_allele_locus_id", "largest_allele_gene_symbol"]
+        if group_by == "sample":
+            header = ["sample_id", "family_id"] + GROUPED_EXPORT_SAMPLE_FIELDS + group_columns
+            lines = [format_tsv_line([g[c] for c in header]) for g in groups]
+        else:
+            header = ["family_id", "num_samples", "samples", "phenotypes"] + group_columns
+            lines = [format_tsv_line(
+                [g["family_id"], len(g["members"]),
+                 "; ".join(f"{m['sample_id']} ({m['sex'] if isinstance(m['sex'], str) else ''}, "
+                           f"{m['affected_status']}/{m['analysis_status']})" for m in g["members"]),
+                 " | ".join(dict.fromkeys(m["phenotype_description"] for m in g["members"]
+                                          if isinstance(m["phenotype_description"], str) and m["phenotype_description"]))]
+                + [g[c] for c in group_columns]) for g in groups]
+        filename = f"tr_outliers.{FILENAME_OUTLIER_TYPE_LABELS[params['outlier_type']]}.{len(groups)}_{group_noun}.{timestamp}.tsv.gz"
+        return Response(gzip_stream(iter(["\t".join(header) + "\n"] + lines)), mimetype="application/gzip",
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    # group_loci_tsv, streamed: the pairs, ordered by their group's rank in the grouped view
+    pairs_query = (f"{ctes}, ranked AS (SELECT group_id, ROW_NUMBER() OVER (ORDER BY {order_by}) AS group_rank "
+                   f"FROM groups) "
+                   f"SELECT pairs.sample_id AS pair_sample_id, pairs.family_id AS pair_family_id, "
+                   f"pairs.allele_size AS pair_allele_size, loci.* "
+                   f"FROM pairs JOIN ranked ON ranked.group_id = {group_column} JOIN loci ON loci.LocusId = pairs.LocusId "
+                   f"ORDER BY ranked.group_rank, pairs.allele_size DESC, pairs.LocusId, pairs.sample_id")
+    id_columns = ["sample_id", "family_id"] if group_by == "sample" else ["family_id", "sample_id"]
+    try:
+        num_pairs = conn.execute(f"{ctes}SELECT COUNT(*) FROM pairs", ctes_params).fetchone()[0]
+    except Exception:
+        conn.close()
+        raise
+
+    def generate():
+        try:
+            yield "\t".join(id_columns + GROUPED_EXPORT_SAMPLE_FIELDS + ["sample_allele_size", "sample_allele_delta_population"]
+                            + LIST_COLUMNS_STATIC + LIST_COLUMNS_OT_SPECIFIC) + "\n"
+            for row in conn.execute(pairs_query, ctes_params):
+                row_dict = dict(row)
+                sample = describe_sample(row_dict["pair_sample_id"], lookups["sample"], lookups["affected"], lookups["analysis"])
+                # The family the rows were grouped by, as the build recorded it
+                sample["family_id"] = row_dict["pair_family_id"]
+                allele_size = row_dict["pair_allele_size"]
+                yield format_tsv_line(
+                    [sample[c] for c in id_columns + GROUPED_EXPORT_SAMPLE_FIELDS]
+                    + [allele_size, compute_delta_population(allele_size, row_dict, params)]
+                    + list(row_to_list_dict(row, ot).values()))
+        finally:
+            conn.close()
+    filename = (f"tr_outliers.{FILENAME_OUTLIER_TYPE_LABELS[params['outlier_type']]}.{num_pairs}_"
+                f"{'sample' if group_by == 'sample' else 'family'}_locus_pairs.{timestamp}.tsv.gz")
+    return Response(gzip_stream(generate()), mimetype="application/gzip",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 def gzip_stream(text_generator):
@@ -2522,10 +3123,9 @@ def export_json(conn, query, count_query, sql_params, ot, params):
     Every locus is always enriched with a "Samples" key listing every qualifying
     outlier sample (allele size, sample/family id, sex, ancestry, affected/analysis
     status, phenotype, purity, methylation, and phenotype-similarity scores) —
-    regardless of result-set size. Phenotype scores are bulk-loaded once up front
-    (fetch_all_phenotype_scores) rather than per row, so this stays cheap even for
-    million-row exports. Rows still stream from the cursor so the full result set
-    is never materialized in memory.
+    regardless of result-set size. The exported loci's phenotype scores are bulk-loaded
+    once up front (fetch_phenotype_scores_of_exported_loci) rather than per row. Rows
+    still stream from the cursor.
     """
     tags_dict = app.config["ANNOTATIONS"]["tags"]
     lookups = app.config["LOOKUPS"]
@@ -2558,7 +3158,7 @@ def export_json(conn, query, count_query, sql_params, ot, params):
 
     def generate():
         try:
-            all_phenotype_scores = fetch_all_phenotype_scores(conn)
+            all_phenotype_scores = fetch_phenotype_scores_of_exported_loci(conn, query, sql_params)
             yield '{\n  "metadata": ' + json.dumps(metadata, indent=2).replace("\n", "\n  ") + ',\n  "loci": [\n'
             first = True
             for raw_row in conn.execute(query, sql_params):
@@ -2660,7 +3260,7 @@ def export_expansion_hunter(conn, query, count_query, sql_params, ot, params):
             # Bulk-loaded once for the whole export, the way export_json does it: passing the
             # per-locus scores in keeps build_sample_details from running its own
             # fetch_phenotype_scores() query (plus a list_tables() call) for every locus.
-            all_phenotype_scores = fetch_all_phenotype_scores(conn)
+            all_phenotype_scores = fetch_phenotype_scores_of_exported_loci(conn, query, sql_params)
             for row_dict, raw_row in zip(results, rows):
                 thresholds = compute_plot_thresholds(
                     row_dict,
@@ -2847,11 +3447,11 @@ def get_swim_plot_data():
     if known_motifs_only == "1":
         extra_clauses.append("IsKnownMotif = 1" if (not source_columns or "IsKnownMotif" in source_columns) else "1=0")
 
-    if require_above_population in ("long-read", "short-read"):
+    if require_above_population in POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION:
         # Only reference population-stat columns that actually exist in the DB
         # (a minimal-input build omits them); with none present the filter cannot
         # be evaluated, so match no rows. Mirrors build_api_query.
-        datasets = ["HPRC256", "AoU1027"] if require_above_population == "long-read" else ["TenK10K"]
+        datasets = POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION[require_above_population]
         present = [d for d in datasets if not source_columns or f"{d}_{population_metric}" in source_columns]
         above_terms = [f"({d}_{population_metric} IS NULL OR allele_size > {d}_{population_metric})" for d in present]
         if include_loci_without_population_data:
@@ -3338,8 +3938,9 @@ def get_schema():
             "require_families_above_unaffected": {"type": "enum", "values": ["first", "second", "third"]},
             "require_above_population": {
                 "type": "enum",
-                "values": ["long-read", "short-read"],
-                "labels": {"long-read": "Long-read (HPRC256, AoU1027)", "short-read": "Short-read (TenK10K)"},
+                "values": list(POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION),
+                "labels": {"long-read": "Long-read (HPRC256, AoU1027)", "short-read": "Short-read (TenK10K)",
+                           "all": "All (long-read and TenK10K)"},
             },
             "include_loci_without_population_data": {
                 "type": "boolean",
@@ -3347,6 +3948,7 @@ def get_schema():
             },
             "min_expansion": {"type": "int", "min": 0},
             "min_repeats_threshold": {"type": "int", "min": 0},
+            "min_repeats_above_population": {"type": "int", "description": "Keep loci whose affected allele is at least this many repeats above the largest population value (the page's Δpop column). Uses the cohorts and population_metric of require_above_population, or every cohort when it is not set. Loci without population data are dropped"},
             "min_pli": {"type": "float", "min": 0.0, "max": 1.0},
             "min_sigma_percentile": {"type": "float", "min": 0.0, "max": 1.0, "description": "Keep loci whose HPRC256/AoU1027 stdev percentile is in the top (1 - value) fraction"},
             "chrom": {"type": "string", "description": "Filter to a single chromosome (e.g. chr1)"},
@@ -3368,9 +3970,22 @@ def get_schema():
             "gene_symbol": {"type": "string"},
             "locus_id": {"type": "string"},
             "tag": {"type": "string", "description": "Filter to loci with this tag"},
+            "affected_unsolved_outlier_sample_id": {"type": "string", "description": "Keep the loci where #Aff counts this sample (affected and unsolved, allele above every unaffected or solved sample's and above the population 99th percentile). Each result then carries SelectedSampleOrFamilyAlleles"},
+            "affected_unsolved_outlier_family_id": {"type": "string", "description": "Keep the loci where #Aff counts at least one sample of this family. Each result then carries SelectedSampleOrFamilyAlleles"},
             "motif_size": {"type": "string", "description": "Motif size filter. Comma-separated entries: exact (3), range (3-6), open-end (5-), open-start (-10)"},
         },
+        # The extra parameters of /api/v1/outlier_samples (the "Group results by" view), which also
+        # takes every filter above, and of its /api/v1/outlier_samples/export download
+        "grouped_view_parameters": {
+            "group_by": {"type": "enum", "required": True, "values": ["sample", "family"], "description": "One row per affected unsolved sample, or per family"},
+            "group_sort": {"type": "enum", "values": list(GROUPED_SORTS), "description": "The column the rows are sorted by (default: num_loci)"},
+            "group_sort_direction": {"type": "enum", "values": ["asc", "desc"], "description": "The sort direction (default: desc, or asc for group_id). Rows with no value sort last either way"},
+            "format": {"type": "enum", "values": list(GROUPED_EXPORT_FORMATS), "description": "Export only, required: one row per sample or family (groups_tsv), or one per sample and locus (group_loci_tsv)"},
+        },
         "sort_options": list(VALID_SORTS),
+        # /api/v1/outlier_samples (the "Group results by" view) needs this table
+        "has_affected_unsolved_outliers_table": has_affected_unsolved_outliers_table(),
+        "group_sort_options": list(GROUPED_SORTS),
         "total_loci": app.config.get("TOTAL_LOCI", 0),
         # None for a database built before the pipeline started recording the sample count
         "total_samples": app.config.get("TOTAL_SAMPLES"),
@@ -3466,6 +4081,8 @@ def configure_app(db_path, sample_table=None, known_loci_json=None,
         total_loci = conn.execute("SELECT COUNT(*) FROM loci").fetchone()[0]
         # None for a database built before the pipeline started recording the sample count.
         total_samples = read_sample_count(conn)
+        # Named in the page's #Fam and Group Results By help text
+        population_gate_cohorts = read_population_gate_cohorts(conn)
         # LIMIT 0 rather than duckdb_compat.table_columns: the columns are advertised as an
         # ordered list via /api/v1/schema, and a query's description keeps the table's order
         # where the catalog lookup returns an unordered set. No row is read either way.
@@ -3489,17 +4106,27 @@ def configure_app(db_path, sample_table=None, known_loci_json=None,
             })
         else:
             sample_ids = []
+        # Each grouped-view sample's family as the build recorded it, so the grouped view's sample
+        # filters and family ids also cover a sample with no sample-table row, or no --sample-table.
+        if AFFECTED_UNSOLVED_OUTLIERS_TABLE in tables:
+            outlier_table_family_id_by_sample = dict(conn.execute(
+                f"SELECT DISTINCT sample_id, family_id FROM {AFFECTED_UNSOLVED_OUTLIERS_TABLE}").fetchall())
+        else:
+            outlier_table_family_id_by_sample = {}
     finally:
         conn.close()
 
     db_columns_set = set(db_columns)
     app.config["TOTAL_LOCI"] = total_loci
     app.config["TOTAL_SAMPLES"] = total_samples
+    app.config["POPULATION_GATE_COHORTS"] = population_gate_cohorts
     app.config["DB_COLUMNS"] = db_columns
     app.config["DB_COLUMNS_SET"] = db_columns_set
+    app.config["DB_TABLES"] = tables
     app.config["HAS_MENDELIAN"] = "mendelian_violations" in tables
     app.config["HAS_SWIM_PLOT_PHENOTYPES"] = has_swim_plot_phenotypes
     app.config["SAMPLE_IDS"] = sample_ids
+    app.config["OUTLIER_TABLE_FAMILY_ID_BY_SAMPLE"] = outlier_table_family_id_by_sample
 
     # Known-disease-locus filter set + pathogenic-threshold map (from the loci table's
     # KnownDiseaseLocus column, and the disease catalog for thresholds when available).
@@ -3585,6 +4212,7 @@ def main():
 
     app.config["BIND_HOST"] = args.host
     app.config["ALLOW_REMOTE_WRITES"] = args.allow_remote_writes
+    app.config["INITIAL_REQUIRE_ABOVE_POPULATION"] = args.initial_require_above_population
     if args.host not in LOOPBACK_HOSTS:
         if args.allow_remote_writes:
             print(f"\nWARNING: bound to {args.host} with --allow-remote-writes: anyone who can "

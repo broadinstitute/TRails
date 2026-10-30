@@ -11,7 +11,8 @@ families of scores:
 
   * A gene-phenotype similarity: how well a patient's HPO terms match the known
     disease phenotypes of the gene at that locus, restricted to diseases whose
-    inheritance mode is compatible with the outlier type.
+    inheritance mode is compatible with the outlier type. Diseases with no
+    inheritance annotation are kept for every outlier type.
   * Pairwise phenotype similarity and shared-term counts between consecutive
     qualifying samples (ordered largest allele first), which surface loci where
     multiple expanded patients share phenotypes.
@@ -27,6 +28,7 @@ HPO term-id strings (as produced by ``input_tables.read_phenotypes``).
 """
 
 from analysis_columns import (
+    POPULATION_P99_GATE_COHORTS,
     is_affected_unsolved,
     is_above_population_p99,
     is_above_unaffected,
@@ -277,14 +279,16 @@ def score_patient_vs_gene_filtered(patient_hpo_ids, gene_symbol, gene_disease_da
     }
 
 
-def get_qualifying_samples(row, outlier_type, affected_lookup, analysis_lookup, participant_to_hpo):
+def get_qualifying_samples(row, outlier_type, affected_lookup, analysis_lookup, participant_to_hpo,
+                           population_gate_cohorts=POPULATION_P99_GATE_COHORTS):
     """Select the qualifying outlier samples for one locus and outlier type.
 
     Walking the outlier entries largest-allele-first, a sample qualifies only if
     it passes all four gates:
       1. Affected and unsolved (``is_affected_unsolved``).
       2. Above the largest unaffected/solved sample (``is_above_unaffected``).
-      3. Above every available population 99th percentile (``is_above_population_p99``).
+      3. Above every available 99th percentile of the population_gate_cohorts
+         (``is_above_population_p99``).
       4. Has at least one HPO term in ``participant_to_hpo``.
 
     The result is then deduplicated by sample_id keeping the LARGEST qualifying
@@ -300,6 +304,8 @@ def get_qualifying_samples(row, outlier_type, affected_lookup, analysis_lookup, 
         affected_lookup: Mapping of sample_id -> affected_status.
         analysis_lookup: Mapping of sample_id -> analysis_status.
         participant_to_hpo: Mapping of sample_id -> set of HPO term ids.
+        population_gate_cohorts: The cohorts whose 99th percentiles a qualifying
+            allele must exceed.
 
     Returns:
         list of (sample_id, allele_size, hpo_term_set) tuples sorted by allele
@@ -318,7 +324,7 @@ def get_qualifying_samples(row, outlier_type, affected_lookup, analysis_lookup, 
             continue
         if not is_above_unaffected(allele_size, row, outlier_type):
             continue
-        if not is_above_population_p99(allele_size, row):
+        if not is_above_population_p99(allele_size, row, population_gate_cohorts):
             continue
         hpo_term_set = participant_to_hpo.get(sample_id, set())
         if not hpo_term_set:
@@ -336,7 +342,8 @@ def get_qualifying_samples(row, outlier_type, affected_lookup, analysis_lookup, 
 
 
 def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_disease_data,
-                             affected_lookup, analysis_lookup):
+                             affected_lookup, analysis_lookup,
+                             population_gate_cohorts=POPULATION_P99_GATE_COHORTS):
     """Compute per-outlier and per-locus phenotype scores; augment records in place.
 
     For each locus record and each outlier type, the qualifying samples are
@@ -370,6 +377,8 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
             ``{gene_symbol: {disease_id: {"phenotypes": set, "inheritance": set}}}``.
         affected_lookup: Mapping of sample_id -> affected_status.
         analysis_lookup: Mapping of sample_id -> analysis_status.
+        population_gate_cohorts: The cohorts whose 99th percentiles a scored allele
+            must exceed (see ``get_qualifying_samples``).
 
     Returns:
         tuple: (per_outlier_rows, per_locus_rows), each a list of dicts matching
@@ -400,7 +409,8 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
 
         for outlier_type in OUTLIER_TYPES:
             qualifying = get_qualifying_samples(
-                row, outlier_type, affected_lookup, analysis_lookup, participant_to_hpo
+                row, outlier_type, affected_lookup, analysis_lookup, participant_to_hpo,
+                population_gate_cohorts
             )
             if not qualifying:
                 continue

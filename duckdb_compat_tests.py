@@ -424,32 +424,28 @@ class NaNParameterTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def assert_matches_sqlite(self):
-        import sqlite3
-        reference = sqlite3.connect(":memory:")
-        reference.execute("CREATE TABLE t (LocusId TEXT, p99 REAL)")
-        reference.executemany("INSERT INTO t VALUES (?, ?)",
-                              [("a", float("nan")), ("b", 5.0)])
-        for query in ("SELECT COUNT(*) FROM t WHERE p99 IS NULL",
-                      "SELECT COUNT(p99) FROM t",
-                      "SELECT COUNT(*) FROM t WHERE 3.0 > p99"):
-            self.assertEqual(self.conn.execute(query).fetchone()[0],
-                             reference.execute(query).fetchone()[0], query)
+    def assert_nan_row_is_null(self):
+        # Rows ("a", NaN) and ("b", 5.0): the NaN must be NULL, uncounted, and never larger
+        # than a real number.
+        for query, expected in (("SELECT COUNT(*) FROM t WHERE p99 IS NULL", 1),
+                                ("SELECT COUNT(p99) FROM t", 1),
+                                ("SELECT COUNT(*) FROM t WHERE 3.0 > p99", 0)):
+            self.assertEqual(self.conn.execute(query).fetchone()[0], expected, query)
 
     def test_executemany(self):
         self.conn.executemany("INSERT INTO t VALUES (?, ?)", [("a", float("nan")), ("b", 5.0)])
-        self.assert_matches_sqlite()
+        self.assert_nan_row_is_null()
 
     def test_execute(self):
         self.conn.execute("INSERT INTO t VALUES (?, ?)", ["a", float("nan")])
         self.conn.execute("INSERT INTO t VALUES (?, ?)", ["b", 5.0])
-        self.assert_matches_sqlite()
+        self.assert_nan_row_is_null()
 
     def test_numpy_nan(self):
         import numpy as np
         self.conn.executemany("INSERT INTO t VALUES (?, ?)",
                               [("a", np.float64("nan")), ("b", np.float64(5.0))])
-        self.assert_matches_sqlite()
+        self.assert_nan_row_is_null()
 
     def test_other_values_are_untouched(self):
         self.conn.executemany("INSERT INTO t VALUES (?, ?)",

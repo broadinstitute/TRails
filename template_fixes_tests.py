@@ -1,5 +1,6 @@
 """Regression tests for the HTML template findings (W15-W18, X13-X17, Y6, Y19-Y22, Z4, Z12-Z15,
-V1, V13-V15) from the code review.
+V1, V13-V15) from the code review, and for the page features ported from the analysis code
+afterwards (Group Results By, the Min Δpop filter, the #Fam column, the TRExplorer link columns).
 
 The templates are Jinja + JavaScript, so there is no Python harness that can execute them.
 These tests pin the template source text instead, which is enough to catch a silent revert of
@@ -79,6 +80,21 @@ def js_function_body(text, signature):
     return text[start:end + 3]
 
 
+def js_object_body(text, signature):
+    """Returns the source of a top-level `const <name> = {...};` JavaScript object literal.
+
+    Args:
+        text: Template source text to search.
+        signature: Start of the declaration, e.g. "const DEFAULT_STATE = {".
+
+    Returns:
+        The text from the declaration through the `};` in column zero that ends it.
+    """
+    start = text.index(signature)
+    end = text.index("\n};\n", start)
+    return text[start:end + 4]
+
+
 class TagFilterRestoreTests(unittest.TestCase):
     """Z4: the saved tag must be selected in a dropdown whose menu already exists.
 
@@ -116,7 +132,7 @@ class SortIconTests(unittest.TestCase):
     def test_all_sortable_headers_carry_a_sort_icon(self):
         template = read_template("index_page_template.html")
         headers = re.findall(r"<th[^>]*\bdata-sort=\"([^\"]+)\"[^>]*>(.*?)</th>", template)
-        self.assertEqual({"region", "size", "count", "variation_cluster"},
+        self.assertEqual({"region", "size", "count", "family_count", "variation_cluster"},
                          {field for field, _ in headers})
         for field, body in headers:
             self.assertIn('<span class="sort-icon">', body, field)
@@ -175,7 +191,7 @@ class DetailRowCellSpecificityTests(unittest.TestCase):
         # The child combinator is only equivalent for the outer cell because the row is built
         # with a single colspan td that the detail HTML is dropped into.
         template = read_template("index_page_template.html")
-        self.assertIn('<tr class="locus-detail-row"><td colspan="18"', template)
+        self.assertIn('<tr class="locus-detail-row"><td colspan="${$row.children(\'td\').length}"', template)
         self.assertEqual(1, template.count('<tr class="locus-detail-row">'))
 
     def test_the_invisible_table_rule_outranks_the_main_table_cell_rule(self):
@@ -444,9 +460,12 @@ class PopulationDataFilterGatingTests(unittest.TestCase):
             self.assertIn("require_above_population", statement)
 
     def test_the_filter_chip_is_suppressed_with_no_population_threshold(self):
-        self.assertIn("if ((key === 'population_metric' || key === 'include_loci_without_population_data')\n"
-                      "            && !currentState.require_above_population) continue;",
-                      read_template("index_page_template.html"))
+        template = read_template("index_page_template.html")
+        self.assertIn("if (key === 'include_loci_without_population_data' && !currentState.require_above_population) continue;",
+                      template)
+        # population_metric is never suppressed: the Δpop column and allele colours use it even with no
+        # population filter, so a non-default metric always changes what the table shows
+        self.assertNotIn("if (key === 'population_metric'", js_function_body(template, "function updateActiveFiltersBar("))
 
 
 class VariationClusterHelpTextTests(unittest.TestCase):
@@ -595,8 +614,10 @@ class DetailRowOuterCellTests(unittest.TestCase):
 
     def test_every_detail_cell_lookup_targets_a_direct_child(self):
         # Toggle off, the loading row's two renders, collapse one, collapse all, and the
-        # post-annotation refresh.
-        self.assertEqual(6, self.template.count(".children('td')"))
+        # post-annotation refresh, plus the two colspans (a locus detail row's and a grouped row's)
+        # that count the cells of the row they open under.
+        self.assertEqual(8, self.template.count(".children('td')"))
+        self.assertEqual(2, self.template.count("colspan=\"${$row.children('td').length}\""))
         # One slide wrapper per row: toggle off, collapse one, collapse all.
         self.assertEqual(3, self.template.count(".children('.slide-wrapper')"))
 
@@ -607,8 +628,323 @@ class DetailRowOuterCellTests(unittest.TestCase):
     def test_the_detail_row_still_has_exactly_one_direct_cell(self):
         # .children('td') is only equivalent to the intended target because the row is built
         # with a single colspan cell that the detail HTML is dropped into.
-        self.assertIn('<tr class="locus-detail-row"><td colspan="18"', self.template)
+        self.assertIn('<tr class="locus-detail-row"><td colspan="${$row.children(\'td\').length}"', self.template)
         self.assertEqual(1, self.template.count('<tr class="locus-detail-row">'))
+
+
+class ResultsTableColumnCountTests(unittest.TestCase):
+    """The results table's colspans follow its columns instead of a hard-coded count.
+
+    Adding the #Fam column took the locus table from 18 to 19 columns, and a grouped view shows a
+    header of its own, so every colspan that spans the results table is computed. The per-sample
+    sub-table's colspans use its own ${colCount}.
+    """
+
+    def setUp(self):
+        self.template = read_template("index_page_template.html")
+
+    def test_the_locus_header_and_the_locus_row_have_the_same_cells(self):
+        header = self.template[self.template.index('<tr id="locus-header-row">'):]
+        header = header[:header.index("</tr>")]
+        row = js_function_body(self.template, "function renderLocusRow(locus, rowIndex) {")
+        row = row[row.index('return `<tr class="locus-row"'):]
+        row = row[:row.index("</tr>`;")]
+        self.assertEqual(19, header.count("<th "))
+        # selectedAllelesCell, the grouped view's extra cell, is interpolated rather than literal
+        self.assertEqual(19, row.count("<td "))
+
+    def test_no_colspan_is_a_hard_coded_number(self):
+        self.assertEqual([], re.findall(r'colspan="\d+"', self.template))
+
+    def test_every_colspan_is_one_of_the_computed_counts(self):
+        self.assertEqual({"${colCount}", "${resultsTableColumnCount()}", "${$row.children('td').length}"},
+                         set(re.findall(r'colspan="([^"]+)"', self.template)))
+
+    def test_the_count_follows_whichever_header_row_is_shown(self):
+        helper = js_function_body(self.template, "function resultsTableColumnCount(")
+        self.assertIn("$('#locus-header-row') : $('#group-header-row')", helper)
+        self.assertIn("$row.children('th').length", helper)
+
+
+class FamilyCountColumnTests(unittest.TestCase):
+    """The #Fam column shows NumAffectedUnsolvedFamiliesAboveUnaffected and sorts by family_count."""
+
+    def setUp(self):
+        self.template = read_template("index_page_template.html")
+
+    def test_the_header_sorts_by_family_count_next_to_aff(self):
+        self.assertIn('#Aff<span class="sort-icon">&#8597;</span></th>\n'
+                      '                                <th class="col-fam-unsolved col-numeric" data-sort="family_count" '
+                      'title="Distinct affected, unsolved families', self.template)
+
+    def test_the_row_cell_reads_the_family_count(self):
+        row = js_function_body(self.template, "function renderLocusRow(locus, rowIndex) {")
+        self.assertIn("const nFamUnsolved = locus.NumAffectedUnsolvedFamiliesAboveUnaffected || 0;", row)
+        self.assertIn('<td class="col-aff-unsolved col-numeric" style="${affUnsolvedStyle}">${nAffUnsolved}</td>\n'
+                      '        <td class="col-fam-unsolved col-numeric" style="${famUnsolvedStyle}">${nFamUnsolved}</td>', row)
+
+    def test_the_column_has_a_width(self):
+        self.assertIn("#results-table .col-fam-unsolved { width: 55px; }", read_template("header_template.html"))
+
+    def test_the_server_accepts_the_sort(self):
+        self.assertIn('"family_count": (f"NumAffectedUnsolvedFamiliesAboveUnaffected_{ot}", "DESC")',
+                      read_template("results_server.py"))
+
+
+class MinDeltaPopFilterTests(unittest.TestCase):
+    """The Min Δpop input (min_repeats_above_population) goes through every state function.
+
+    A control missing from any one of them is silently lost: on reload (readStateFromUrl only keeps
+    DEFAULT_STATE keys), on Search (readStateFromUI), in the request (buildApiUrl), in the export
+    (performExport), on Back or a chip removal (applyStateToUI), or from the active filter chips.
+    """
+
+    def setUp(self):
+        self.template = read_template("index_page_template.html")
+
+    def test_the_input_exists(self):
+        self.assertIn('<input type="number" name="min_repeats_above_population"', self.template)
+
+    def test_every_state_function_handles_it(self):
+        self.assertIn("    min_repeats_above_population: '',",
+                      js_object_body(self.template, "const DEFAULT_STATE = {"))
+        for signature in ("function applyStateToUI(", "function readStateFromUI(", "function buildApiUrl("):
+            self.assertIn("'min_repeats_above_population'", js_function_body(self.template, signature), signature)
+        self.assertIn("params.set('min_repeats_above_population', currentState.min_repeats_above_population);",
+                      js_function_body(self.template, "async function performExport("))
+        self.assertIn("min_repeats_above_population: 'Min Δpop'",
+                      js_function_body(self.template, "function updateActiveFiltersBar("))
+
+    def test_it_makes_the_population_metric_count(self):
+        # The filter compares against the 99th % / max choice, so 'max' has to reach the API with it.
+        self.assertIn("currentState.min_repeats_above_population",
+                      js_function_body(self.template, "function populationMetricAffectsResults("))
+        for signature in ("function buildApiUrl(", "async function performExport("):
+            self.assertIn("populationMetricAffectsResults() && currentState.population_metric === 'max'",
+                          js_function_body(self.template, signature), signature)
+
+    def test_the_delta_pop_column_compares_against_the_cohorts_the_server_filters_on(self):
+        # The filter is a minimum on the Δpop column, so the column has to use the population
+        # metric and the cohorts of results_server.population_datasets_compared.
+        row = js_function_body(self.template, "function renderLocusRow(locus, rowIndex) {")
+        self.assertIn("const popMetric = currentState.population_metric === 'max' ? 'MaxAllele' : '99thPercentile';", row)
+        self.assertIn("currentState.require_above_population === 'short-read' ? ['TenK10K']", row)
+        self.assertIn("currentState.require_above_population === 'long-read' ? ['HPRC256', 'AoU1027']", row)
+        self.assertIn(": ['HPRC256', 'AoU1027', 'TenK10K'];", row)
+        self.assertIn("locus[`${p}_${popMetric}`]", row)
+        server = read_template("results_server.py")
+        self.assertIn('LONG_READ_POPULATION_DATASETS = ("HPRC256", "AoU1027")', server)
+        self.assertIn('POPULATION_DATASETS = LONG_READ_POPULATION_DATASETS + ("TenK10K",)', server)
+        self.assertIn('"short-read": ("TenK10K",),', server)
+
+    def test_it_replaces_the_min_pli_filter(self):
+        # The page no longer has a Min pLI filter (only a comment names it); the server still
+        # accepts min_pli.
+        for line in self.template.split("\n"):
+            if "min_pli" in line:
+                self.assertTrue(line.strip().startswith("//"), line)
+        self.assertIn('request.args.get("min_pli")', read_template("results_server.py"))
+
+    def test_the_swim_plot_has_no_min_pli_filter_either(self):
+        self.assertNotIn("min_pli", read_template("swim_plot_template.html"))
+
+    def test_an_old_bookmark_with_min_pli_is_normalized_in_place(self):
+        # readStateFromUrl keeps only DEFAULT_STATE keys, and then always rewrites the arrival
+        # hash in place, so a bookmark carrying min_pli neither keeps it nor traps Back.
+        read_state = js_function_body(self.template, "function readStateFromUrl(")
+        self.assertIn("if (key in DEFAULT_STATE) {", read_state)
+        self.assertIn("    replaceStateInUrl();\n\n    applyStateToUI();", read_state)
+
+    def test_the_metric_stays_in_the_url_because_the_column_uses_it(self):
+        state_hash = js_function_body(self.template, "function buildStateHash(")
+        self.assertNotIn("key === 'population_metric'", state_hash)
+
+
+class GroupResultsByTests(unittest.TestCase):
+    """The Group Results By controls go through every state function and reach the grouped API."""
+
+    def setUp(self):
+        self.template = read_template("index_page_template.html")
+        self.server = read_template("results_server.py")
+
+    def test_every_grouped_column_has_a_width(self):
+        # In the table's fixed layout an unsized column only gets the space the sized ones leave,
+        # which left Phenotype zero pixels wide at 1280px
+        header = read_template("header_template.html")
+        for column_class in set(re.findall(r"'(col-group-[a-z-]+)", self.template)):
+            self.assertRegex(header, r"#results-table \." + column_class + r"[ ,][^}]*width:", column_class)
+
+    def test_removing_the_group_sort_chip_also_restores_the_default_direction(self):
+        # Otherwise a leftover ASC from 'Sample / family id' sorts the default # of loci fewest first
+        start = self.template.index("$(document).on('click', '.filter-chip .delete', function() {")
+        handler = self.template[start:self.template.index("});", start)]
+        self.assertIn("if (key === 'group_sort') {", handler)
+        self.assertIn("currentState.group_sort_direction = GROUP_SORT_NATURAL_DIRECTIONS[DEFAULT_STATE.group_sort] || 'desc';",
+                      handler)
+
+    def test_the_nested_locus_header_is_not_sticky(self):
+        # The grouped row's locus table sits inside #results-table, whose header cells are sticky
+        self.assertIn("#results-table .group-loci-table thead th { position: static; }",
+                      read_template("header_template.html"))
+
+    def test_the_affected_quick_filter_uses_the_samples_own_status(self):
+        # Rows are colored by the #Aff rule, which counts unknown-status samples as affected-unsolved;
+        # the Affected button must still show only samples whose status is affected
+        self.assertIn("if (isAffectedStatus(s.affected_status)) rowClass += ' sample-status-affected';", self.template)
+        self.assertIn("if (filter === 'affected') $row.toggle($row.hasClass('sample-status-affected'));", self.template)
+
+    def test_the_controls_exist(self):
+        for value in ("locus", "sample", "family"):
+            self.assertIn('<input type="radio" name="group_by" value="%s"' % value, self.template)
+        for value in ("asc", "desc"):
+            self.assertIn('<input type="radio" name="group_sort_direction" value="%s"' % value, self.template)
+        self.assertIn('<div id="group-sort-dropdown" class="ui compact selection dropdown">', self.template)
+
+    def test_the_sort_menu_offers_exactly_the_server_sorts(self):
+        menu = self.template[self.template.index('<div id="group-sort-dropdown"'):]
+        menu = menu[:menu.index("</span>")]
+        server_sorts = self.server[self.server.index("GROUPED_SORTS = {"):]
+        server_sorts = server_sorts[:server_sorts.index("\n}\n")]
+        self.assertEqual(set(re.findall(r'^    "(\w+)":', server_sorts, re.MULTILINE)),
+                         set(re.findall(r'class="item" data-value="(\w+)"', menu)))
+        # The id sorts A to Z by default, as the page's GROUP_SORT_NATURAL_DIRECTIONS assumes.
+        self.assertIn('"group_id": ("group_id", "asc"),', server_sorts)
+        self.assertIn("const GROUP_SORT_NATURAL_DIRECTIONS = {group_id: 'asc'};", self.template)
+
+    def test_every_state_function_handles_them(self):
+        default_state = js_object_body(self.template, "const DEFAULT_STATE = {")
+        for line in ("group_by: 'locus',", "group_sort: 'num_loci',", "group_sort_direction: 'desc',"):
+            self.assertIn(line, default_state)
+        apply_state = js_function_body(self.template, "function applyStateToUI(")
+        self.assertIn("'require_above_population', 'group_by']", apply_state)
+        self.assertIn("setGroupSortDropdown(currentState.group_sort);", apply_state)
+        self.assertIn('input[name="group_sort_direction"][value="${currentState.group_sort_direction}"]', apply_state)
+        read_state = js_function_body(self.template, "function readStateFromUI(")
+        for name in ("group_by", "group_sort", "group_sort_direction"):
+            self.assertIn("currentState.%s = " % name, read_state)
+        labels = js_function_body(self.template, "function updateActiveFiltersBar(")
+        self.assertIn("group_by: 'Group by', group_sort: 'Group sort', group_sort_direction: 'Group sort direction',",
+                      labels)
+
+    def test_the_sort_is_left_out_of_the_url_and_the_chips_in_the_locus_view(self):
+        skip = "(key === 'group_sort' || key === 'group_sort_direction') && currentState.group_by === 'locus'"
+        self.assertIn(skip, js_function_body(self.template, "function buildStateHash("))
+        self.assertIn(skip, js_function_body(self.template, "function updateActiveFiltersBar("))
+
+    def test_search_and_export_use_the_grouped_routes(self):
+        search = js_function_body(self.template, "async function performSearch(")
+        self.assertIn("fetchWithTimeout(grouped ? buildGroupedApiUrl() : buildApiUrl())", search)
+        self.assertIn("if (grouped) renderGroupedResults(data); else renderResults(data);", search)
+        export = js_function_body(self.template, "async function performExport(")
+        # The export menu holds the formats of the table on screen, so its grouping wins over
+        # an unsearched change of the radios.
+        self.assertIn("currentState.group_by = savedState.group_by;", export)
+        self.assertIn(": buildGroupedExportUrl(format);", export)
+        self.assertIn("'/outlier_samples'", js_function_body(self.template, "function buildGroupedApiUrl("))
+        self.assertIn("'/outlier_samples/export'", js_function_body(self.template, "function buildGroupedExportUrl("))
+        self.assertIn('@app.route("/api/v1/outlier_samples")', self.server)
+        self.assertIn('@app.route("/api/v1/outlier_samples/export")', self.server)
+        self.assertIn('GROUPED_EXPORT_FORMATS = ("groups_tsv", "group_loci_tsv")', self.server)
+        for export_format in ("groups_tsv", "group_loci_tsv"):
+            self.assertIn('data-value="%s"' % export_format, self.template)
+
+    def test_a_grouped_row_expands_to_its_own_loci(self):
+        loci_url = js_function_body(self.template, "function buildGroupLociApiUrl(")
+        for name in ("affected_unsolved_outlier_family_id", "affected_unsolved_outlier_sample_id"):
+            self.assertIn("'%s'" % name, loci_url)
+            self.assertIn('"%s"' % name, self.server)
+        self.assertIn("for (const name of SAMPLE_LEVEL_FILTERS) url.searchParams.delete(name);", loci_url)
+        self.assertIn("const SAMPLE_LEVEL_FILTERS = ['sample_id_keyword', 'sample_id_like', 'phenotype_keyword'];",
+                      self.template)
+        self.assertIn('SAMPLE_LEVEL_FILTERS = ("sample_id_keyword", "sample_id_like", "phenotype_keyword")',
+                      self.server)
+
+    def test_no_grouped_url_adds_a_source(self):
+        for signature in ("function buildGroupedApiUrl(", "function buildGroupedExportUrl(",
+                          "function buildGroupLociApiUrl("):
+            self.assertNotIn("source", js_function_body(self.template, signature), signature)
+
+    def test_the_expand_handler_is_bound_to_table_cells_only(self):
+        # The grouped header row has a th with the same class, which has no row to expand.
+        self.assertIn("$(document).on('click', 'td.col-group-expand'", self.template)
+        self.assertNotIn("$(document).on('click', '.col-group-expand'", self.template)
+
+    def test_the_sorted_group_column_uses_the_one_styled_indicator_class(self):
+        self.assertIn("`${cls} sorted-active`",
+                      js_function_body(self.template, "function renderGroupedResults(data) {"))
+        self.assertIn("removeClass('sorted-active')",
+                      js_function_body(self.template, "function renderGroupLociTable(groupId, data) {"))
+
+
+class PopulationGateOptionTests(unittest.TestCase):
+    """The "All" population filter and the server's --initial-require-above-population start value."""
+
+    def setUp(self):
+        self.template = read_template("index_page_template.html")
+
+    def test_both_pages_offer_the_all_cohorts_filter_the_server_accepts(self):
+        self.assertIn('<input type="radio" name="require_above_population" value="all">', self.template)
+        self.assertIn('<input type="radio" name="swim_require_above_population" value="all">',
+                      read_template("swim_plot_template.html"))
+        self.assertIn('"all": POPULATION_DATASETS,', read_template("results_server.py"))
+
+    def test_the_server_hands_the_page_its_start_value(self):
+        self.assertIn("const INITIAL_REQUIRE_ABOVE_POPULATION = {{ initial_require_above_population | tojson }};",
+                      self.template)
+        self.assertIn('initial_require_above_population=app.config.get("INITIAL_REQUIRE_ABOVE_POPULATION", ""),',
+                      read_template("results_server.py"))
+
+    def test_it_only_applies_to_a_url_with_no_fragment_at_all(self):
+        startup = self.template[self.template.index("Promise.all([tagDropdownReady, populateSampleIdDropdown()])"):]
+        startup = startup[:startup.index("performSearch();")]
+        self.assertLess(startup.index("readStateFromUrl();"), startup.index("INITIAL_REQUIRE_ABOVE_POPULATION"))
+        self.assertIn("if (!window.location.href.includes('#') && INITIAL_REQUIRE_ABOVE_POPULATION) {", startup)
+
+    def test_the_default_state_keeps_a_bare_fragment_in_the_url(self):
+        # Otherwise removing the start filter leaves a URL with no '#', and a reload sets it again.
+        for signature in ("function writeStateToUrl(", "function replaceStateInUrl("):
+            body = js_function_body(self.template, signature)
+            self.assertIn("hash || '#'", body, signature)
+            self.assertNotIn("window.location.pathname", body, signature)
+
+
+class TRExplorerLinkTests(unittest.TestCase):
+    """Every TRExplorer locus link is built by header_template.html's buildTRExplorerUrl."""
+
+    def test_the_header_builds_the_url_with_the_chosen_columns(self):
+        helper = js_function_body(read_template("header_template.html"), "function buildTRExplorerUrl(locus) {")
+        self.assertIn("&showColumns=${encodeURIComponent(TREXPLORER_LINK_COLUMNS.join(','))}", helper)
+
+    def test_both_pages_use_it_and_build_no_url_of_their_own(self):
+        for name in ("index_page_template.html", "swim_plot_template.html"):
+            template = read_template(name)
+            self.assertIn("buildTRExplorerUrl(locus)", template, name)
+            self.assertNotIn("trexplorer.broadinstitute.org/#", template, name)
+            self.assertIn('{% include "header_template.html" %}', template, name)
+
+
+class SwimPlotMarkerTests(unittest.TestCase):
+    """The swim plot marks true/candidate tags with a filled triangle, not Chart.js's hairline star."""
+
+    def test_the_point_style_and_the_legend_agree(self):
+        template = read_template("swim_plot_template.html")
+        self.assertIn("style = 'triangle';", template)
+        self.assertNotIn("style = 'star';", template)
+        self.assertIn('<span style="margin-left: 8px;">&#9650;</span> True/Candidate', template)
+
+    def test_the_cap_note_matches_the_server_limit(self):
+        self.assertIn("const SWIM_PLOT_MAX_ALLELES_PER_MOTIF_SIZE = 500;", read_template("swim_plot_template.html"))
+        self.assertIn("ORDER BY allele_size DESC, LocusId, sample_id LIMIT 500", read_template("results_server.py"))
+
+
+class DetailPanelMotifTests(unittest.TestCase):
+    """Motifs over 30 bp are shortened in the detail panel's sample rows and affected-allele list."""
+
+    def test_both_places_use_the_shortening_helper(self):
+        detail = js_function_body(read_template("index_page_template.html"),
+                                  "function renderLocusDetail(detail, outlierType) {")
+        self.assertEqual(2, detail.count("formatMotifForDisplay(locus.Motif)"))
+        self.assertNotIn("escapeHtml(locus.Motif || '')", detail)
 
 
 if __name__ == "__main__":

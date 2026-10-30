@@ -202,5 +202,133 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
             connection.close()
 
 
+def read_counts_implied_by_affected_unsolved_outliers_table(connection):
+    """Recounts NumAffectedUnsolved{Samples,Families}AboveUnaffected from the outlier table.
+
+    Args:
+        connection: An open connection to a built result database.
+
+    Returns:
+        A dict mapping (LocusId, outlier_type) to (sample count, distinct non-NULL family
+        count), for every pair the table has rows for.
+    """
+    return {(locus_id, outlier_type): (sample_count, family_count)
+            for locus_id, outlier_type, sample_count, family_count in connection.execute(
+                f"SELECT LocusId, outlier_type, COUNT(*), COUNT(DISTINCT family_id) "
+                f"FROM {result_database.AFFECTED_UNSOLVED_OUTLIERS_TABLE} "
+                f"GROUP BY LocusId, outlier_type").fetchall()}
+
+
+class AffectedUnsolvedOutliersTableTests(unittest.TestCase):
+    """The outlier table must list exactly the samples and families the loci counts count."""
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.matrix_path = os.path.join(self.directory, "matrix.tsv")
+        self.metadata_path = os.path.join(self.directory, "samples.tsv")
+        self.db_path = os.path.join(self.directory, "result.duckdb")
+
+        # A1 and A2 share a family, A4 has no family_id, GHOST has no metadata row (so it
+        # counts as affected without a family), U1 is unaffected and U2 is solved.
+        sample_ids = ["A1", "A2", "A3", "A4", "U1", "U2", "GHOST"]
+        _write_tsv(
+            self.matrix_path,
+            ["trid", "motif", "HPRC256_99thPercentile", "AoU1027_99thPercentile",
+             "TenK10K_99thPercentile"] + sample_ids,
+            [
+                # Every affected allele is above U1's 40, and above the long-read 99th
+                # percentiles (max 30), but only A1, GHOST and A2 are above TenK10K's 52.
+                # Every ShortAlleles allele is 5, a tie with U1, so that count is 0.
+                ["chr1-1000-1030-CAG", "CAG", "20", "30", "52",
+                 "5,60", "5,55", "5,50", "5,45", "5,40", "5,35", "5,58"],
+                # U1 carries the largest allele, so no sample is above every unaffected.
+                ["chr2-2000-2020-AT", "AT", "", "", "",
+                 "10,30", "10,12", "10,12", "10,12", "10,31", "10,12", "10,12"],
+                # Hemizygous A1 and A3 are above U1 and HPRC256's 25; only A1 is above TenK10K's 39.
+                ["chrX-3000-3010-CG", "CG", "25", "", "39",
+                 "40", "8,9", "38", "8,9", "20", "8,9", "8,9"],
+            ])
+        _write_tsv(
+            self.metadata_path,
+            ["sample_id", "sex", "family_id", "affected_status", "analysis_status"],
+            [
+                ["A1", "male", "FAM_A", "affected", "unsolved"],
+                ["A2", "female", "FAM_A", "affected", "unsolved"],
+                ["A3", "male", "FAM_B", "affected", "unsolved"],
+                ["A4", "female", "", "affected", "partially solved"],
+                ["U1", "male", "FAM_C", "unaffected", "unaffected"],
+                ["U2", "female", "FAM_D", "affected", "solved"],
+            ])
+
+    def tearDown(self):
+        for name in os.listdir(self.directory):
+            os.remove(os.path.join(self.directory, name))
+        os.rmdir(self.directory)
+
+    def build_and_read(self, **build_arguments):
+        """Builds the database and returns (stored counts, counts implied by the table, gate cohorts).
+
+        The stored counts map (LocusId, outlier_type) to the loci table's
+        (NumAffectedUnsolvedSamplesAboveUnaffected, NumAffectedUnsolvedFamiliesAboveUnaffected).
+        """
+        build_database.build(self.matrix_path, self.metadata_path, self.db_path, **build_arguments)
+        connection = duckdb_compat.connect(self.db_path)
+        try:
+            stored_counts = {}
+            for outlier_type in analysis_columns.OUTLIER_TYPES:
+                for locus_id, sample_count, family_count in connection.execute(
+                        f"SELECT LocusId, NumAffectedUnsolvedSamplesAboveUnaffected_{outlier_type}, "
+                        f"NumAffectedUnsolvedFamiliesAboveUnaffected_{outlier_type} FROM loci").fetchall():
+                    stored_counts[(locus_id, outlier_type)] = (sample_count, family_count)
+            return (stored_counts, read_counts_implied_by_affected_unsolved_outliers_table(connection),
+                    result_database.read_population_gate_cohorts(connection))
+        finally:
+            connection.close()
+
+    def assert_table_agrees_with_counts(self, stored_counts, counts_implied_by_table):
+        """Checks every (locus, outlier type), the way add_affected_unsolved_outliers_table.py does."""
+        self.assertEqual(len(stored_counts), 3 * len(analysis_columns.OUTLIER_TYPES))
+        for key, (sample_count, family_count) in stored_counts.items():
+            # A NULL count (no outlier list) and a count of 0 both mean no rows.
+            self.assertEqual(counts_implied_by_table.get(key, (0, 0)),
+                             (sample_count or 0, family_count or 0), key)
+        self.assertLessEqual(set(counts_implied_by_table), set(stored_counts))
+
+    def test_default_gate_table_agrees_with_counts(self):
+        stored_counts, counts_implied_by_table, population_gate_cohorts = self.build_and_read()
+        self.assert_table_agrees_with_counts(stored_counts, counts_implied_by_table)
+        self.assertEqual(population_gate_cohorts, ("HPRC256", "AoU1027"))
+        self.assertEqual(stored_counts[("chr1-1000-1030-CAG", "AllAlleles")], (5, 2))
+        self.assertEqual(stored_counts[("chr1-1000-1030-CAG", "ShortAlleles")], (0, 0))
+        self.assertEqual(stored_counts[("chr1-1000-1030-CAG", "HemizygousAlleles")], (None, None))
+        self.assertEqual(stored_counts[("chr2-2000-2020-AT", "AllAlleles")], (0, 0))
+        self.assertEqual(stored_counts[("chrX-3000-3010-CG", "HemizygousAlleles")], (2, 2))
+
+    def test_tenk10k_gate_table_agrees_with_counts(self):
+        stored_counts, counts_implied_by_table, population_gate_cohorts = self.build_and_read(
+            population_gate_cohorts=("HPRC256", "AoU1027", "TenK10K"))
+        self.assert_table_agrees_with_counts(stored_counts, counts_implied_by_table)
+        self.assertEqual(population_gate_cohorts, ("HPRC256", "AoU1027", "TenK10K"))
+        self.assertEqual(stored_counts[("chr1-1000-1030-CAG", "AllAlleles")], (3, 1))
+        self.assertEqual(stored_counts[("chrX-3000-3010-CG", "HemizygousAlleles")], (1, 1))
+
+    def test_table_rows_carry_family_and_largest_allele(self):
+        self.build_and_read()
+        connection = duckdb_compat.connect(self.db_path)
+        try:
+            rows = connection.execute(
+                f"SELECT * FROM {result_database.AFFECTED_UNSOLVED_OUTLIERS_TABLE} "
+                f"WHERE LocusId = 'chr1-1000-1030-CAG' ORDER BY sample_id").fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(rows, [
+            ("chr1-1000-1030-CAG", "AllAlleles", "A1", "FAM_A", 60),
+            ("chr1-1000-1030-CAG", "AllAlleles", "A2", "FAM_A", 55),
+            ("chr1-1000-1030-CAG", "AllAlleles", "A3", "FAM_B", 50),
+            ("chr1-1000-1030-CAG", "AllAlleles", "A4", None, 45),
+            ("chr1-1000-1030-CAG", "AllAlleles", "GHOST", None, 58),
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()
