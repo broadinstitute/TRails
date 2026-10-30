@@ -1677,7 +1677,7 @@ def build_api_where_clause(params):
         # means a literal underscore, not ILIKE's single-character wildcard.
         kw_clauses = [
             f"len(list_filter(string_split(OutlierSampleIds_{ot}, ','),"
-            f" entry -> split_part(entry, ':', 2) ILIKE ? ESCAPE '\\')) > 0"
+            f" lambda entry: split_part(entry, ':', 2) ILIKE ? ESCAPE '\\')) > 0"
             for _ in params["sample_id_like"]
         ]
         clauses.append(f"({' OR '.join(kw_clauses)})")

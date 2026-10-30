@@ -12,8 +12,8 @@ TRails loads tandem-repeat genotypes + sample metadata and provides an interacti
   sample metadata are never sent to any remote server or third party. 
 - **Supports short-read or long-read TR genotypes.** TRails only needs repeat copy-numbers and 
   sample metadata in TSV format.
-- **Interactive outlier search** Filter by population allele frequencies, gene regions, motif categories, etc. Sort by allele size, outlier count, and
-  more.
+- **Interactive outlier search** Filter by population allele sizes (HPRC256, All of Us and TenK10K, from TRExplorer), gene regions, motif categories, etc. Sort by allele size, outlier count, and
+  more. Group the results by unsolved affected sample or family.
 - **Tagging** Define custom tags to mark specific search results as Candidates, Reviewed, etc.  
 - **Phenotype-aware prioritization** — rank loci based on the similarity of HPO terms among outlier sample(s) with each other as well as with the gene's known disease phenotype.
 - **Sample QC** flags samples that have an excess of large expansions, or of inheritance-inconsistent genotypes.
@@ -23,22 +23,27 @@ TRails loads tandem-repeat genotypes + sample metadata and provides an interacti
 
 ## Install
 
-`install.sh` requires python3 and downloads TRails + public reference data into `./TRails`:
+`install.sh` needs python3 (3.9 or newer), curl and tar. It downloads TRails into `./TRails`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/broadinstitute/TRails/main/install.sh | bash
 ```
 
-It installs the Python dependencies and fetches the public reference data. It is
-**self-updating** and always safe to re-run: re-run the same line any time to update (an
-up-to-date install is a no-op; an interrupted download is discarded and restarts from the
-beginning). Updating only replaces the files the installer itself shipped, so your databases,
-input tables and `reference_data/` cache stay in place. Optional environment variables:
-`TRAILS_INSTALL_DIR` (install location; default `./TRails`), `TRAILS_FORCE=1` (force
-re-download).
+It creates a Python virtual environment in `./TRails/.venv`, installs the Python dependencies
+into it (never into your system Python), and downloads the public reference data described
+below. A first install takes about a minute on a fast connection, downloads about 1 GB (mostly
+TRExplorer's catalog table, which it reduces to a 500 MB local file) and uses about 850 MB of
+disk. It is **self-updating** and always safe to re-run: re-run the same line any time to
+update (an up-to-date install is a no-op; an interrupted download is discarded and restarts
+from the beginning). Updating only replaces the files the installer itself shipped, so your
+databases, input tables, `reference_data/` cache and `.venv/` stay in place. Optional
+environment variables: `TRAILS_INSTALL_DIR` (install location; default `./TRails`),
+`TRAILS_FORCE=1` (force re-download).
 
 From an existing checkout, `./install.sh` does the same minus the self-download. You can also
-skip `install.sh` entirely — `trails.py` installs anything missing on first run.
+skip `install.sh` entirely: `trails.py` creates the virtual environment, installs the
+dependencies and downloads the reference data on first run. On Debian or Ubuntu, creating the
+virtual environment needs the `python3-venv` package.
 
 ## Quickstart
 
@@ -51,27 +56,31 @@ python3 trails.py \
     [--phenotypes-table        your_phenotypes.tsv.gz]
 ```
 
-It: (1) installs any missing dependencies, (2) downloads any missing
-public reference data, (3) builds the local DuckDB database (or reuses it if your inputs are
-unchanged — pass `--rebuild` to force), and (4) starts the local server. Open the printed
-URL in your web browser to begin your analysis using TRails interface. 
+It: (1) runs itself with the Python of TRails' virtual environment, installing any missing
+dependencies there, (2) downloads any missing public reference data, (3) builds the local
+DuckDB database (or reuses it if your inputs are unchanged; pass `--rebuild` to force), and
+(4) starts the local server. Open the printed URL in your web browser to begin your analysis
+using TRails interface.
 
 Useful `trails.py` flags: 
 `--rebuild` (force a rebuild), `--port` / `--host`, `-n / --n-loci N` (limit to the first N
 loci, for a quick test), `--population-gate-cohorts` (the population cohorts whose 99th
 percentiles an affected allele must exceed to count in the #Aff / #Fam columns and the
 phenotype scores: comma-separated `HPRC256`, `AoU1027`, `TenK10K`; default `HPRC256,AoU1027`.
-Add `TenK10K` for a short-read callset. The percentiles are read from the
-`HPRC256_99thPercentile` / `AoU1027_99thPercentile` / `TenK10K_99thPercentile` columns of the
-repeat-copy-numbers TSV, when present. Changing it rebuilds the database),
+Add `TenK10K` for a short-read callset. The percentiles come from TRExplorer, unless your
+repeat-copy-numbers TSV supplies its own `HPRC256_99thPercentile` / `AoU1027_99thPercentile` /
+`TenK10K_99thPercentile` columns. Changing it rebuilds the database),
 `--initial-require-above-population long-read|short-read|all` (the population filter the page
-starts with when it is opened with no saved filters, e.g. `all` for a short-read callset).
+starts with when it is opened with no saved filters, e.g. `all` for a short-read callset),
+`--gene-table PATH` (use your own gene-disease table instead of the downloaded one).
 
 ## Inputs
 
 TRails reads **two** tables you supply (a third is optional). **Only a handful of columns are
 required — almost everything is optional, and any missing optional column simply disables the
-feature that depends on it rather than causing an error.** Full schemas and the generated
+feature that depends on it rather than causing an error.** Everything else (population
+statistics, gene annotations, the gene-disease table, known disease loci) is downloaded for
+you; see [Reference data](#reference-data-downloaded-for-you). Full schemas and the generated
 database tables are documented in [docs/INPUT_FORMATS.md](docs/INPUT_FORMATS.md).
 
 ### 1. Repeat copy numbers TSV — `--repeat-copy-numbers-tsv`  *(required)*
@@ -96,6 +105,14 @@ chrX-148500631-148500691-GCC    GCC     21         20,21      45
 > This is a per-allele genotype matrix from any TR genotyping tool. `trails.py` reads it
 > directly into the local database — no intermediate files are written (see
 > [docs/INPUT_FORMATS.md](docs/INPUT_FORMATS.md)).
+
+Coordinates are GRCh38 (hg38). Each locus is matched to TRExplorer's repeat catalog to pick up
+its population statistics and annotations: by `trid` when TRExplorer has the same locus id
+(a `chr` prefix is ignored), which is the case for loci genotyped with the TRExplorer catalog,
+and otherwise by overlapping coordinates with a matching motif. The build prints how many loci
+matched. You may also add annotation columns, such as `gene_id` or `HPRC256_99thPercentile`, to
+this table; values you supply win over TRExplorer's (see
+[docs/INPUT_FORMATS.md](docs/INPUT_FORMATS.md)).
 
 ### 2. Sample metadata TSV — `--sample-metadata-tsv`  *(required)*
 
@@ -140,26 +157,30 @@ PMGRC-1-1-0      HP:0001250    Seizure
 
 Extra columns (e.g. `age_of_onset`, `modifier`) are accepted and ignored.
 
-### Optional licensed reference inputs  *(not bundled)*
+## Reference data (downloaded for you)
 
-This improves annotation but is license-restricted, so TRails never downloads it; pass
-your own copy only if you have an OMIM API key. If absent, the dependent annotations will be omitted.
+`install.sh` and `trails.py` download these public files into `reference_data/`, once. A
+download that fails (e.g. offline) only leaves the columns that depend on it empty.
 
-| Input | Flag | Restriction |
-|-------|------|-------------|
-| gene–disease + phenotype-summary table | `--gene-table` | OMIM/HPO-derived |
+| Data | Source | Used for |
+|------|--------|----------|
+| Population statistics, gene region, variation clusters | [TRExplorer](https://trexplorer.broadinstitute.org) repeat catalog v2.1, hg38 | population filters, Δpop, σ percentile, the #Aff / #Fam population gate, gene-region filters |
+| Gene-disease table | [genelookup](https://genelookup.broadinstitute.org), without OMIM's licensed columns | gene symbol, inheritance, pLI, disease phenotype summary, gene-level phenotype scoring. Refreshed only with `TRAILS_FORCE=1`; override with `--gene-table` |
+| HPO `genes_to_phenotype.txt` | Human Phenotype Ontology release v2025-05-06 | phenotype scoring |
+| Known disease loci | [str-analysis](https://github.com/broadinstitute/str-analysis) variant catalog and [STRchive](https://github.com/dashnowlab/STRchive) | known-disease-locus flags, pathogenic thresholds |
 
 ## Dependencies
 
-- **python3** (3.8+) and **pip**. The one-line installer additionally needs **curl** and
-  **tar** (standard on macOS/Linux). No other system packages are required.
-- **Required Python packages**: the contents of `requirements.txt`, installed by `install.sh`
-  and by `trails.py` on first run. If any of them is still missing after the install, the run
-  stops with an error.
+- **python3** (3.9+) with its `venv` module (on Debian or Ubuntu, the `python3-venv` package).
+  The one-line installer additionally needs **curl** and **tar** (standard on macOS/Linux). No
+  other system packages are required.
+- **Required Python packages**: the contents of `requirements.txt`, installed into
+  `.venv/` by `install.sh` and by `trails.py` on first run. If any of them is still missing
+  after the install, the run stops with an error.
   - `flask` — the local web server
   - `pandas`, `numpy` — the analysis pipeline
   - `intervaltree` — interval overlap lookups
-  - `duckdb` (>= 1.0), the result-database engine (only `duckdb_compat.py` imports it)
+  - `duckdb` (>= 1.3), the result-database engine (only `trails/duckdb_compat.py` imports it)
 - **Optional Python packages**: **not** in `requirements.txt`. `install.sh` and `trails.py`
   install them separately, by name, and a failure here is only a printed note, never an error:
   - `pyhpo` — HPO term similarity (phenotype scoring falls back to Jaccard without it)
@@ -167,19 +188,31 @@ your own copy only if you have an OMIM API key. If absent, the dependent annotat
     the standard library)
 
   `trails.py` attempts the optional install once and then writes a
-  `.trails_optional_deps_attempted` marker file next to itself, so a package that will not build
-  on your machine does not make every later run re-try it. Delete that file to retry.
+  `.trails_optional_deps_attempted` marker file in the TRails directory, so a package that will
+  not build on your machine does not make every later run re-try it. Delete that file to retry.
 
   TRails is otherwise self-contained — it has no other third-party runtime dependency (the
   motif and locus-id utilities are built in, not pulled from an external package).
 
 You normally never install these by hand — `install.sh` and `trails.py` do it for you. To
-install manually, do what they do (the second line is optional):
+install manually, do what they do, from the TRails directory (the last line is optional):
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 -m pip install pyhpo requests
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install pyhpo requests
 ```
+
+## Code layout and tests
+
+- `trails.py`: the command you run. It hands over to `trails/trails_launcher.py`.
+- `trails/`: the code: the database build (`build_database.py` and the modules it imports),
+  the results server (`results_server.py`) and its page templates (`*_template.html`), and the
+  reference-data download (`trails_setup.py`).
+- `tests/`: unit tests. Run them from the TRails directory with
+  `python3 -m unittest discover -p '*tests.py'`.
+- `docs/INPUT_FORMATS.md`: input and database schemas.
+- `install.sh`: the installer. `reference_data/` and `.venv/` are created by the install.
 
 ## License
 

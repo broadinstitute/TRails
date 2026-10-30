@@ -568,6 +568,24 @@ def add_derived_locus_columns(locus_records, source_label="", repeat_copy_number
     return locus_records
 
 
+def add_population_stdev_percentile_columns(locus_records):
+    """Add HPRC256_StdevPercentile and AoU1027_StdevPercentile, which the sigma filters read.
+
+    Each is the locus's rank among loci with the same motif by population standard deviation,
+    divided by the number of such loci: {cohort}_StdevRankByMotif /
+    {cohort}_StdevRankTotalNumberByMotif. A locus without both values keeps whatever it has.
+
+    Args:
+        locus_records: Per-locus dicts. Mutated in place.
+    """
+    for record in locus_records:
+        for cohort in ("HPRC256", "AoU1027"):
+            rank = record.get(f"{cohort}_StdevRankByMotif")
+            total = record.get(f"{cohort}_StdevRankTotalNumberByMotif")
+            if rank is not None and total:
+                record[f"{cohort}_StdevPercentile"] = rank / total
+
+
 def compute_is_known_motif(canonical_motif, known_canonical_motifs):
     """Return 1 if a canonical motif is a known disease motif, else 0.
 

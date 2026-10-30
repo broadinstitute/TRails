@@ -5,4 +5,4 @@ flask            # the local results server
 pandas           # TSV I/O + the dataframes the analysis pipeline passes around
 numpy            # numeric helpers used by the analysis columns
 intervaltree     # interval-overlap lookups for known-disease-locus matching
-duckdb>=1.0      # the result-database engine; >=1.0 for the stable on-disk format
+duckdb>=1.3      # the result-database engine; >=1.3 for the "lambda x: ..." syntax DuckDB 2.0 requires

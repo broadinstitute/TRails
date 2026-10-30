@@ -1,7 +1,7 @@
 # TRails input formats
 
 This documents every input TRails reads, how to produce the ones you must supply, and which
-inputs are public vs. licensed vs. your own data. **Only a few columns are required; almost
+inputs TRails downloads for you vs. which are your own data. **Only a few columns are required; almost
 everything is optional — a missing optional column disables just the feature that depends on
 it, never the whole run.** Column-name matching for the fixed/known columns is
 **case-insensitive and underscore-insensitive** across every TSV input (`sample_id` ≡
@@ -12,13 +12,12 @@ still join exactly. Schemas were derived from the live analysis code.
 
 | Class | Meaning | Examples | TRails behavior |
 |-------|---------|----------|-----------------|
-| **A** | Public, auto-fetchable | HPO `genes_to_phenotype.txt`; public repeat catalog; STRchive | downloaded into `reference_data/` by `install.sh` / `trails.py` |
-| **B** | Licensed / controlled-access | gene–disease + phenotype-summary table | NEVER bundled; **optional** — pass `--gene-table` only if you are licensed |
+| **A** | Public, auto-fetchable | TRExplorer population statistics and locus annotations; genelookup gene table; HPO `genes_to_phenotype.txt`; known-disease-locus catalogs | downloaded into `reference_data/` by `install.sh` / `trails.py` |
 | **C** | Your own cohort data | repeat-copy-numbers TSV; sample-metadata & phenotype TSVs; the generated result DB | NEVER bundled; you supply these |
 
-TRails must start and run with class A only. Every class-B input is guarded so its absence
-degrades gracefully (the dependent columns/annotations become NULL/disabled) rather than
-crashing.
+Your class C tables plus the class A downloads are everything TRails needs. A class A download
+that fails (e.g. offline) only leaves the columns that depend on it empty; the build still runs.
+All coordinates are GRCh38 (hg38).
 
 ---
 
@@ -44,6 +43,17 @@ chrX-148500631-148500691-GCC    GCC     21         20,21      45
 | one column per sample | **≥1 required** | header = `sample_id`; cell = comma-separated per-allele repeat copy numbers |
 | optional annotation columns | optional | recognized per-locus annotation columns annotate the locus instead of being read as samples; most are written to the loci table, a few are always recomputed — see below |
 
+**Annotations from TRExplorer.** You do not need to supply any annotation: each locus gets the
+population statistics (`HPRC256_*`, `AoU1027_*`, `TenK10K_*`), Gencode gene id and region,
+variation cluster and reference-repeat fields of its locus in TRExplorer's repeat catalog
+(class A, below). A locus matches the TRExplorer locus with the same id, ignoring a `chr`
+prefix; otherwise the TRExplorer locus whose interval overlaps it with a Jaccard similarity
+(intersection over union) of at least 0.66 and whose motif matches (the same canonical motif for
+1-6 bp motifs, the same motif length for 7 bp or longer), preferring the largest HPRC256, then
+AoU1027, standard deviation. `TRExplorerLocusId` and `TRExplorerLocusJaccardSimilarity` record
+the match. A locus with no match keeps these columns empty. The build prints how many loci
+matched by id, by overlap, or not at all.
+
 **Optional per-locus annotation columns.** You may add extra columns to the matrix that
 annotate the *locus* rather than a sample; they are recognized by name (case-, underscore- and
 space-insensitive) and are not treated as samples. Any header that is **not** recognized by one
@@ -51,7 +61,8 @@ of the two rules below is treated as a sample, so check this list before naming 
 
 Being recognized is not the same as being kept: some of these columns are always recomputed by
 the build from `trid` and `motif`, and whatever you supply for them is silently replaced. The
-"Value you supply" column below says which is which.
+"Value you supply" column below says which is which. A kept value wins over TRExplorer's:
+TRExplorer fills only the columns your matrix leaves empty.
 
 *Rule 1: recognized by exact name.* The full set, grouped by what it annotates:
 
@@ -59,7 +70,7 @@ the build from `trid` and `motif`, and whatever you supply for them is silently 
 |-------|--------------------|------------------|
 | gene | `gene_id` / `GencodeGeneId`, `gene_region` / `GencodeGeneRegion` | **kept.** The `Gencode*` alias is used only when the plain name is absent |
 | gene | `gene_region_rank` | **discarded.** Always recomputed from `gene_region`, so the rank can never disagree with the region stored beside it (the results table sorts gene regions by this rank while displaying `gene_region`). Supply it only to keep the header out of the sample list; the build prints one line saying how many supplied values it ignored |
-| gene | `IsInMendelianGene` | **kept only without `--gene-table`.** With a gene table it is recomputed from `gene_id` |
+| gene | `IsInMendelianGene` | **kept only without a gene table.** With one (genelookup's is downloaded by default) it is recomputed from `gene_id` |
 | locus coordinates / motif | `Chrom`, `Start0Based`, `End1Based`, `MotifSize`, `CanonicalMotif` | **discarded.** Always recomputed from `trid` and `motif`. Supply them only to keep those headers out of the sample list |
 | locus coordinates / motif | `ReferenceRegion`, `NumRepeatsInReference` | **kept.** Derived from the coordinates and motif only when absent |
 | known-locus flags | `KnownDiseaseLocus`, `IsKnownMotif` | **kept only without a known-loci catalog** (`--known-loci-json` / STRchive). With a catalog the catalog wins |
@@ -84,7 +95,8 @@ specific cohort/version tokens (not the bare cohort abbreviation), so a sample g
 e.g. `AoU_0001` is still read as a sample.
 
 *Population gate.* The `HPRC256_99thPercentile`, `AoU1027_99thPercentile` and
-`TenK10K_99thPercentile` columns also gate the precomputed `NumAffectedUnsolved*` counts (the
+`TenK10K_99thPercentile` columns (TRExplorer's, unless your matrix supplies them) also gate the
+precomputed `NumAffectedUnsolved*` counts (the
 #Aff / #Fam columns), the `affected_unsolved_outliers_above_unaffected` table and the phenotype
 scores: an affected allele counts only when it is larger than the 99th percentile of every
 cohort named by `--population-gate-cohorts` that has a value at the locus. The default is
@@ -96,11 +108,11 @@ table, and `trails.py` rebuilds the database when the flag changes.
 
 Both rules live in one place in the code, which is the source of truth if this table ever falls
 behind: `ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED` and `ANNOTATION_COLUMN_PREFIXES` in
-`input_tables.py` (applied by `_is_annotation_column`).
+`trails/input_tables.py` (applied by `_is_annotation_column`).
 
-In particular, supplying a `gene_id` column is what lets the optional `--gene-table` populate
-the gene-symbol / inheritance / pLI / disease-category columns and enables gene-level phenotype
-scoring.
+In particular, a locus's `gene_id` (TRExplorer's Gencode gene id, or your own column) is what
+joins it to the gene table, which populates the gene-symbol / inheritance / pLI /
+phenotype-summary columns and enables gene-level phenotype scoring.
 
 This is a per-allele genotype matrix from **any** TR genotyping tool — short-read or long-read
 (TRGT, ExpansionHunter, straglr, LongTR, …). TRails only needs the per-allele repeat copy
@@ -174,14 +186,14 @@ documented here only as the internal data model, for contributors. Each record c
 **Optional annotation keys** (absent ⇒ the matching output column is NULL): `CanonicalMotif`,
 `Gencode*` (`GencodeGeneId`/`GencodeGeneRegion`/…), reference-quality fields, `TRExplorer*`,
 RepeatMasker intervals, and per-cohort population-stat columns (`HPRC256_*`, `AoU1027_*`,
-`TenK10K_*`). These come from an upstream annotation step; supply them only if you have them.
+`TenK10K_*`). These come from TRExplorer's catalog, or from annotation columns of your matrix.
 `VariantType` is **not** read by the pipeline (the server synthesizes it only for the
 ExpansionHunter export) — optional/ignored.
 
 ### 5. Generated result database  *(server input; built for you)*
 
 `trails.py` builds a single `*.with_analysis_columns.duckdb` (DuckDB) and points the server at
-it (`results_server.py --db <path>`). You don't author it. It contains 6 tables, plus the two
+it (`trails/results_server.py --db <path>`). You don't author it. It contains 6 tables, plus the two
 optional Mendelian-QC tables of section 6:
 
 | Table | Contents |
@@ -222,13 +234,5 @@ is uploaded.
 | `genes_to_phenotype.txt` | `--genes-to-phenotype` | Human Phenotype Ontology annotation release (github.com/obophenotype/human-phenotype-ontology) |
 | `variant_catalog_without_offtargets.GRCh38.json` | `--known-loci-json` | public `str-analysis` repo (github.com/broadinstitute/str-analysis) |
 | STRchive disease-locus table (`STRchive-loci.json`) | `--strchive-loci-json` | github.com/dashnowlab/STRchive, downloaded from a built-in default URL and cached locally by the installer (offline-safe); pass the flag to pin your own copy |
-
----
-
-## Class B — licensed / controlled-access (optional, user-supplied)
-
-| Input | Flag | Restriction |
-|-------|------|-------------|
-| gene–disease + phenotype-summary table | `--gene-table` | OMIM/HPO-derived; the gene-symbol / inheritance / pLI / disease-category / phenotype-summary columns and gene-level phenotype scoring degrade without it |
-
-If you don't pass this, TRails still runs — only the dependent columns/annotations are omitted.
+| TRExplorer population statistics and locus annotations (`TRExplorer_v2.1.hg38.annotations.duckdb`) | none | TRExplorer repeat catalog v2.1, hg38 (gs://tandem-repeat-catalog). The installer downloads the annotated catalog table (about 900 MB), keeps the columns TRails uses in this file (about 500 MB) and deletes the download. See "Annotations from TRExplorer" above |
+| gene-disease table (`genelookup_gene_table.tsv.gz`) | `--gene-table` | genelookup.broadinstitute.org, exported through its query service: gene id and symbol, aliases, pLI, LoF O/E upper bound, HGNC id, inheritance, LLM phenotype summary and sources. OMIM's licensed columns are not included (genelookup does not export them). Not versioned, so it is downloaded once and refreshed only with `TRAILS_FORCE=1 ./install.sh` or `trails/trails_setup.py --force`; pass `--gene-table` to use your own table instead |

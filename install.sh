@@ -10,11 +10,13 @@
 #   1. If not run from a checkout, downloads + extracts TRails into ./TRails (curl + tar,
 #      no git). Re-running seamlessly UPDATES to the latest $TRAILS_VERSION; an up-to-date
 #      copy is reused. Idempotent (a partial download is discarded and refetched).
-#   2. Installs Python deps (requirements.txt).
-#   3. Downloads PUBLIC (class-A) reference data into reference_data/ (skips files already
-#      present at the currently pinned version; a download is atomic, not resumable, and a
-#      failure is non-fatal). Licensed/controlled (class B) and your own (class C) data are
-#      NEVER fetched — TRails runs without them; supply your own via CLI flags.
+#   2. Creates TRails' own Python virtual environment in .venv/ and installs the Python deps
+#      (requirements.txt) into it.
+#   3. Downloads PUBLIC (class-A) reference data into reference_data/: the HPO and
+#      known-disease-locus files, TRExplorer's population statistics and locus annotations
+#      (about 900 MB downloaded, about 500 MB kept), and genelookup's gene table. Skips files
+#      already present at the currently pinned version; a download is atomic, not resumable,
+#      and a failure is non-fatal. Your own (class C) data is never fetched.
 #      See docs/INPUT_FORMATS.md.
 #
 # Env knobs: TRAILS_REPO=owner/name  TRAILS_VERSION=<branch|tag|commit>  TRAILS_INSTALL_DIR=./TRails
@@ -167,13 +169,27 @@ TRAILS_DIR="$(pwd)"   # resolve to absolute so a relative INSTALL_DIR (e.g. ./TR
 REF_DIR="$TRAILS_DIR/reference_data"
 mkdir -p "$REF_DIR"
 
-# --- Python dependencies ------------------------------------------------------------
+# --- Python virtual environment and dependencies ------------------------------------
+# Everything is installed into TRails' own virtual environment, .venv/, never into the python3 on
+# the PATH: recent Homebrew and Linux system Pythons refuse pip installs outside a virtual
+# environment ("externally-managed-environment"). trails.py re-runs itself with .venv's Python.
+# An environment whose base Python has since been removed (e.g. by a Homebrew upgrade) no longer
+# starts, so it is rebuilt.
+VENV_PYTHON="$TRAILS_DIR/.venv/bin/python"
+if ! "$VENV_PYTHON" -c "import sys" >/dev/null 2>&1; then
+  echo "Creating a Python virtual environment in $TRAILS_DIR/.venv ..."
+  python3 -m venv --clear "$TRAILS_DIR/.venv" || {
+    echo "ERROR: could not create a Python virtual environment. On Debian or Ubuntu, install the" >&2
+    echo "       python3-venv package (e.g. sudo apt install python3-venv) and re-run." >&2
+    exit 1
+  }
+fi
 echo "Installing Python dependencies..."
-python3 -m pip install -r "$TRAILS_DIR/requirements.txt"   # flask, pandas, numpy, intervaltree, duckdb
+"$VENV_PYTHON" -m pip install -r "$TRAILS_DIR/requirements.txt"   # flask, pandas, numpy, intervaltree, duckdb
 # pyhpo only sharpens phenotype scoring (phenotype_scoring falls back to Jaccard without it), so a
 # failure here must not abort the install the way a required dependency would. Installed by name
 # rather than from a requirements file, so it cannot fail the required set alongside it.
-python3 -m pip install pyhpo requests \
+"$VENV_PYTHON" -m pip install pyhpo requests \
   || echo "  note: optional packages not installed; phenotype scoring will use Jaccard
           similarity and the opt-in STRchive fetch will be unavailable"
 echo ""
@@ -185,11 +201,8 @@ echo ""
 REMOTE_FLAG=""; [[ "${TRAILS_REMOTE:-0}" == "1" ]] && REMOTE_FLAG="--remote"
 FORCE_FLAG="";  [[ "${TRAILS_FORCE:-0}"  == "1" ]] && FORCE_FLAG="--force"
 echo "Class A (public, fetched):"
-python3 "$TRAILS_DIR/trails_setup.py" fetch --dir "$REF_DIR" $REMOTE_FLAG $FORCE_FLAG
+"$VENV_PYTHON" "$TRAILS_DIR/trails/trails_setup.py" fetch --dir "$REF_DIR" $REMOTE_FLAG $FORCE_FLAG
 
-echo ""
-echo "Class B (licensed / controlled-access — NOT fetched; supply your own if licensed):"
-echo "  - gene-disease table  -> pass via --gene-table PATH        (OMIM/HPO-derived)"
 echo ""
 echo "Class C (your own data — NOT fetched; see docs/INPUT_FORMATS.md):"
 echo "  - repeat-copy-numbers TSV, sample-metadata TSV, optional phenotype TSV"

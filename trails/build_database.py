@@ -20,7 +20,10 @@ fully-tested unit):
   3. ``input_tables.read_phenotypes``            -> participant -> HPO terms (optional)
   4. ``input_tables.read_gene_table`` + ``read_gene_disease_phenotypes`` (optional)
   5. ``allele_histograms.build_histograms_and_outliers`` -> per-locus records
-  6. ``locus_annotations.add_derived_locus_columns``     -> coordinate / motif columns
+  6. ``locus_annotations.add_derived_locus_columns``     -> coordinate / motif columns, then
+     ``trexplorer_annotations.add_trexplorer_annotations`` -> population statistics, gene
+     region, variation cluster (for columns the matrix left empty), then
+     ``locus_annotations.add_population_stdev_percentile_columns``
   7. known-disease-locus match + ``CanonicalMotif`` + ``IsKnownMotif`` + ``IsInMendelianGene``
   8. ``analysis_columns.add_gene_columns``               -> pLI / inheritance
   9. ``analysis_columns.add_all_outlier_columns``        -> the affected/unaffected analysis
@@ -48,6 +51,7 @@ import mendelian_qc
 import phenotype_scoring
 import result_database
 import swim_plot
+import trexplorer_annotations
 
 
 def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
@@ -55,7 +59,8 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
           known_loci_json=None, n_loci=None, skip_phenotype_scores=False,
           source_label="", fetch_strchive=False, mendelian_threshold=2,
           n_outlier_sample_ids=10, strchive_loci_json=None,
-          population_gate_cohorts=analysis_columns.POPULATION_P99_GATE_COHORTS):
+          population_gate_cohorts=analysis_columns.POPULATION_P99_GATE_COHORTS,
+          trexplorer_annotations_database=None):
     """Read the input TSVs and write the TRails result database to db_path.
 
     Builds every table in memory and populates the DuckDB database directly, with
@@ -94,6 +99,10 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
             affected_unsolved_outliers_above_unaffected table and in the phenotype
             scores. Recorded in the metadata table. Defaults to
             ``analysis_columns.POPULATION_P99_GATE_COHORTS``.
+        trexplorer_annotations_database: Optional database written by
+            ``trexplorer_annotations.build_trexplorer_annotations_database`` (trails_setup
+            downloads it), from which each locus takes the population statistics, gene region
+            and variation cluster of its TRExplorer locus. Columns the matrix supplies win.
 
     Returns:
         The path of the written database (``db_path``).
@@ -165,6 +174,14 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
     locus_annotations.add_derived_locus_columns(
         records, source_label=source_label,
         repeat_copy_numbers_tsv=repeat_copy_numbers_tsv)
+    if trexplorer_annotations_database:
+        print(f"Adding TRExplorer annotations from {trexplorer_annotations_database} ...")
+        num_matched_by_locus_id, num_matched_by_overlap = trexplorer_annotations.add_trexplorer_annotations(
+            records, trexplorer_annotations_database)
+        print(f"  {num_matched_by_locus_id:,} loci matched a TRExplorer locus by id, "
+              f"{num_matched_by_overlap:,} by overlap, and "
+              f"{len(records) - num_matched_by_locus_id - num_matched_by_overlap:,} matched none")
+    locus_annotations.add_population_stdev_percentile_columns(records)
 
     # Stage 7: known-disease-locus match + IsKnownMotif + IsInMendelianGene.
     print("Annotating known-disease loci and known motifs ...")
@@ -272,7 +289,7 @@ def main():
                         help="sample metadata TSV (one row per sample; only sample_id is required)")
     parser.add_argument("--db", required=True, help="output DuckDB database path")
     parser.add_argument("--phenotypes-table", help="optional phenotype TSV (HPO terms per sample)")
-    parser.add_argument("--gene-table", help="optional gene-disease table (class B)")
+    parser.add_argument("--gene-table", help="gene-disease table (reference, optional; trails_setup.py downloads one)")
     parser.add_argument("--genes-to-phenotype", help="HPO genes_to_phenotype.txt (reference)")
     parser.add_argument("--known-loci-json", help="known-loci catalog (reference)")
     parser.add_argument("--strchive-loci-json", help="cached STRchive-loci.json (reference, optional)")
@@ -291,6 +308,8 @@ def main():
                              "(default: %(default)s)")
     parser.add_argument("-n", "--n-loci", type=int, help="limit to the first N loci (for testing)")
     parser.add_argument("--skip-phenotype-scores", action="store_true", help="skip phenotype scoring")
+    parser.add_argument("--trexplorer-annotations-db",
+                        help="TRExplorer annotations database written by trails_setup.py (reference, optional)")
     args = parser.parse_args()
     try:
         population_gate_cohorts = analysis_columns.parse_population_gate_cohorts(
@@ -305,7 +324,8 @@ def main():
           mendelian_threshold=args.mendelian_threshold,
           n_outlier_sample_ids=args.n_outlier_sample_ids,
           strchive_loci_json=args.strchive_loci_json,
-          population_gate_cohorts=population_gate_cohorts)
+          population_gate_cohorts=population_gate_cohorts,
+          trexplorer_annotations_database=args.trexplorer_annotations_db)
 
 
 if __name__ == "__main__":

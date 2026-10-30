@@ -11,11 +11,11 @@ import os
 import re
 import unittest
 
-REPO_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+CODE_DIRECTORY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trails")
 
 
 def read_template(name):
-    """Returns the text of a file in the repository root.
+    """Returns the text of a file in the trails/ code directory.
 
     Args:
         name: File name, e.g. "index_page_template.html" or "results_server.py".
@@ -23,7 +23,7 @@ def read_template(name):
     Returns:
         The file's contents as a string.
     """
-    with open(os.path.join(REPO_DIRECTORY, name)) as handle:
+    with open(os.path.join(CODE_DIRECTORY, name)) as handle:
         return handle.read()
 
 
@@ -151,7 +151,7 @@ class ActiveSortClassTests(unittest.TestCase):
     """
 
     def test_no_template_uses_a_direction_named_sort_class(self):
-        for name in sorted(os.listdir(REPO_DIRECTORY)):
+        for name in sorted(os.listdir(CODE_DIRECTORY)):
             if name.endswith(".html"):
                 template = read_template(name)
                 self.assertNotIn("sorted-asc", template, name)
@@ -265,7 +265,7 @@ class DeadSearchResultsGlobalTests(unittest.TestCase):
     """Z13: performSearch must not stash the response payload in a global nothing reads."""
 
     def test_no_template_writes_a_search_results_global(self):
-        for name in sorted(os.listdir(REPO_DIRECTORY)):
+        for name in sorted(os.listdir(CODE_DIRECTORY)):
             if name.endswith(".html"):
                 self.assertNotIn("searchResults", read_template(name), name)
 
@@ -375,7 +375,7 @@ class SharedJsHeaderTests(unittest.TestCase):
         self.header = self.shared_js.split("=========================================================================")[1]
 
     def test_header_names_every_including_template(self):
-        for name in sorted(os.listdir(REPO_DIRECTORY)):
+        for name in sorted(os.listdir(CODE_DIRECTORY)):
             if not name.endswith(".html") or name == "qc_shared_js.html":
                 continue
             if '{% include "qc_shared_js.html" %}' in read_template(name):
