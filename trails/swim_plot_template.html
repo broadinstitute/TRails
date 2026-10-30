@@ -67,7 +67,7 @@
                     <!-- Left column: radio button groups -->
                     <div class="six wide column">
 
-                    <!-- Outlier Type + Source -->
+                    <!-- Outlier Type -->
                     <div class="field">
                         <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
                             <label style="margin: 0;">Outlier Type:</label>
@@ -141,7 +141,7 @@
                                 <label>Known disease motifs only</label>
                             </div>
                             <div class="ui checkbox">
-                                <input type="checkbox" id="swim_mendelian_only">
+                                <input type="checkbox" id="swim_mendelian_genes_only">
                                 <label>Mendelian disease genes only</label>
                             </div>
                         </div>
@@ -353,7 +353,7 @@ function getSwimParams() {
     if ($('#swim_apply_pathogenic_threshold').is(':checked')) params.apply_pathogenic_threshold = '1';
     if ($('#swim_known_loci_only').is(':checked')) params.known_loci_only = '1';
     if ($('#swim_known_motifs_only').is(':checked')) params.known_motifs_only = '1';
-    if ($('#swim_mendelian_only').is(':checked')) params.mendelian_only = '1';
+    if ($('#swim_mendelian_genes_only').is(':checked')) params.mendelian_genes_only = '1';
 
     // Require above population
     const rap = $('input[name="swim_require_above_population"]:checked').val();
@@ -1081,8 +1081,10 @@ $(document).ready(function() {
     // Gene region mutual exclusivity: include unchecks exclude (and vice versa)
     linkGeneRegionIncludeAndExcludeCheckboxes('swim_');
 
-    // Initialize sample ID dropdown
+    // Initialize sample ID dropdown (a typed-in value is escaped wherever Semantic UI shows it:
+    // ESCAPING_ADDITIONS_DROPDOWN_SETTINGS, qc_shared_js.html)
     $('#swim-sample-id-filter').dropdown({
+        ...ESCAPING_ADDITIONS_DROPDOWN_SETTINGS,
         allowAdditions: true,
         clearable: true,
         fullTextSearch: true,

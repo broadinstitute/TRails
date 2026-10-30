@@ -55,6 +55,12 @@ GENELOOKUP_GENE_TABLE_SQL = (
     "FROM `cmg-analysis.gene_lookup.combined_gene_disease_association_table`")
 GENELOOKUP_GENE_TABLE_NAME = "genelookup_gene_table.tsv.gz"
 
+# Seconds a download may go without receiving any data before it is abandoned. urlopen applies
+# its timeout to each socket operation (connecting, and each read), not to the whole transfer, so
+# a slow but moving 900 MB download still finishes, while one that stalls raises TimeoutError,
+# which fetch_reference_data reports before continuing without that file.
+DOWNLOAD_STALL_TIMEOUT_SECONDS = 60
+
 
 @contextlib.contextmanager
 def _removed_on_failure(path):
@@ -74,8 +80,9 @@ def _removed_on_failure(path):
 def _download(url, dest):
     """Download url to dest atomically (write a .tmp file, then rename)."""
     tmp = dest + ".tmp"
+    request = urllib.request.Request(url, headers={"User-Agent": "TRails-setup"})
     with _removed_on_failure(tmp):
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "TRails-setup"})) as response, \
+        with urllib.request.urlopen(request, timeout=DOWNLOAD_STALL_TIMEOUT_SECONDS) as response, \
                 open(tmp, "wb") as out:
             for chunk in iter(lambda: response.read(1 << 20), b""):
                 out.write(chunk)
@@ -122,7 +129,8 @@ def _export_genelookup_gene_table(sql, dest):
     with _removed_on_failure(tmp):
         with gzip.open(tmp, "wt") as out:
             for file_index, url in enumerate(result["public_urls"]):
-                with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "TRails-setup"})) as part:
+                part_request = urllib.request.Request(url, headers={"User-Agent": "TRails-setup"})
+                with urllib.request.urlopen(part_request, timeout=DOWNLOAD_STALL_TIMEOUT_SECONDS) as part:
                     lines = gzip.decompress(part.read()).decode().splitlines(keepends=True)
                 out.writelines(lines if file_index == 0 else lines[1:])
         os.replace(tmp, dest)

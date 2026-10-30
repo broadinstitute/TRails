@@ -118,32 +118,28 @@ def compute_similarity_pyhpo(patient_hpo_ids, disease_hpo_ids):
     Returns:
         float: A similarity score in [0.0, 1.0].
     """
-    try:
-        from pyhpo import HPOSet
-
-        if not ensure_ontology():
-            raise ImportError("pyhpo ontology unavailable")
-
-        patient_valid = resolvable_hpo_terms(patient_hpo_ids)
-        disease_valid = resolvable_hpo_terms(disease_hpo_ids)
-        if not patient_valid or not disease_valid:
-            return 0.0
-
-        try:
-            return HPOSet.from_queries(patient_valid).similarity(
-                HPOSet.from_queries(disease_valid),
-                kind="omim",
-                method="graphic",
-                combine="funSimAvg",
-            )
-        except Exception:
-            return 0.0
-
-    except ImportError:
+    if not ensure_ontology():
         patient_set = set(patient_hpo_ids)
         disease_set = set(disease_hpo_ids)
         union = len(patient_set | disease_set)
         return len(patient_set & disease_set) / union if union > 0 else 0.0
+
+    from pyhpo import HPOSet
+
+    patient_valid = resolvable_hpo_terms(patient_hpo_ids)
+    disease_valid = resolvable_hpo_terms(disease_hpo_ids)
+    if not patient_valid or not disease_valid:
+        return 0.0
+
+    try:
+        return HPOSet.from_queries(patient_valid).similarity(
+            HPOSet.from_queries(disease_valid),
+            kind="omim",
+            method="graphic",
+            combine="funSimAvg",
+        )
+    except Exception:
+        return 0.0
 
 
 def compute_combined_ic(hpo_term):

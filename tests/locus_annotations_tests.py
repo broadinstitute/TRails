@@ -59,6 +59,21 @@ class MotifsMatchTests(unittest.TestCase):
         self.assertFalse(locus_annotations.motifs_match("", "CAG"))
         self.assertFalse(locus_annotations.motifs_match("CAG", None))
 
+    def test_n_in_a_short_motif_matches_any_base(self):
+        # The catalogs write polyalanine loci as GCN or NGC; every alanine codon, in any
+        # rotation and on either strand, matches, as does the other N spelling.
+        for concrete_motif in ("GCG", "GCC", "GCA", "GCT", "CGC", "GGC", "ccg"):
+            for catalog_motif in ("GCN", "NGC"):
+                self.assertTrue(locus_annotations.motifs_match(concrete_motif, catalog_motif),
+                                (concrete_motif, catalog_motif))
+                self.assertTrue(locus_annotations.motifs_match(catalog_motif, concrete_motif),
+                                (catalog_motif, concrete_motif))
+        self.assertTrue(locus_annotations.motifs_match("NGC", "GCN"))
+
+    def test_n_does_not_match_a_different_motif_or_length(self):
+        for motif in ("AAT", "AAA", "TTA", "GCGG", "GC", "GGGGCC"):
+            self.assertFalse(locus_annotations.motifs_match(motif, "GCN"), motif)
+
 
 class GeneRegionRankTests(unittest.TestCase):
 
@@ -520,14 +535,26 @@ class KnownMotifAndMendelianGeneTests(unittest.TestCase):
     def tearDown(self):
         os.remove(self.catalog_path)
 
-    def test_collect_canonical_motifs_skips_N_containing(self):
+    def test_collect_canonical_motifs_expands_n_into_concrete_motifs(self):
         known = locus_annotations.collect_known_disease_canonical_motifs(
             self.interval_trees)
         from motif_utilities import compute_canonical_motif
         self.assertIn(compute_canonical_motif("CAG"), known)
         self.assertIn(compute_canonical_motif("CCCCGG"), known)
-        # NGC contains N and is excluded.
-        self.assertNotIn(compute_canonical_motif("NGC", include_reverse_complement=False), known)
+        # NGC stands for AGC, CGC, GGC and TGC; the N spelling itself is not a locus motif.
+        for concrete_motif in ("AGC", "CGC", "GGC", "TGC"):
+            self.assertIn(compute_canonical_motif(concrete_motif), known, concrete_motif)
+        self.assertNotIn(compute_canonical_motif("NGC"), known)
+
+    def test_long_motif_with_n_is_not_expanded(self):
+        catalog_path = _make_catalog_file([{
+            "LocusId": "LONG", "MainReferenceRegion": "chr1:1000-1120", "RepeatUnit": "GGCTNNGGGNGC",
+            "Diseases": [{"Name": "D"}]}])
+        try:
+            interval_trees, _ = locus_annotations.load_known_disease_loci(catalog_path)
+        finally:
+            os.remove(catalog_path)
+        self.assertEqual(locus_annotations.collect_known_disease_canonical_motifs(interval_trees), set())
 
     def test_compute_is_known_motif(self):
         known = locus_annotations.collect_known_disease_canonical_motifs(
@@ -537,6 +564,56 @@ class KnownMotifAndMendelianGeneTests(unittest.TestCase):
             locus_annotations.compute_is_known_motif(compute_canonical_motif("CAG"), known), 1)
         self.assertEqual(
             locus_annotations.compute_is_known_motif("ZZZ", known), 0)
+        # A locus motif written with N is known when a concrete motif it stands for is.
+        self.assertEqual(locus_annotations.compute_is_known_motif(compute_canonical_motif("GCN"), known), 1)
+        self.assertEqual(locus_annotations.compute_is_known_motif(compute_canonical_motif("ANT"), known), 0)
+
+
+class PolyalanineDiseaseLocusTests(unittest.TestCase):
+    """Real ARX and PHOX2B entries, whose catalogs write the polyalanine repeat as NGC / GCN."""
+
+    def setUp(self):
+        # As in variant_catalog_without_offtargets.GRCh38.json and STRchive-loci.json.
+        catalog_path = _make_catalog_file([
+            {"LocusId": "ARX_1", "MainReferenceRegion": "chrX:25013649-25013697", "RepeatUnit": "NGC",
+             "PathogenicMotifs": None,
+             "Diseases": [{"Name": "Developmental and epileptic encephalopathy-1"}]},
+            {"LocusId": "PHOX2B", "MainReferenceRegion": "chr4:41745972-41746032", "RepeatUnit": "GCN",
+             "PathogenicMotifs": None, "Diseases": [{"Name": "Congenital central hypoventilation"}]},
+        ])
+        strchive_path = _make_catalog_file([{
+            "id": "EIEE1_ARX", "disease": "Developmental and epileptic encephalopathy-1",
+            "chrom": "chrX", "start_hg38": 25013649, "stop_hg38": 25013697,
+            "reference_motif_reference_orientation": ["GCN"],
+            "pathogenic_motif_reference_orientation": ["NGC"],
+        }])
+        try:
+            self.interval_trees, self.strchive_trees = locus_annotations.load_known_disease_loci(
+                catalog_path, strchive_filepath=strchive_path)
+        finally:
+            os.remove(catalog_path)
+            os.remove(strchive_path)
+
+    def test_a_concrete_motif_matches_the_n_motif(self):
+        # TRGT's pathogenic-repeat catalog calls ARX's repeat GCG; PHOX2B is often genotyped as GCC.
+        self.assertEqual(locus_annotations.matches_disease_locus(
+            "chrX-25013649-25013697-GCG", self.interval_trees, self.strchive_trees), "ARX_1")
+        self.assertEqual(locus_annotations.matches_disease_locus(
+            "chr4-41745972-41746032-GCC", self.interval_trees, self.strchive_trees), "PHOX2B")
+        self.assertEqual(locus_annotations.matches_disease_locus(
+            "chrX-25013649-25013697-GCG", {}, self.strchive_trees), "EIEE1_ARX")
+
+    def test_a_different_motif_at_the_same_locus_does_not_match(self):
+        for locus_id in ("chrX-25013649-25013697-AAT", "chr4-41745972-41746032-GGAA"):
+            self.assertIsNone(locus_annotations.matches_disease_locus(
+                locus_id, self.interval_trees, self.strchive_trees), locus_id)
+
+    def test_is_known_motif_agrees_with_known_disease_locus(self):
+        known = locus_annotations.collect_known_disease_canonical_motifs(
+            self.interval_trees, self.strchive_trees)
+        for motif, expected in (("GCG", 1), ("GCC", 1), ("AAT", 0)):
+            self.assertEqual(locus_annotations.compute_is_known_motif(
+                locus_annotations.compute_canonical_motif(motif), known), expected, motif)
 
     def test_is_in_mendelian_gene(self):
         # A table with neither an inheritance nor a sources column counts every gene it lists.

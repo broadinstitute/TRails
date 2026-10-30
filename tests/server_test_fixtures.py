@@ -62,3 +62,34 @@ class ServerTestCase(unittest.TestCase):
         results_server.configure_app(db_path, annotations_db=cls.annotations_db, **configure_app_arguments)
         results_server.app.config["TESTING"] = True
         cls.client = results_server.app.test_client()
+
+    def get_locus_ids(self, query):
+        """Return the LocusIds /api/v1/loci returns for outlier_type=all and further parameters.
+
+        Args:
+            query: The further query parameters, e.g. "phenotype_keyword=ataxia".
+
+        Returns:
+            Set of the LocusIds on the first page of results.
+        """
+        response = self.client.get(f"/api/v1/loci?outlier_type=all&{query}")
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return {r["LocusId"] for r in response.get_json()["results"]}
+
+    def record_template_render_arguments(self):
+        """Make the pages record their template's arguments instead of rendering, for one test.
+
+        Returns:
+            dict that each page render updates with its keyword arguments. The page body is "".
+        """
+        render_arguments = {}
+
+        class RecordingTemplate:
+            def render(self, **kwargs):
+                render_arguments.update(kwargs)
+                return ""
+
+        original_get_template = results_server.jinja2_env.get_template
+        results_server.jinja2_env.get_template = lambda name: RecordingTemplate()
+        self.addCleanup(setattr, results_server.jinja2_env, "get_template", original_get_template)
+        return render_arguments

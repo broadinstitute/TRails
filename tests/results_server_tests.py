@@ -4,9 +4,7 @@ These tests build a tiny temporary DuckDB database with a minimal ``loci`` table
 (plus a ``swim_plot`` table) and exercise the server through Flask's test client,
 so no real TCP port is bound. They check that:
 
-  * GET /api/v1/loci returns rows from the database,
-  * a request carrying the ``?source=`` query parameter the pages send is answered
-    (the parameter is ignored, not rejected), and
+  * GET /api/v1/loci returns rows from the database, and
   * the pages and endpoints (schema, swim, export, qc) behave gracefully.
 """
 
@@ -22,7 +20,9 @@ from unittest import mock
 
 import intervaltree
 
+import analysis_columns
 import duckdb_compat
+import input_tables
 import locus_annotations
 import result_database
 import results_server
@@ -139,13 +139,13 @@ class ResultsServerTests(ServerTestCase):
         self.assertIn("chr1-100-110-AT", locus_ids)
         self.assertIn("chr2-200-209-AAG", locus_ids)
 
-    def test_source_param_is_ignored(self):
-        response = self.client.get("/api/v1/loci?outlier_type=all&source=foo")
+    def test_unknown_query_parameters_are_ignored(self):
+        response = self.client.get("/api/v1/loci?outlier_type=all&unrecognized=foo")
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertEqual(data["total"], 2)
-        # The ignored source must not leak into filters_applied.
-        self.assertNotIn("source", data["filters_applied"])
+        # An unrecognized parameter is ignored and not reported in filters_applied.
+        self.assertNotIn("unrecognized", data["filters_applied"])
 
     def test_outlier_type_required(self):
         response = self.client.get("/api/v1/loci")
@@ -400,16 +400,7 @@ class ResultsServerTests(ServerTestCase):
         sys.argv = ["results_server.py", "--db", "unused.duckdb"]
         self.assertEqual(results_server.parse_args().initial_require_above_population, "")
 
-        render_arguments = {}
-
-        class _RecordingTemplate:
-            def render(self, **kwargs):
-                render_arguments.update(kwargs)
-                return ""
-
-        original_get_template = results_server.jinja2_env.get_template
-        results_server.jinja2_env.get_template = lambda name: _RecordingTemplate()
-        self.addCleanup(setattr, results_server.jinja2_env, "get_template", original_get_template)
+        render_arguments = self.record_template_render_arguments()
         self.addCleanup(results_server.app.config.pop, "INITIAL_REQUIRE_ABOVE_POPULATION", None)
         self.assertEqual(self.client.get("/").status_code, 200)
         self.assertEqual(render_arguments["initial_require_above_population"], "")
@@ -619,6 +610,21 @@ def _build_db_for_sample_qc(path):
     conn.close()
 
 
+class ComputeOutlierWarningsTests(unittest.TestCase):
+    """The reported bound is the smallest count that is flagged, so "≥ bound" says who is flagged."""
+
+    def test_a_fractional_99th_percentile_is_reported_rounded_up(self):
+        # 98 samples with 1 rank-1 locus, then 4 and 5: the 99th percentile is 4.01
+        rank1_data = [{"sample_id": f"S{index}", "bin": "2bp", "count": 1} for index in range(98)]
+        rank1_data += [{"sample_id": "FOUR", "bin": "2bp", "count": 4}, {"sample_id": "FIVE", "bin": "2bp", "count": 5}]
+        warnings = results_server.compute_outlier_warnings(rank1_data)
+        self.assertEqual(warnings, {"FIVE": {"outlier_bins": {"2bp": {"count": 5, "threshold": 5}}}})
+        # Every flagged count is at least the reported bound, and every other count is below it
+        bound = warnings["FIVE"]["outlier_bins"]["2bp"]["threshold"]
+        for entry in rank1_data:
+            self.assertEqual(entry["sample_id"] in warnings, entry["count"] >= bound, entry)
+
+
 class SampleQcLocusCountTests(ServerTestCase):
     """The sample-QC counts are counts of loci, not of swim_plot allele rows."""
 
@@ -799,23 +805,18 @@ class PhenotypeKeywordAcrossAffectedOutliersTests(ServerTestCase):
         _build_db_with_all_affected_phenotypes(cls.db_path)
         cls.configure_server(cls.db_path)
 
-    def _locus_ids(self, keyword):
-        response = self.client.get(f"/api/v1/loci?outlier_type=all&phenotype_keyword={keyword}")
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
-        return {r["LocusId"] for r in response.get_json()["results"]}
-
     def test_first_second_and_third_phenotypes_all_match(self):
-        self.assertEqual(self._locus_ids("seizures"), {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=seizures"), {"chr1-100-110-AT"})
         # ataxia is the SECOND affected outlier's phenotype, and dystonia the third.
-        self.assertEqual(self._locus_ids("ataxia"), {"chr1-100-110-AT"})
-        self.assertEqual(self._locus_ids("dystonia"), {"chr2-200-209-AAG"})
-        self.assertEqual(self._locus_ids("myopathy"), {"chr2-200-209-AAG"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=ataxia"), {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=dystonia"), {"chr2-200-209-AAG"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=myopathy"), {"chr2-200-209-AAG"})
 
     def test_unmatched_keyword_returns_nothing(self):
-        self.assertEqual(self._locus_ids("no_such_phenotype"), set())
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=no_such_phenotype"), set())
 
     def test_keywords_are_or_combined_across_columns(self):
-        self.assertEqual(self._locus_ids("ataxia,dystonia"),
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=ataxia,dystonia"),
                          {"chr1-100-110-AT", "chr2-200-209-AAG"})
 
 
@@ -893,11 +894,6 @@ class PhenotypeKeywordAgreesWithTheSwimPlotTests(ServerTestCase):
         _build_db_with_swim_plot_phenotypes(cls.db_path)
         cls.configure_server(cls.db_path)
 
-    def _locus_ids(self, keyword):
-        response = self.client.get(f"/api/v1/loci?outlier_type=all&phenotype_keyword={keyword}")
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
-        return {r["LocusId"] for r in response.get_json()["results"]}
-
     def _swim_locus_ids(self, keyword):
         response = self.client.get(
             f"/api/v1/swim_plot_data?outlier_type=all&phenotype_keyword={keyword}")
@@ -905,34 +901,35 @@ class PhenotypeKeywordAgreesWithTheSwimPlotTests(ServerTestCase):
         return {entry["LocusId"] for entry in response.get_json()["data"]}
 
     def test_the_top_three_affected_phenotypes_still_match(self):
-        self.assertEqual(self._locus_ids("seizures"), {"chr1-100-110-AT"})
-        self.assertEqual(self._locus_ids("ataxia"), {"chr1-100-110-AT"})
-        self.assertEqual(self._locus_ids("dystonia"), {"chr1-100-110-AT"})
-        self.assertEqual(self._locus_ids("myopathy"), {"chr2-200-209-AAG"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=seizures"), {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=ataxia"), {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=dystonia"), {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=myopathy"), {"chr2-200-209-AAG"})
 
     def test_a_fourth_affected_outlier_matches(self):
         # neuropathy belongs to the fourth affected outlier, which no summary column carries.
-        self.assertEqual(self._locus_ids("neuropathy"), {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=neuropathy"), {"chr1-100-110-AT"})
 
     def test_an_unaffected_outlier_matches(self):
-        self.assertEqual(self._locus_ids("headache"), {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=headache"), {"chr1-100-110-AT"})
 
     def test_the_two_views_select_the_same_loci(self):
         for keyword in ("seizures", "ataxia", "dystonia", "neuropathy", "headache", "myopathy",
                         "no_such_phenotype"):
-            self.assertEqual(self._locus_ids(keyword), self._swim_locus_ids(keyword), keyword)
+            self.assertEqual(self.get_locus_ids(f"phenotype_keyword={keyword}"), self._swim_locus_ids(keyword),
+                             keyword)
 
     def test_keywords_are_or_combined(self):
-        self.assertEqual(self._locus_ids("neuropathy,myopathy"),
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=neuropathy,myopathy"),
                          {"chr1-100-110-AT", "chr2-200-209-AAG"})
-        self.assertEqual(self._locus_ids("neuropathy,myopathy"),
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=neuropathy,myopathy"),
                          self._swim_locus_ids("neuropathy,myopathy"))
 
     def test_matching_is_case_insensitive_and_partial(self):
-        self.assertEqual(self._locus_ids("NEURO"), {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=NEURO"), {"chr1-100-110-AT"})
 
     def test_an_unmatched_keyword_returns_nothing(self):
-        self.assertEqual(self._locus_ids("no_such_phenotype"), set())
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=no_such_phenotype"), set())
 
 
 class SplitOutlierEntriesTests(unittest.TestCase):
@@ -951,7 +948,6 @@ class SplitOutlierEntriesTests(unittest.TestCase):
             "6x:sA,5x:sB", {"sA": {"family_id": "F1", "sex": "male"}}, {}, {})
         self.assertEqual([(s["allele_size"], s["sample_id"], s["family_id"], s["sex"]) for s in parsed],
                          [(6, "sA", "F1", "male"), (5, "sB", None, None)])
-        self.assertNotIn("purity", parsed[0])
 
 
 class ComputePlotThresholdsTests(unittest.TestCase):
@@ -1588,8 +1584,8 @@ class RequestCheckTests(MinimalDatabaseTestCase):
     def test_another_host_name_is_refused_whatever_the_bind_address(self):
         # A page whose own domain was pointed at this machine connects from it, and sends that
         # domain as the Host and as the Origin of a write, so the two match and only the Host
-        # check refuses it. Without a recorded bind address the server's default, 127.0.0.1,
-        # applies.
+        # check refuses it. Without a recorded bind address, restrict_writes treats the server as
+        # bound to a non-loopback address.
         for bind_host in (None, "127.0.0.1", "localhost", "::1", "0.0.0.0", "192.168.1.5"):
             if bind_host is None:
                 results_server.app.config.pop("BIND_HOST", None)
@@ -1656,8 +1652,7 @@ class RequestCheckTests(MinimalDatabaseTestCase):
         self.assertIn("--sample-table file not found", printed.call_args.args[0])
 
     def test_filters_applied_is_the_same_in_the_list_and_the_json_export(self):
-        query = ("outlier_type=all&min_pli=0.5&motif_size=2&search=GENE1&reference_region=chr1:100-110"
-                 "&sort_by=size&source=TRails")
+        query = "outlier_type=all&min_pli=0.5&motif_size=2&search=GENE1&reference_region=chr1:100-110&sort_by=size"
         expected = {"min_pli": 0.5, "motif_size": "2", "search": "GENE1", "reference_region": "chr1:100-110"}
         self.assertEqual(self.client.get(f"/api/v1/loci?{query}").get_json()["filters_applied"], expected)
         export = self.client.get(f"/api/v1/export?{query}&format=json")
@@ -1731,16 +1726,7 @@ class MendelianViolationTests(ServerTestCase):
         self.assertEqual(len(data["by_center_motif"]), 8)
 
     def test_the_qc2_page_gets_the_trio_minimum_it_names(self):
-        render_arguments = {}
-
-        class _RecordingTemplate:
-            def render(self, **kwargs):
-                render_arguments.update(kwargs)
-                return ""
-
-        original_get_template = results_server.jinja2_env.get_template
-        results_server.jinja2_env.get_template = lambda name: _RecordingTemplate()
-        self.addCleanup(setattr, results_server.jinja2_env, "get_template", original_get_template)
+        render_arguments = self.record_template_render_arguments()
         self.assertEqual(self.client.get("/qc2").status_code, 200)
         self.assertEqual(render_arguments["min_trios_per_center"], results_server.MIN_TRIOS_PER_CENTER)
 
@@ -1778,30 +1764,26 @@ class MinExpansionTests(ServerTestCase):
         _build_db_for_min_expansion(cls.db_path)
         cls.configure_server(cls.db_path)
 
-    def _loci(self, query):
-        response = self.client.get(f"/api/v1/loci?outlier_type=all&{query}")
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
-        return {r["LocusId"] for r in response.get_json()["results"]}
-
     def test_each_filter_on_its_own(self):
-        self.assertEqual(self._loci("min_expansion=1"), {"A", "B"})
-        self.assertEqual(self._loci("require_above_unaffected=second"), {"A", "C"})
-        self.assertEqual(self._loci("require_families_above_unaffected=second"), {"A", "C"})
+        self.assertEqual(self.get_locus_ids("min_expansion=1"), {"A", "B"})
+        self.assertEqual(self.get_locus_ids("require_above_unaffected=second"), {"A", "C"})
+        self.assertEqual(self.get_locus_ids("require_families_above_unaffected=second"), {"A", "C"})
 
     def test_combined_filters_keep_the_loci_that_pass_both(self):
         for unaffected_filter in ("require_above_unaffected", "require_families_above_unaffected"):
             for min_expansion in (0, 1):
                 query = f"{unaffected_filter}=second&min_expansion={min_expansion}"
-                self.assertEqual(self._loci(query),
-                                 self._loci(f"{unaffected_filter}=second") & self._loci(f"min_expansion={min_expansion}"),
+                self.assertEqual(self.get_locus_ids(query),
+                                 self.get_locus_ids(f"{unaffected_filter}=second")
+                                 & self.get_locus_ids(f"min_expansion={min_expansion}"),
                                  query)
-            self.assertEqual(self._loci(f"{unaffected_filter}=second&min_expansion=1"), {"A"})
+            self.assertEqual(self.get_locus_ids(f"{unaffected_filter}=second&min_expansion=1"), {"A"})
 
     def test_a_missing_unaffected_column_matches_nothing(self):
         saved = results_server.app.config["DB_COLUMNS_SET"]
         self.addCleanup(results_server.app.config.__setitem__, "DB_COLUMNS_SET", saved)
         results_server.app.config["DB_COLUMNS_SET"] = saved - {"FirstUnaffectedAlleleSize_AllAlleles"}
-        self.assertEqual(self._loci("require_families_above_unaffected=second"), set())
+        self.assertEqual(self.get_locus_ids("require_families_above_unaffected=second"), set())
 
 
 class SwimPlotFilterTests(MinimalDatabaseTestCase):
@@ -1816,11 +1798,6 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         return {(entry["LocusId"], entry["sample_id"]) for entry in response.get_json()["data"]}
 
-    def _loci(self, query):
-        response = self.client.get(f"/api/v1/loci?outlier_type=all&{query}")
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
-        return {r["LocusId"] for r in response.get_json()["results"]}
-
     def test_locus_filters_keep_the_loci_the_results_table_returns(self):
         self.client.post("/api/v1/annotations/chr2-200-209-AAG/tags", json={"tag": "swim"})
         self.addCleanup(self.client.delete, "/api/v1/annotations/chr2-200-209-AAG/tags/swim")
@@ -1830,10 +1807,7 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
                       "reference_region=chr1:100-110", "search=GENE2", "search=chr1:105", "search=nothing",
                       "search=CHR2-200-209-aag", "tag=swim", "tag=no_such_tag", "known_loci_only=true",
                       "max_variation_cluster_size_diff=5", "min_repeats_threshold=5"):
-            self.assertEqual({locus_id for locus_id, _ in self._swim_rows(query)}, self._loci(query), query)
-
-    def test_mendelian_only_is_another_name_for_mendelian_genes_only(self):
-        self.assertEqual(self._swim_rows("mendelian_only=1"), {("chr2-200-209-AAG", "sampleC")})
+            self.assertEqual({locus_id for locus_id, _ in self._swim_rows(query)}, self.get_locus_ids(query), query)
 
     def test_invalid_values_are_rejected_as_by_the_results_table(self):
         for query in ("gene_regions=foo", "exclude_gene_regions=foo", "motif=AXT", "motif_size=a-b",
@@ -1847,7 +1821,7 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
 
     def test_sample_level_filters_keep_the_rows_of_the_matching_samples(self):
         # The results table keeps the locus; the swim plot draws only that sample's allele there.
-        self.assertEqual(self._loci("sample_id_keyword=sampleB"), {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("sample_id_keyword=sampleB"), {"chr1-100-110-AT"})
         self.assertEqual(self._swim_rows("sample_id_keyword=SAMPLEB"), {("chr1-100-110-AT", "sampleB")})
         self.assertEqual(self._swim_rows("sample_id_like=ple_"), set())
         self.assertEqual(self._swim_rows("sample_id_like=pleC"), {("chr2-200-209-AAG", "sampleC")})
@@ -1859,7 +1833,7 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
         saved = results_server.app.config["KNOWN_DISEASE_LOCUS_THRESHOLDS"]
         self.addCleanup(results_server.app.config.__setitem__, "KNOWN_DISEASE_LOCUS_THRESHOLDS", saved)
         results_server.app.config["KNOWN_DISEASE_LOCUS_THRESHOLDS"] = {"chr1-100-110-AT": 6}
-        self.assertEqual(self._loci("apply_pathogenic_threshold=true"), {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("apply_pathogenic_threshold=true"), {"chr1-100-110-AT"})
         self.assertEqual(self._swim_rows("apply_pathogenic_threshold=1"), {("chr1-100-110-AT", "sampleA")})
 
     def test_require_affected_above_unaffected(self):
@@ -1867,6 +1841,44 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
         for value in ("1", "true"):
             self.assertEqual(self._swim_rows(f"require_affected_above_unaffected={value}"),
                              {("chr1-100-110-AT", "sampleA"), ("chr2-200-209-AAG", "sampleC")})
+
+    def test_require_affected_above_unaffected_follows_the_builds_rule(self):
+        # The build counts a solved affected sample with the unaffected ones, and a sample of
+        # unknown status with the candidates. SOLVED is affected and solved, UNKNOWN has blank
+        # statuses, AFFECTED is affected and unsolved, UNAFFECTED is unaffected.
+        sample_table = os.path.join(self.tmpdir, "statuses.tsv")
+        with open(sample_table, "w") as output_file:
+            output_file.write("sample_id\taffected_status\tanalysis_status\n"
+                              "SOLVED\taffected\tsolved\nUNKNOWN\t\t\n"
+                              "AFFECTED\taffected\tunsolved\nUNAFFECTED\tunaffected\tunaffected\n")
+        sample_lookup, affected_lookup, analysis_lookup = input_tables.read_sample_metadata(sample_table)
+        records = [
+            # UNKNOWN is above SOLVED; AFFECTED is not
+            {"LocusId": "chr1-100-110-AT", "OutlierSampleIds_AllAlleles": "60x:UNKNOWN,55x:SOLVED,50x:AFFECTED"},
+            # SOLVED is the largest, so no candidate is above it
+            {"LocusId": "chr1-200-210-AT", "OutlierSampleIds_AllAlleles": "60x:SOLVED,50x:UNKNOWN"},
+            {"LocusId": "chr1-300-310-AT", "OutlierSampleIds_AllAlleles": "40x:AFFECTED,30x:UNAFFECTED"},
+        ]
+        for record in records:
+            start = int(record["LocusId"].split("-")[1])
+            record.update({"Chrom": "chr1", "Start0Based": start, "End1Based": start + 10, "Motif": "AT",
+                           "MotifSize": 2, "OutlierSampleIds_ShortAlleles": None,
+                           "OutlierSampleIds_HemizygousAlleles": None})
+        analysis_columns.add_all_outlier_columns(records, sample_lookup, affected_lookup, analysis_lookup)
+        db_path = os.path.join(self.tmpdir, "statuses.duckdb")
+        conn = duckdb_compat.connect(db_path)
+        result_database.write_loci_table(conn, records, list(records[0]))
+        result_database.write_swim_plot(conn, swim_plot.generate_swim_plot_table(records, sample_lookup),
+                                        columns=swim_plot.SWIM_PLOT_COLUMNS)
+        conn.commit()
+        conn.close()
+        self.configure_server(db_path, sample_table=sample_table)
+        self.addCleanup(self.configure_server, self.db_path)
+
+        self.assertEqual(self.get_locus_ids("require_above_unaffected=first"), {"chr1-100-110-AT", "chr1-300-310-AT"})
+        swim_rows = self._swim_rows("require_affected_above_unaffected=1")
+        self.assertEqual(swim_rows, {("chr1-100-110-AT", "UNKNOWN"), ("chr1-300-310-AT", "AFFECTED")})
+        self.assertEqual({locus_id for locus_id, _ in swim_rows}, self.get_locus_ids("require_above_unaffected=first"))
 
     def test_the_matching_loci_are_looked_up_once_per_request(self):
         recorded_queries = _record_queries(self)
@@ -1906,7 +1918,7 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
 
         for gate, expected_loci in (("long-read", {"A", "B"}), ("all", {"B"})):
             query = f"require_above_population={gate}&min_repeats_above_population=5"
-            self.assertEqual(self._loci(query), expected_loci, query)
+            self.assertEqual(self.get_locus_ids(query), expected_loci, query)
             self.assertEqual({locus_id for locus_id, _ in self._swim_rows(query)}, expected_loci, query)
 
 

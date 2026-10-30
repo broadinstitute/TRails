@@ -558,8 +558,10 @@ $(document).ready(function() {
         },
     });
 
-    // Initialize sample ID dropdown
+    // Initialize sample ID dropdown. applyStateToUI restores it from the URL, so a typed-in value
+    // is escaped wherever Semantic UI shows it (ESCAPING_ADDITIONS_DROPDOWN_SETTINGS, qc_shared_js.html).
     $('#sample-id-filter').dropdown({
+        ...ESCAPING_ADDITIONS_DROPDOWN_SETTINGS,
         allowAdditions: true,
         clearable: true,
         fullTextSearch: true,
@@ -568,6 +570,7 @@ $(document).ready(function() {
 
     // Initialize add-tag dropdown (in modal)
     $('#add-tag-dropdown').dropdown({
+        ...ESCAPING_ADDITIONS_DROPDOWN_SETTINGS,
         allowAdditions: true,
         clearable: true,
         fullTextSearch: true,
@@ -747,16 +750,23 @@ function readStateFromUrl() {
 }
 
 // Apply State to UI
+
+// The inputs named `name` whose value is exactly `value`. The value is compared here rather than
+// written into the selector because it can come from the URL, where text such as `"]` would make
+// the selector invalid and stop the page from applying its state.
+function inputsWithValue(name, value) {
+    return $(`input[name="${name}"]`).filter(function() { return this.value === value; });
+}
+
 function applyStateToUI() {
     // Radio buttons
     for (const name of ['outlier_type', 'require_above_unaffected',
                         'require_families_above_unaffected',
                         'require_above_population', 'group_by']) {
-        const val = currentState[name] || '';
-        $(`input[name="${name}"][value="${val}"]`).parent().checkbox('check');
+        inputsWithValue(name, currentState[name] || '').parent().checkbox('check');
     }
     setGroupSortDropdown(currentState.group_sort);
-    $(`input[name="group_sort_direction"][value="${currentState.group_sort_direction}"]`).prop('checked', true);
+    inputsWithValue('group_sort_direction', currentState.group_sort_direction).prop('checked', true);
     $('#group-sort-field').toggle(currentState.group_by !== 'locus');
 
     // Sort: ordered priority pills + matching checkboxes (multi-key)
@@ -764,7 +774,7 @@ function applyStateToUI() {
     syncSortCheckboxes();
 
     // Population metric (native inline radio, not a semantic-ui checkbox)
-    $(`input[name="population_metric"][value="${currentState.population_metric || '99th'}"]`).prop('checked', true);
+    inputsWithValue('population_metric', currentState.population_metric || '99th').prop('checked', true);
 
     // Boolean checkboxes
     for (const name of ['apply_pathogenic_threshold', 'known_loci_only', 'known_motifs_only', 'mendelian_genes_only',
@@ -1127,6 +1137,10 @@ async function performSearch() {
         // exists, so show the last page instead.
         if (data.total_pages > 0 && data.page > data.total_pages) {
             currentState.page = data.total_pages;
+            // Rewrite the out-of-range URL in place: pushing the clamped one as a new entry would
+            // make Back return to the out-of-range page, which clamps and pushes again, trapping
+            // the user (see readStateFromUrl).
+            replaceStateInUrl();
             return performSearch();
         }
         if (grouped) renderGroupedResults(data); else renderResults(data);
@@ -1243,7 +1257,8 @@ function updateActiveFiltersBar() {
         if ((key === 'group_sort' || key === 'group_sort_direction') && currentState.group_by === 'locus') continue;
         if (value === DEFAULT_STATE[key] || value === '' || value === false) continue;
         // group_sort shows the sort menu's label rather than its API value
-        const shownValue = key === 'group_sort' ? ($(`#group-sort-dropdown .item[data-value="${value}"]`).text() || value)
+        const shownValue = key === 'group_sort'
+            ? ($('#group-sort-dropdown .item').filter(function() { return $(this).attr('data-value') === value; }).text() || value)
             : key === 'group_sort_direction' ? value.toUpperCase() : value;
         const display = value === true ? labels[key] : `${escapeHtml(labels[key] || key)}: ${escapeHtml(shownValue)}`;
         chips.push(`<a class="ui small label filter-chip" data-filter="${escapeHtml(key)}">${display}<i class="delete icon"></i></a>`);

@@ -595,8 +595,8 @@ def add_all_outlier_columns(records, sample_lookup, affected_lookup, analysis_lo
     return affected_unsolved_outlier_rows
 
 
-# Maps each gene-table source field (as stored by input_tables.read_gene_table)
-# to its GeneTable*-prefixed output column.
+# Maps each gene-table source field to its GeneTable*-prefixed output column. The fields are also
+# the ones input_tables.read_gene_table keeps from the gene table.
 GENE_TABLE_COLUMN_BY_SOURCE_FIELD = {
     "gene_symbol": "GeneTableGeneSymbol",
     "gene_aliases": "GeneTableGeneAliases",
@@ -612,25 +612,26 @@ GENE_TABLE_COLUMN_BY_SOURCE_FIELD = {
 
 
 def add_gene_columns(records, gene_lookup):
-    """Populate the gene-derived ``pLI`` and ``inheritance`` columns, in place.
+    """Fill the GeneTable* columns, ``pLI`` and ``inheritance`` from the gene table, in place.
 
-    For each record, looks up its ``gene_id`` in ``gene_lookup``:
+    For each record, looks up its ``gene_id`` in ``gene_lookup`` and sets:
+      * the ten GENE_TABLE_COLUMN_BY_SOURCE_FIELD columns (``GeneTableGeneSymbol``,
+        ``GeneTablepLI_v4``, ``GeneTableInheritance``, ...) to the gene row's
+        fields, with a blank (NaN) field as None.
       * ``pLI`` = max of the gene's pLI_v2 and pLI_v4 (whichever are present),
         or None.
       * ``inheritance`` = the gene's inheritance mode, or None. It always equals
         ``GeneTableInheritance``.
 
-    Both columns are set to None when there is no gene_lookup, when the record's
-    gene_id is missing, or when the gene_id is not in the lookup — so analysis
-    runs without a gene table.
+    All of them are set to None when there is no gene_lookup, when the record's
+    gene_id is missing, or when the gene_id is not in the lookup, so the loci
+    table has the columns even for a build without a gene table.
 
     Args:
         records: List of locus record dicts (mutated in place).
-        gene_lookup: Mapping of gene_id -> gene info dict (with pLI_v2, pLI_v4,
-            inheritance), or None / empty when no gene table was supplied.
-
-    Returns:
-        The same list of records, each with pLI and inheritance set.
+        gene_lookup: Mapping of gene_id -> gene info dict (as read by
+            input_tables.read_gene_table), or None / empty when no gene table was
+            supplied.
     """
     for record in records:
         gene_id = record.get("gene_id")
@@ -660,8 +661,6 @@ def add_gene_columns(records, gene_lookup):
                 record[column] = None if is_none_or_nan(value) else value
 
         record["inheritance"] = record["GeneTableInheritance"]
-
-    return records
 
 
 # The ordered 131-name loci-table schema. Other per-locus annotation columns the matrix

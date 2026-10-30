@@ -32,7 +32,12 @@ import intervaltree
 KnownDiseaseLoci = collections.namedtuple("KnownDiseaseLoci", ["interval_trees", "strchive_trees"])
 
 from analysis_columns import blank_to_none
-from motif_utilities import COMPLEMENT, compute_canonical_motif
+from motif_utilities import COMPLEMENT, compute_canonical_motif, compute_canonical_motifs_with_n_as_any_base
+
+
+# Motifs up to this length are compared by sequence (motifs_match, IsKnownMotif); longer ones,
+# which are not meaningfully canonicalizable here, match a disease locus by length.
+MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE = 6
 
 
 # Gene-region prioritization rank (lower number = more important / more likely
@@ -92,10 +97,13 @@ def compute_jaccard(start1, end1, start2, end2):
 def motifs_match(motif1, motif2):
     """Return whether two motifs match under TRExplorer-style rules.
 
-    For motifs of at most 6 bp, two motifs match when their canonical forms
-    (including reverse complement) are equal. For longer motifs -- which are not
-    meaningfully canonicalizable here -- two motifs match when they have the
-    same length.
+    For motifs of at most MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE bp, two motifs match
+    when their canonical forms (including reverse complement) are equal, with an
+    ``N`` in either motif matching any base: the catalogs write polyalanine loci
+    such as ARX and PHOX2B as ``GCN`` / ``NGC``, which a locus genotyped as
+    ``GCG`` or ``GCC`` must still match. Motifs without N are compared exactly.
+    For longer motifs -- which are not meaningfully canonicalizable here -- two
+    motifs match when they have the same length.
 
     Args:
         motif1: The first motif string (e.g. the query locus motif).
@@ -107,9 +115,12 @@ def motifs_match(motif1, motif2):
     """
     if not motif1 or not motif2:
         return False
-    if len(motif1) <= 6:
-        return (compute_canonical_motif(motif1, include_reverse_complement=True)
-                == compute_canonical_motif(motif2, include_reverse_complement=True))
+    if len(motif1) <= MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE:
+        # Motifs of different lengths never share a canonical form; checking first also keeps a
+        # long N-rich catalog motif from being expanded.
+        return len(motif1) == len(motif2) and bool(
+            compute_canonical_motifs_with_n_as_any_base(motif1)
+            & compute_canonical_motifs_with_n_as_any_base(motif2))
     return len(motif1) == len(motif2)
 
 
@@ -220,6 +231,37 @@ def strchive_locus_motifs(locus_data):
             + list(locus_data.get("pathogenic_motif_reference_orientation") or []))
 
 
+def variant_catalog_locus_motifs(locus_data):
+    """Return the motifs to match a variant-catalog locus against.
+
+    The counterpart of ``strchive_locus_motifs`` for the variant catalog, and likewise
+    the one definition the matching and the known-motif flag share.
+
+    Args:
+        locus_data: A variant-catalog locus dict (an interval's ``.data``).
+
+    Returns:
+        A list of motif strings: the ``RepeatUnit`` followed by any ``PathogenicMotifs``
+        (which the catalog stores as null for most loci).
+    """
+    return [locus_data["RepeatUnit"]] + list(locus_data.get("PathogenicMotifs") or [])
+
+
+def _catalogs_with_their_motifs(interval_trees, strchive_trees):
+    """Return each disease catalog with the function listing a locus's motifs and its name.
+
+    Args:
+        interval_trees: chrom -> IntervalTree of variant-catalog loci.
+        strchive_trees: chrom -> IntervalTree of STRchive loci, or None.
+
+    Returns:
+        A tuple of ``(trees, locus_motifs_function, source_name)`` triples, the variant
+        catalog first: it is consulted before the STRchive fallback.
+    """
+    return ((interval_trees, variant_catalog_locus_motifs, "variant_catalog"),
+            (strchive_trees or {}, strchive_locus_motifs, "STRchive"))
+
+
 # A query locus matches a known disease locus only when their intervals' Jaccard index is above this
 KNOWN_DISEASE_LOCUS_MIN_JACCARD = 0.66
 
@@ -230,8 +272,8 @@ def find_matching_disease_locus(chrom, start, end, motif, interval_trees, strchi
     Matching uses TRExplorer-style logic: a query locus matches a disease locus
     when they overlap, their interval Jaccard is greater than
     KNOWN_DISEASE_LOCUS_MIN_JACCARD, and at least one of the disease locus's motifs
-    (its ``RepeatUnit`` plus any ``PathogenicMotifs``, or for STRchive
-    ``strchive_locus_motifs``) matches the query motif under ``motifs_match``. The
+    (``variant_catalog_locus_motifs``, or for STRchive ``strchive_locus_motifs``)
+    matches the query motif under ``motifs_match``. The
     variant catalog is consulted first; the optional STRchive trees are a
     fallback consulted only when the catalog yields no match. The build
     (``matches_disease_locus``) and the server's locus-detail page and
@@ -255,22 +297,12 @@ def find_matching_disease_locus(chrom, start, end, motif, interval_trees, strchi
         return None, None
     chrom = chrom.replace("chr", "") if chrom else ""
 
-    for interval in interval_trees.get(chrom, intervaltree.IntervalTree()).overlap(start, end):
-        if compute_jaccard(start, end, interval.begin, interval.end) <= KNOWN_DISEASE_LOCUS_MIN_JACCARD:
-            continue
-        locus_data = interval.data
-        for disease_motif in [locus_data["RepeatUnit"]] + (locus_data.get("PathogenicMotifs") or []):
-            if motifs_match(motif, disease_motif):
-                return locus_data, "variant_catalog"
-
-    if strchive_trees:
-        for interval in strchive_trees.get(chrom, intervaltree.IntervalTree()).overlap(start, end):
+    for trees, locus_motifs, source in _catalogs_with_their_motifs(interval_trees, strchive_trees):
+        for interval in trees.get(chrom, intervaltree.IntervalTree()).overlap(start, end):
             if compute_jaccard(start, end, interval.begin, interval.end) <= KNOWN_DISEASE_LOCUS_MIN_JACCARD:
                 continue
-            locus_data = interval.data
-            for strchive_motif in strchive_locus_motifs(locus_data):
-                if motifs_match(motif, strchive_motif):
-                    return locus_data, "STRchive"
+            if any(motifs_match(motif, disease_motif) for disease_motif in locus_motifs(interval.data)):
+                return interval.data, source
 
     return None, None
 
@@ -305,16 +337,23 @@ def collect_known_disease_canonical_motifs(interval_trees, strchive_trees=None):
     """Return the set of canonical motifs associated with known disease loci.
 
     Walks every disease-locus interval and collects the canonical form
-    (including reverse complement) of each locus's ``RepeatUnit`` and
-    ``PathogenicMotifs``. When ``strchive_trees`` is supplied, each STRchive
-    locus's motifs (``strchive_locus_motifs``) are collected too, so a
+    (including reverse complement) of each locus's motifs
+    (``variant_catalog_locus_motifs``). When ``strchive_trees`` is supplied, each
+    STRchive locus's motifs (``strchive_locus_motifs``) are collected too, so a
     locus that is recognized as a known disease locus only via the STRchive
     fallback (see ``matches_disease_locus``) still has its motif counted as
-    known -- otherwise such a locus would get ``KnownDiseaseLocus`` set but
-    ``IsKnownMotif=0``. Motifs containing ``N`` are intentionally skipped --
-    they cannot be canonicalized into a single concrete sequence to compare
-    against per-locus canonical motifs, so excluding them is by design (do not
-    "fix" this).
+    known.
+
+    A motif of at most MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE bp containing ``N``
+    contributes the canonical form of every concrete motif it stands for
+    (``compute_canonical_motifs_with_n_as_any_base``), so ``GCN`` makes GCA, GCC,
+    GCG and GCT known, as ``motifs_match`` treats them. For these motifs
+    ``IsKnownMotif`` therefore agrees with ``KnownDiseaseLocus``. A longer motif
+    contributes its own canonical form, or nothing when it contains ``N`` (it
+    stands for too many motifs to list); since ``motifs_match`` matches longer
+    motifs by length alone, a locus can get ``KnownDiseaseLocus`` set but
+    ``IsKnownMotif=0`` when its motif is longer than
+    MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE bp.
 
     Args:
         interval_trees: chrom -> IntervalTree from ``load_known_disease_loci``.
@@ -325,24 +364,16 @@ def collect_known_disease_canonical_motifs(interval_trees, strchive_trees=None):
         A set of canonical motif strings.
     """
     known_canonical_motifs = set()
-    for tree in interval_trees.values():
-        for interval in tree:
-            if not interval.data:
-                continue
-            for motif in [interval.data["RepeatUnit"]] + (interval.data.get("PathogenicMotifs") or []):
-                if "N" in motif:
+    for trees, locus_motifs, _source in _catalogs_with_their_motifs(interval_trees, strchive_trees):
+        for tree in trees.values():
+            for interval in tree:
+                if not interval.data:
                     continue
-                known_canonical_motifs.add(
-                    compute_canonical_motif(motif, include_reverse_complement=True))
-    for tree in (strchive_trees or {}).values():
-        for interval in tree:
-            if not interval.data:
-                continue
-            for motif in strchive_locus_motifs(interval.data):
-                if "N" in motif:
-                    continue
-                known_canonical_motifs.add(
-                    compute_canonical_motif(motif, include_reverse_complement=True))
+                for motif in locus_motifs(interval.data):
+                    if len(motif) <= MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE:
+                        known_canonical_motifs.update(compute_canonical_motifs_with_n_as_any_base(motif))
+                    elif "N" not in motif.upper():
+                        known_canonical_motifs.add(compute_canonical_motif(motif))
     return known_canonical_motifs
 
 
@@ -545,14 +576,21 @@ def add_population_stdev_percentile_columns(locus_records):
 def compute_is_known_motif(canonical_motif, known_canonical_motifs):
     """Return 1 if a canonical motif is a known disease motif, else 0.
 
+    A locus motif of at most MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE bp containing ``N``
+    is known when any concrete motif it stands for is, the rule ``motifs_match``
+    applies.
+
     Args:
         canonical_motif: A locus's canonical motif string.
         known_canonical_motifs: The set returned by
             ``collect_known_disease_canonical_motifs``.
 
     Returns:
-        1 if ``canonical_motif`` is in the known set, else 0.
+        1 if ``canonical_motif`` (or, for a short motif with N, one of the concrete
+        motifs it stands for) is in the known set, else 0.
     """
+    if "N" in canonical_motif and len(canonical_motif) <= MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE:
+        return 1 if compute_canonical_motifs_with_n_as_any_base(canonical_motif) & known_canonical_motifs else 0
     return 1 if canonical_motif in known_canonical_motifs else 0
 
 

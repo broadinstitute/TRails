@@ -224,7 +224,7 @@ class AnnotationWriteHelperTests(unittest.TestCase):
                 self.assertTrue(re.search(r"^(def %s\(|%s = )" % (symbol, symbol), server, re.MULTILINE),
                                 "%s cites results_server.%s, which does not exist" % (name, symbol))
 
-    def test_that_function_exists_and_returns_the_detail_field_the_helper_reads(self):
+    def test_the_read_only_server_hook_answers_403_with_a_detail_field(self):
         server = read_template("results_server.py")
         self.assertIn("def restrict_writes():", server)
         hook = server[server.index("def restrict_writes():"):]
@@ -665,9 +665,9 @@ class ResultsTableColumnCountTests(unittest.TestCase):
         row = js_function_body(self.template, "function renderLocusRow(locus, rowIndex) {")
         row = row[row.index('return `<tr class="locus-row"'):]
         row = row[:row.index("</tr>`;")]
-        self.assertEqual(19, header.count("<th "))
+        self.assertGreater(header.count("<th "), 0)
         # selectedAllelesCell, the grouped view's extra cell, is interpolated rather than literal
-        self.assertEqual(19, row.count("<td "))
+        self.assertEqual(header.count("<th "), row.count("<td "))
 
     def test_no_colspan_is_a_hard_coded_number(self):
         self.assertEqual([], re.findall(r'colspan="\d+"', self.template))
@@ -822,7 +822,7 @@ class GroupResultsByTests(unittest.TestCase):
         apply_state = js_function_body(self.template, "function applyStateToUI(")
         self.assertIn("'require_above_population', 'group_by']", apply_state)
         self.assertIn("setGroupSortDropdown(currentState.group_sort);", apply_state)
-        self.assertIn('input[name="group_sort_direction"][value="${currentState.group_sort_direction}"]', apply_state)
+        self.assertIn("inputsWithValue('group_sort_direction', currentState.group_sort_direction)", apply_state)
         read_state = js_function_body(self.template, "function readStateFromUI(")
         for name in ("group_by", "group_sort", "group_sort_direction"):
             self.assertIn("currentState.%s = " % name, read_state)
@@ -1091,16 +1091,76 @@ class CdnIntegrityTests(unittest.TestCase):
 
 class PagePastTheLastPageTests(unittest.TestCase):
     """A search that lands past the last page (its only row left the results, or a URL names a page
-    that no longer exists) shows the last page instead of an empty one."""
+    that no longer exists) shows the last page instead of an empty one.
+
+    The clamped page replaces the URL's history entry rather than adding one, so Back does not
+    return to the out-of-range page, which would clamp and push again.
+    """
+
+    def setUp(self):
+        self.search = js_function_body(read_template("index_page_template.html"), "async function performSearch(")
 
     def test_the_search_retries_on_the_last_page_before_rendering(self):
-        search = js_function_body(read_template("index_page_template.html"), "async function performSearch(")
         self.assertIn("if (data.total_pages > 0 && data.page > data.total_pages) {\n"
-                      "            currentState.page = data.total_pages;\n"
-                      "            return performSearch();", search)
-        self.assertLess(search.index("data.page > data.total_pages"), search.index("renderResults(data)"))
+                      "            currentState.page = data.total_pages;\n", self.search)
+        self.assertLess(self.search.index("data.page > data.total_pages"), self.search.index("renderResults(data)"))
         # The server reports the page count the check compares against
         self.assertIn('"total_pages": total_pages,', read_template("results_server.py"))
+
+    def test_the_clamped_page_replaces_the_history_entry_before_the_retry(self):
+        clamp = self.search[self.search.index("currentState.page = data.total_pages;"):]
+        self.assertLess(clamp.index("replaceStateInUrl();"), clamp.index("return performSearch();"))
+
+
+class TypedInDropdownValueEscapingTests(unittest.TestCase):
+    """Every dropdown that accepts typed-in values escapes them wherever Semantic UI writes them as HTML.
+
+    The results page restores #sample-id-filter from the URL hash, so without the escaping a link
+    such as #sample_id_keyword=<img src=x onerror=...> would run its script on the page. Semantic UI
+    writes a typed-in value into the "Add ..." menu item (templates.addition) and into the selection
+    label (templates.label), and with preserveHTML: false it hands the label template plain text.
+    """
+
+    def test_the_shared_settings_escape_the_addition_and_the_label(self):
+        settings = js_object_body(read_template("qc_shared_js.html"), "const ESCAPING_ADDITIONS_DROPDOWN_SETTINGS = {")
+        self.assertIn("preserveHTML: false,", settings)
+        self.assertIn("addition: choice => escapeHtml(choice),", settings)
+        self.assertIn("label: (value, text) => escapeHtml(text) + '<i class=\"delete icon\"></i>',", settings)
+
+    def test_every_dropdown_that_accepts_typed_in_values_uses_them(self):
+        dropdowns_with_additions = []
+        for name in sorted(os.listdir(CODE_DIRECTORY)):
+            if not name.endswith(".html"):
+                continue
+            for match in re.finditer(r"(\$\('#[\w-]+'\))\.dropdown\(\{(.*?)\n    \}\);", read_template(name), re.DOTALL):
+                if "allowAdditions: true" in match.group(2):
+                    dropdowns_with_additions.append(match.group(1))
+                    self.assertIn("...ESCAPING_ADDITIONS_DROPDOWN_SETTINGS,", match.group(2), match.group(1))
+        self.assertEqual(["$('#sample-id-filter')", "$('#add-tag-dropdown')", "$('#swim-sample-id-filter')"],
+                         dropdowns_with_additions)
+
+    def test_the_url_restored_dropdown_is_one_of_them(self):
+        apply_state = js_function_body(read_template("index_page_template.html"), "function applyStateToUI(")
+        self.assertIn("$('#sample-id-filter').dropdown('set exactly', ids);", apply_state)
+
+    def test_url_values_are_compared_rather_than_written_into_selectors(self):
+        # A URL value such as `"]` written into a selector makes it invalid, and applyStateToUI would
+        # throw before the page's first search
+        template = read_template("index_page_template.html")
+        helper = js_function_body(template, "function inputsWithValue(")
+        self.assertIn("$(`input[name=\"${name}\"]`).filter(function() { return this.value === value; });", helper)
+        apply_state = js_function_body(template, "function applyStateToUI(")
+        self.assertIn("inputsWithValue(name, currentState[name] || '').parent().checkbox('check');", apply_state)
+        self.assertIn("inputsWithValue('population_metric', currentState.population_metric || '99th')", apply_state)
+
+
+class SwimPlotMendelianGeneFilterTests(unittest.TestCase):
+    """The swim plot sends the Mendelian-gene filter under the name the API parses, mendelian_genes_only."""
+
+    def test_the_checkbox_sends_mendelian_genes_only(self):
+        self.assertIn("if ($('#swim_mendelian_genes_only').is(':checked')) params.mendelian_genes_only = '1';",
+                      read_template("swim_plot_template.html"))
+        self.assertIn('"known_motifs_only", "mendelian_genes_only",', read_template("results_server.py"))
 
 
 class NestedTableHeaderTests(unittest.TestCase):

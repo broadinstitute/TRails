@@ -57,6 +57,40 @@ class DownloadCleanupTests(unittest.TestCase):
         self.assertEqual(os.listdir(self.tmpdir), [])
 
 
+class DownloadTimeoutTests(unittest.TestCase):
+    """A stalled connection must raise, so its download is reported and skipped instead of hanging."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_every_download_passes_a_timeout_to_urlopen(self):
+        with mock.patch.object(trails_setup.urllib.request, "urlopen",
+                               return_value=io.BytesIO(b"table")) as urlopen:
+            trails_setup._download("https://example.org/table.tsv", os.path.join(self.tmpdir, "table.tsv"))
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], trails_setup.DOWNLOAD_STALL_TIMEOUT_SECONDS)
+
+        responses = [io.BytesIO(json.dumps({"status": "success", "public_urls": ["https://a"]}).encode()),
+                     io.BytesIO(gzip.compress(b"gene_id\nENSG1\n"))]
+        with mock.patch.object(trails_setup.urllib.request, "urlopen", side_effect=responses) as urlopen:
+            trails_setup._export_genelookup_gene_table(trails_setup.GENELOOKUP_GENE_TABLE_SQL,
+                                                       os.path.join(self.tmpdir, "genes.tsv.gz"))
+        self.assertTrue(all(call.kwargs.get("timeout") for call in urlopen.call_args_list))
+
+    def test_a_download_that_stalls_is_reported_and_skipped(self):
+        output = io.StringIO()
+        with mock.patch.object(trails_setup, "REFERENCE_FILES",
+                               [("table.tsv", "https://example.org/table.tsv", trails_setup._download, None)]), \
+                mock.patch.object(trails_setup.urllib.request, "urlopen",
+                                  return_value=ResponseThatFailsAfterOneChunk(TimeoutError("timed out"))), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(trails_setup.fetch_reference_data(self.tmpdir), {})
+        self.assertIn("could not fetch table.tsv (TimeoutError: timed out)", output.getvalue())
+        self.assertEqual(sorted(os.listdir(self.tmpdir)), [trails_setup.CACHE_MANIFEST_NAME])
+
+
 class GenelookupExportTests(unittest.TestCase):
 
     def setUp(self):

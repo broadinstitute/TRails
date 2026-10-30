@@ -124,7 +124,8 @@ class CursorLifetimeTests(unittest.TestCase):
         self.conn.close()
 
     def test_description_survives_a_later_query(self):
-        # validate_database reads the loci column list off this cursor after listing tables.
+        # A caller may read a cursor's description after running another query on the same
+        # connection.
         cursor = self.conn.execute("SELECT * FROM loci ORDER BY LocusId LIMIT 1")
         duckdb_compat.list_tables(self.conn)
         self.assertEqual([d[0] for d in cursor.description], ["LocusId", "Motif"])
@@ -209,18 +210,19 @@ class ConnectionApiTests(unittest.TestCase):
             reader.close()
 
     def test_read_only_connections_share_one_instance_and_get_their_own_temp_schema(self):
-        # get_db() opens one of these per request, and the variation cluster filter builds a
-        # temp table on it, so two concurrent requests must not collide over that name.
+        # get_db() opens one of these per request, and the swim plot's locus filter builds a temp
+        # table (swim_plot_matching_loci) on it, so two concurrent requests must not collide over
+        # that name.
         writer = duckdb_compat.connect(self.db_path)
         writer.execute("CREATE TABLE t AS SELECT 1 AS a")
         writer.close()
         first = duckdb_compat.connect(self.db_path, read_only=True)
         second = duckdb_compat.connect(self.db_path, read_only=True)
         try:
-            first.execute("CREATE OR REPLACE TEMP TABLE vc_filtered_loci AS SELECT * FROM t")
-            second.execute("CREATE OR REPLACE TEMP TABLE vc_filtered_loci AS SELECT * FROM t")
-            self.assertEqual(first.execute("SELECT COUNT(*) FROM vc_filtered_loci").fetchone()[0], 1)
-            self.assertEqual(second.execute("SELECT COUNT(*) FROM vc_filtered_loci").fetchone()[0], 1)
+            first.execute("CREATE OR REPLACE TEMP TABLE swim_plot_matching_loci AS SELECT * FROM t")
+            second.execute("CREATE OR REPLACE TEMP TABLE swim_plot_matching_loci AS SELECT * FROM t")
+            self.assertEqual(first.execute("SELECT COUNT(*) FROM swim_plot_matching_loci").fetchone()[0], 1)
+            self.assertEqual(second.execute("SELECT COUNT(*) FROM swim_plot_matching_loci").fetchone()[0], 1)
         finally:
             first.close()
             second.close()
@@ -363,6 +365,14 @@ class InsertRowsTests(unittest.TestCase):
             duckdb_compat.insert_rows(self.conn, "t", ["v"], [{"v": 1}, {"v": "abc"}])
         self.assertIn('Column "v" is declared BIGINT', str(caught.exception))
 
+    def test_a_column_of_a_type_trails_tables_do_not_use_is_refused_by_name(self):
+        # Only BIGINT, INTEGER, DOUBLE and VARCHAR columns are loaded; anything else raises
+        # instead of being handed to DuckDB to convert as it sees fit.
+        self.conn.execute("CREATE TABLE t (flag BOOLEAN)")
+        with self.assertRaises(ValueError) as caught:
+            duckdb_compat.insert_rows(self.conn, "t", ["flag"], [{"flag": True}])
+        self.assertIn('column "flag" is BOOLEAN', str(caught.exception))
+
     def test_a_large_int_is_not_rounded(self):
         # Wider than float64 can hold exactly, which is what a pandas upcast would cost.
         self.conn.execute("CREATE TABLE t (v BIGINT)")
@@ -411,8 +421,9 @@ class NaNParameterTests(unittest.TestCase):
 
     Missing numbers reach the database writer as NaN. DuckDB stores a bound NaN as an actual
     NaN: it is not NULL, COUNT(col) counts it, and it compares as LARGER than every real
-    number. A locus with no population statistic would then pass the server's "affected
-    allele > population 99th percentile" gate as though the cohort had data for it.
+    number. A locus with no population statistic would then be wrongly rejected by the
+    server's "affected allele > population 99th percentile" filter, which lets a NULL
+    threshold through but finds no real allele size larger than a NaN.
     """
 
     def setUp(self):

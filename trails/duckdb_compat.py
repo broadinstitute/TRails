@@ -77,9 +77,10 @@ def _bound_value(value):
 
     Rows reaching the database writer carry missing numbers as NaN. Bound as it is, DuckDB
     stores an actual NaN, which is not NULL, is counted by COUNT(col), and compares as LARGER
-    than every real number. A locus whose population statistic is missing
-    would then pass an "affected allele > population 99th percentile" gate as though it had
-    data.
+    than every real number. A locus whose population statistic is missing would then be
+    wrongly rejected by the server's "affected allele > population 99th percentile" filter,
+    which lets a NULL threshold through (``threshold IS NULL OR allele > threshold``): a NaN
+    is not NULL, and no real allele size is larger than it.
 
     `value != value` is true only for NaN, and works for numpy floats as well as Python's.
     """
@@ -144,8 +145,8 @@ class Cursor:
     A duckdb connection holds one result at a time, where sqlite3 hands out independent
     cursors. Two consequences:
 
-      - description is read and kept at construction, because the calling code reads it back
-        off a cursor after running another query on the same connection.
+      - description is read and kept at construction, so it stays readable even after a later
+        query on the same connection.
       - the rows can only be fetched until the next execute() on the same connection.
         Fetching after that raises instead of silently returning the newer query's rows.
     """
@@ -224,8 +225,8 @@ class Connection:
         self.generation += 1
         self._connection.executemany(sql, _bound_params(seq_of_params))
 
-    # Expose a DataFrame to SQL under a name, and take it away again. insert_rows is the
-    # caller: it is how a chunk of rows is handed to DuckDB in one statement.
+    # Expose a DataFrame to SQL under a name, and take it away again. insert_rows hands DuckDB
+    # a chunk of rows this way, and trexplorer_annotations registers the loci it matches.
     def register(self, name, df):
         self._connection.register(name, df)
 
@@ -296,26 +297,31 @@ def _chunk_column(column_name, values, declared_type):
     """Build one chunk column with the pandas dtype its destination column is declared as.
 
     Args:
-        column_name: The column's name, used only in the error message.
+        column_name: The column's name, used only in the error messages.
         values: The column's values for this chunk, NaNs already mapped to None.
-        declared_type: The DuckDB type the destination column is declared as, or None when
-            the table has no such column.
+        declared_type: The DuckDB type the destination column is declared as: BIGINT, INTEGER,
+            DOUBLE or VARCHAR, the types TRails' tables use (DESCRIBE reports a TEXT column as
+            VARCHAR). None when the table has no such column.
 
     Returns:
-        A pandas array (or object-dtype Series for a type TRails does not declare itself).
+        A pandas array of the matching nullable dtype.
+
+    Raises:
+        ValueError: If a value does not fit the declared type, or the column is of any other
+            type or missing from the table.
     """
     try:
         if declared_type in ("BIGINT", "INTEGER"):
             return pd.array(values, dtype="Int64")
-        if declared_type in ("DOUBLE", "FLOAT"):
+        if declared_type == "DOUBLE":
             return pd.array(values, dtype="Float64")
         if declared_type == "VARCHAR":
             return pd.array([_varchar_value(value) for value in values], dtype="string")
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f'Column "{column_name}" is declared {declared_type} but holds a '
                          f"value that does not fit that type: {error}") from error
-    # Any other declared type: hand the values over as they are and let DuckDB convert them.
-    return pd.Series(values, dtype=object)
+    raise ValueError(f"insert_rows loads only BIGINT, INTEGER, DOUBLE and VARCHAR columns, but "
+                     f'column "{column_name}" is {declared_type or "not in the table"}')
 
 
 def _declared_column_types(conn, table_name):

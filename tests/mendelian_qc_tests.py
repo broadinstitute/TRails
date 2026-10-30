@@ -94,18 +94,18 @@ class ChromCategoryTests(unittest.TestCase):
 
     def test_autosome(self):
         self.assertEqual(get_chrom_category("chr1-100-110-AT"), "autosome")
-        self.assertEqual(get_chrom_category("chr12_200_210_CAG"), "autosome")
+        self.assertEqual(get_chrom_category("12-200-210-CAG"), "autosome")
 
     def test_chrx(self):
         self.assertEqual(get_chrom_category("chrX-1-2-A"), "chrX")
-        self.assertEqual(get_chrom_category("X_1_2_A"), "chrX")
+        self.assertEqual(get_chrom_category("X-1-2-A"), "chrX")
 
     def test_chry(self):
         self.assertEqual(get_chrom_category("chrY-1-2-A"), "chrY")
 
     def test_chrm(self):
         self.assertEqual(get_chrom_category("chrM-1-2-A"), "chrM")
-        self.assertEqual(get_chrom_category("chrMT_1_2_A"), "chrM")
+        self.assertEqual(get_chrom_category("chrMT-1-2-A"), "chrM")
 
 
 class MotifSizeCategoryTests(unittest.TestCase):

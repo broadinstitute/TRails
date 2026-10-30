@@ -20,8 +20,9 @@ every locus whose motif is made of A, C, G and T only:
     chrY_total`` something other than a violation rate.
 
 Violations and totals are tallied by chromosome, by motif-size category and by
-canonical 1-6 bp motif into the two output tables (``per_sample_columns`` and
-``per_motif_columns``).
+canonical 1-6 bp motif into the per-sample and per-motif rows (``_per_sample_row``
+/ ``_per_motif_row``) that result_database writes as the ``mendelian_violations``
+and ``mendelian_violations_per_motif`` tables.
 
 All functions are pure -- they take their inputs as arguments and return values
 without mutating shared module state.
@@ -117,23 +118,17 @@ def check_violation(child_genotype, mother_genotype, father_genotype, threshold,
 def get_chrom_category(trid):
     """Categorize a locus id by chromosome type.
 
-    The chromosome is taken from the first ``_``-delimited field of the trid, or
-    the first ``-``-delimited field if there is no underscore, or the whole
-    string otherwise.
+    The chromosome is the first ``-``-delimited field of the trid, as in the
+    build's ``Chrom``: ``locus_annotations.parse_locus_id`` has already required
+    the ``chrom-start-end-motif`` form.
 
     Args:
-        trid: Locus id, expected to start with a chromosome name (e.g.
-            ``chr1_...`` or ``chrX-...``).
+        trid: Locus id of the form ``chrom-start-end-motif`` (e.g. ``chrX-...``).
 
     Returns:
         One of ``"autosome"``, ``"chrX"``, ``"chrY"`` or ``"chrM"``.
     """
-    if "_" in trid:
-        chrom = trid.split("_")[0].lower()
-    elif "-" in trid:
-        chrom = trid.split("-")[0].lower()
-    else:
-        chrom = trid.lower()
+    chrom = trid.split("-")[0].lower()
 
     if chrom in ("chrx", "x"):
         return "chrX"

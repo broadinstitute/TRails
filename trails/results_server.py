@@ -691,7 +691,11 @@ def compute_violation_fraction(violations, total):
     return (violations or 0) / total if total else 0
 
 
-def load_mendelian_warnings(db_path, threshold=0.10):
+# A trio child is flagged when its autosome or chrX Mendelian-violation rate is above this (10%)
+MENDELIAN_VIOLATION_RATE_WARNING_THRESHOLD = 0.10
+
+
+def load_mendelian_warnings(db_path):
     """Load Mendelian violation data and flag samples with high violation rates.
 
     The Mendelian-violation tables live in the results database. If the
@@ -699,15 +703,11 @@ def load_mendelian_warnings(db_path, threshold=0.10):
 
     Args:
         db_path: Path to the results DuckDB database.
-        threshold: Violation-rate threshold (default 0.10 = 10%).
 
     Returns:
-        dict mapping sample_id to warning info for samples exceeding the threshold
-        on autosome OR chrX.
+        dict mapping sample_id to warning info for samples whose autosome or chrX rate is above
+        MENDELIAN_VIOLATION_RATE_WARNING_THRESHOLD.
     """
-    if not os.path.exists(db_path):
-        return {}
-
     conn = duckdb_compat.connect(db_path, read_only=True)
     conn.row_factory = duckdb_compat.Row
     try:
@@ -719,7 +719,8 @@ def load_mendelian_warnings(db_path, threshold=0.10):
             autosome_rate = compute_violation_fraction(row["autosome_violations"], row["autosome_total"])
             chrX_rate = compute_violation_fraction(row["chrX_violations"], row["chrX_total"])
             chrY_rate = compute_violation_fraction(row["chrY_violations"], row["chrY_total"])
-            if autosome_rate > threshold or chrX_rate > threshold:
+            if (autosome_rate > MENDELIAN_VIOLATION_RATE_WARNING_THRESHOLD
+                    or chrX_rate > MENDELIAN_VIOLATION_RATE_WARNING_THRESHOLD):
                 motif_rates = {}
                 for category in ["1bp", "2bp", "3bp", "4bp", "5bp", "6bp", "7_24bp", "25plusbp"]:
                     violations = row[f"motif_{category}_violations"] or 0
@@ -809,7 +810,10 @@ def compute_outlier_warnings(rank1_data):
     the per-sample largest-outlier count.
 
     Returns:
-        dict mapping sample_id to {"outlier_bins": {bin: {"count", "threshold"}}}.
+        dict mapping sample_id to {"outlier_bins": {bin: {"count", "threshold"}}}. The
+        threshold is the smallest count that is flagged, i.e. the 99th percentile rounded up,
+        since the counts are whole numbers and the percentile usually is not; the QC pages show
+        it as "≥ threshold".
     """
     bin_counts = collections.defaultdict(list)
     for entry in rank1_data:
@@ -829,7 +833,7 @@ def compute_outlier_warnings(rank1_data):
                 warnings.setdefault(sample_id, {"outlier_bins": {}})
                 warnings[sample_id]["outlier_bins"][bin_name] = {
                     "count": count,
-                    "threshold": int(threshold),
+                    "threshold": math.ceil(threshold),
                 }
     return warnings
 
@@ -3365,8 +3369,8 @@ def get_swim_plot_data():
     """Return swim-plot data: one entry per outlier sample per motif category.
 
     Takes the /api/v1/loci parameters (see validate_params), plus require_affected_above_unaffected,
-    which keeps only the affected alleles above every unaffected allele at their locus;
-    mendelian_only is another name for mendelian_genes_only. Each row is one allele, so:
+    which keeps only the alleles above every unaffected or solved sample's allele at their locus.
+    Each row is one allele, so:
 
       * the sample-level filters (SAMPLE_LEVEL_FILTERS) keep the rows of the matching samples;
       * the SWIM_PLOT_ALLELE_LEVEL_FILTERS compare each row's own allele, where /api/v1/loci
@@ -3378,25 +3382,18 @@ def get_swim_plot_data():
     params, error = validate_params()
     if error:
         return error
-    if is_true_flag("mendelian_only"):
-        params["mendelian_genes_only"] = True
     ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
 
     row_clauses = []
     row_params = []
 
     if is_true_flag("require_affected_above_unaffected"):
-        row_clauses.append("""(
-            affected_status IN ('Affected', 'Possibly Affected')
-            AND allele_size > COALESCE(
-                (SELECT MAX(inner_sp.allele_size)
-                 FROM swim_plot inner_sp
-                 WHERE inner_sp.LocusId = swim_plot.LocusId
-                   AND inner_sp.outlier_type = swim_plot.outlier_type
-                   AND inner_sp.affected_status = 'Unaffected'),
-                0
-            )
-        )""")
+        # The build sets is_above_first_unaffected with the same rule #Aff and the results table's
+        # require_above_unaffected use: above the largest allele of the locus's unaffected or
+        # solved samples (analysis_columns.is_unaffected_or_solved_status), so samples of unknown
+        # status count as candidates, and an unaffected or solved sample's own allele is never
+        # above it.
+        row_clauses.append("swim_plot.is_above_first_unaffected = 1")
 
     if "min_expansion" in params:
         row_clauses.append("swim_plot.allele_size >= swim_plot.NumRepeatsInReference + ?")

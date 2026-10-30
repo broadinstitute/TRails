@@ -11,6 +11,7 @@ from motif_utilities import (
     COMPLEMENT,
     _alphabetically_first_motif_under_shift,
     compute_canonical_motif,
+    compute_canonical_motifs_with_n_as_any_base,
     generate_all_canonical_motifs,
     reverse_complement,
 )
@@ -105,6 +106,18 @@ class ComputeCanonicalMotifTests(unittest.TestCase):
         # An N-containing motif still canonicalizes (N complements to N).
         self.assertEqual(compute_canonical_motif("AN"), "AN")
         self.assertEqual(compute_canonical_motif("NA"), "AN")
+
+
+class CanonicalMotifsWithNAsAnyBaseTests(unittest.TestCase):
+
+    def test_n_stands_for_every_base(self):
+        self.assertEqual(compute_canonical_motifs_with_n_as_any_base("gcn"),
+                         {compute_canonical_motif(motif) for motif in ("GCA", "GCC", "GCG", "GCT")})
+        self.assertEqual(len(compute_canonical_motifs_with_n_as_any_base("NN")),
+                         len({compute_canonical_motif(a + b) for a in "ACGT" for b in "ACGT"}))
+
+    def test_a_motif_without_n_gives_its_own_canonical_motif(self):
+        self.assertEqual(compute_canonical_motifs_with_n_as_any_base("CAG"), {"AGC"})
 
 
 class GenerateAllCanonicalMotifsTests(unittest.TestCase):

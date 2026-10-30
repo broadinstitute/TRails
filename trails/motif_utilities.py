@@ -2,7 +2,9 @@
 
   * ``reverse_complement`` over the full IUPAC ``COMPLEMENT`` table,
   * ``compute_canonical_motif``: the alphabetically first rotation of the motif or
-    (optionally) of its reverse complement, and
+    (optionally) of its reverse complement,
+  * ``compute_canonical_motifs_with_n_as_any_base``: the canonical motifs of every
+    concrete motif an N-containing motif stands for, and
   * ``generate_all_canonical_motifs``: the set of all canonical motifs up to a length.
 
 All functions are pure: they take their inputs as arguments and return values
@@ -97,6 +99,26 @@ def compute_canonical_motif(motif, include_reverse_complement=True):
             return minimal_motif_reverse_complement
 
     return minimal_motif
+
+
+def compute_canonical_motifs_with_n_as_any_base(motif):
+    """Return the canonical motifs of every concrete motif that ``motif`` stands for.
+
+    Each ``N`` stands for any of A, C, G and T, so the polyalanine catalog motif
+    ``"GCN"`` stands for GCA, GCC, GCG and GCT. Two motifs match, N included, when
+    their sets share a canonical motif. A motif without N gives just its own
+    canonical motif. The number of concrete motifs is 4 to the power of the number
+    of Ns, so callers expand only short motifs.
+
+    Args:
+        motif: A repeat motif such as ``"GCN"``. Case-insensitive.
+
+    Returns:
+        A set of canonical motif strings (``compute_canonical_motif``, with reverse
+        complement).
+    """
+    base_choices = [("A", "C", "G", "T") if base == "N" else (base,) for base in motif.upper()]
+    return {compute_canonical_motif("".join(bases)) for bases in itertools.product(*base_choices)}
 
 
 def generate_all_canonical_motifs(max_size=6):

@@ -126,13 +126,13 @@ class GroupedViewTestCase(ServerTestCase):
         header = lines[0].split("\t")
         return response, [dict(zip(header, line.split("\t"))) for line in lines[1:]]
 
-
-class GroupedViewTests(GroupedViewTestCase):
-
     def _groups(self, **params):
         response = self.client.get("/api/v1/outlier_samples", query_string=dict({"outlier_type": "all"}, **params))
         self.assertEqual(response.status_code, 200, response.get_json())
         return response.get_json()
+
+
+class GroupedViewTests(GroupedViewTestCase):
 
     def _loci(self, **params):
         response = self.client.get("/api/v1/loci", query_string=dict({"outlier_type": "all"}, **params))
@@ -336,9 +336,7 @@ class NoSampleTableTests(GroupedViewTestCase):
 
     def test_sample_id_filters_still_find_the_samples(self):
         def groups(**params):
-            response = self.client.get("/api/v1/outlier_samples", query_string=dict({"outlier_type": "all"}, **params))
-            self.assertEqual(response.status_code, 200, response.get_json())
-            return {r["group_id"]: r for r in response.get_json()["results"]}
+            return {r["group_id"]: r for r in self._groups(**params)["results"]}
         self.assertEqual(list(groups(group_by="sample", sample_id_keyword="s2")), ["S2"])
         self.assertEqual(sorted(groups(group_by="sample", sample_id_like="S")), ["S1", "S2", "S3", "S6"])
         self.assertEqual({f: r["num_loci"] for f, r in groups(group_by="family", sample_id_keyword="S2").items()},

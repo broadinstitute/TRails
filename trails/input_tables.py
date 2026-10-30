@@ -384,10 +384,9 @@ def read_phenotypes(path):
 def read_gene_table(path):
     """Read the gene table into a gene_id -> annotations mapping.
 
-    Keeps the columns used downstream when present: ``gene_symbol``,
-    ``gene_aliases``, ``pLI_v2``, ``pLI_v4``, ``lof_oe_ci_upper_v4``,
-    ``hgnc_gene_id``, ``inheritance``, ``disease_category``,
-    ``LLM_phenotype_summary``, ``sources``.
+    Keeps, when present, the fields analysis_columns.GENE_TABLE_COLUMN_BY_SOURCE_FIELD
+    lists (gene_symbol, the pLI and LOEUF values, inheritance, sources, ...), the
+    ones the downstream stages read.
 
     Args:
         path: Path to the gene-table TSV (optionally gzipped), or None.
@@ -409,11 +408,7 @@ def read_gene_table(path):
     # case/underscore-insensitive rule the module docstring states for every input table: a header
     # spelled "Gene_ID", "PLI_V4" or "gene symbol" would otherwise be silently dropped (or, for the
     # required gene_id column, rejected outright).
-    matches = match_columns(df, [
-        "gene_id", "gene_symbol", "gene_aliases", "pLI_v2", "pLI_v4",
-        "lof_oe_ci_upper_v4", "hgnc_gene_id", "inheritance", "disease_category",
-        "LLM_phenotype_summary", "sources",
-    ])
+    matches = match_columns(df, ["gene_id"] + list(analysis_columns.GENE_TABLE_COLUMN_BY_SOURCE_FIELD))
     if "gene_id" not in matches:
         raise ValueError(
             f"Gene table {path} is missing a required 'gene_id' column; "
