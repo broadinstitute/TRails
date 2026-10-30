@@ -659,8 +659,8 @@ STRCHIVE_TEST_LOCI = [
         "inheritance": ["AD"],
         "pathogenic_min": 60,
         "chrom": "chr9",
-        # STRchive coordinates are 1-based, so this is the 0-based interval [100, 110).
-        "start_hg38": 101,
+        # STRchive's start is 0-based and its stop exclusive, so this is the interval [100, 110).
+        "start_hg38": 100,
         "stop_hg38": 110,
         "reference_motif_reference_orientation": ["AAAAG"],
         "pathogenic_motif_reference_orientation": ["AAGGG"],
@@ -673,7 +673,7 @@ STRCHIVE_TEST_LOCI = [
         "inheritance": "AR",
         "pathogenic_min": 50,
         "chrom": "chr3",
-        "start_hg38": 301,
+        "start_hg38": 300,
         "stop_hg38": 310,
         "reference_motif_reference_orientation": ["CAG"],
         "pathogenic_motif_reference_orientation": [],
@@ -1821,9 +1821,9 @@ class KnownDiseaseMatchTests(unittest.TestCase):
         catalog_path = os.path.join(cls.tmpdir, "catalog.json")
         with open(catalog_path, "w") as output_file:
             json.dump([
-                {"LocusId": "ZERO_MIN", "MainReferenceRegion": "chr1:101-110", "RepeatUnit": "AT",
+                {"LocusId": "ZERO_MIN", "MainReferenceRegion": "chr1:100-110", "RepeatUnit": "AT",
                  "Diseases": [{"Name": "D1", "PathogenicMin": 0}, {"Name": "D2", "PathogenicMin": 40}]},
-                {"LocusId": "NO_MIN", "MainReferenceRegion": "chr3:301-310", "RepeatUnit": "CAG",
+                {"LocusId": "NO_MIN", "MainReferenceRegion": "chr3:300-310", "RepeatUnit": "CAG",
                  "Diseases": [{"Name": "D3"}]},
             ], output_file)
         strchive_path = os.path.join(cls.tmpdir, "STRchive-loci.json")

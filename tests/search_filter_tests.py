@@ -804,7 +804,7 @@ class DiseaseCatalogStartupTests(unittest.TestCase):
                 "locus_id": "FMR1_test",
                 "disease": "Test syndrome",
                 "chrom": "chr1",
-                "start_hg38": 101,
+                "start_hg38": 100,
                 "stop_hg38": 110,
                 "reference_motif_reference_orientation": ["AT"],
                 "pathogenic_motif_reference_orientation": ["AT"],
