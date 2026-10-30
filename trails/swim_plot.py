@@ -27,6 +27,7 @@ from analysis_columns import (
     is_missing_outlier_value,
     is_none_or_nan,
     parse_outlier_entries,
+    title_case_status_for_display,
 )
 
 
@@ -86,24 +87,6 @@ def _compute_motif_category(motif_size):
     return "25+bp"
 
 
-def _title_case_status(raw_status):
-    """Title-case an affected_status or analysis_status for display, or "Unknown".
-
-    A blank status ("", "NA", "N/A", "null", ...) means nothing was recorded, so it
-    becomes "Unknown" rather than the display values "Na", "N/A" or "Null", which
-    would show up as extra facet categories.
-
-    Args:
-        raw_status: The sample's raw status, or a missing value.
-
-    Returns:
-        "Unknown" when the status is missing or blank (``blank_to_none``), otherwise
-        the stripped, Title-cased value, e.g. "Affected" or "Partially Solved".
-    """
-    status = blank_to_none(raw_status)
-    return "Unknown" if status is None else str(status).strip().title()
-
-
 def generate_swim_plot_table(records, sample_lookup):
     """Flatten locus records into one swim-plot row per outlier allele.
 
@@ -160,9 +143,9 @@ def generate_swim_plot_table(records, sample_lookup):
                     # The sample row's affected_status, so "possibly affected" is shown as it
                     # was entered; read_sample_metadata's affected_lookup collapses it to
                     # "affected" for the analysis logic.
-                    "affected_status": _title_case_status(
+                    "affected_status": title_case_status_for_display(
                         sample_row.get("affected_status") if sample_row else None),
-                    "analysis_status": _title_case_status(
+                    "analysis_status": title_case_status_for_display(
                         sample_row.get("analysis_status") if sample_row else None),
                     "sex": blank_to_none(sample_row.get("sex")) if sample_row else None,
                     "phenotype_description": (

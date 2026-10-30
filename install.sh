@@ -115,8 +115,9 @@ except Exception: pass" 2>/dev/null || true)"
     _tarball="$INSTALL_DIR/.trails_src.${_safe_ref}.tar.gz"
     rm -f "$_tarball"
     curl -fL --retry 3 -o "$_tarball" "$tarball_url"
-    # Stage the new tree, then replace the old one, so a file the new revision no longer
-    # ships does not survive.
+    # Stage the new tree first, so a failed download or extract leaves the installed files
+    # untouched. It is then copied over the install; the files a revision dropped are removed
+    # below, using the manifest of the previous install.
     _staging="$INSTALL_DIR/.trails_src_staging"
     rm -rf "$_staging"
     mkdir -p "$_staging"
@@ -202,7 +203,7 @@ echo ""
 REMOTE_FLAG=""; [[ "${TRAILS_REMOTE:-0}" == "1" ]] && REMOTE_FLAG="--remote"
 FORCE_FLAG="";  [[ "${TRAILS_FORCE:-0}"  == "1" ]] && FORCE_FLAG="--force"
 echo "Class A (public, fetched):"
-"$VENV_PYTHON" "$TRAILS_DIR/trails/trails_setup.py" fetch --dir "$REF_DIR" $REMOTE_FLAG $FORCE_FLAG
+"$VENV_PYTHON" "$TRAILS_DIR/trails/trails_setup.py" --dir "$REF_DIR" $REMOTE_FLAG $FORCE_FLAG
 
 echo ""
 echo "Class C (your own data — NOT fetched; see docs/INPUT_FORMATS.md):"

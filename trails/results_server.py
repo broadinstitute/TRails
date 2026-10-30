@@ -819,15 +819,9 @@ def compute_outlier_warnings(rank1_data):
     for entry in rank1_data:
         bin_counts[entry["bin"]].append((entry["sample_id"], entry["count"]))
 
-    bin_thresholds = {}
-    for bin_name, samples in bin_counts.items():
-        counts = [s[1] for s in samples]
-        if counts:
-            bin_thresholds[bin_name] = float(np.percentile(counts, 99))
-
     warnings = {}
     for bin_name, samples in bin_counts.items():
-        threshold = bin_thresholds.get(bin_name, float("inf"))
+        threshold = float(np.percentile([count for _, count in samples], 99))
         for sample_id, count in samples:
             if count >= threshold:
                 warnings.setdefault(sample_id, {"outlier_bins": {}})
@@ -1660,7 +1654,7 @@ def build_locus_filter_clauses(params, filters_applied_elsewhere=()):
 
     if "motif" in params:
         if "CanonicalMotif" in source_columns:
-            canonical_motifs = {compute_canonical_motif(m, include_reverse_complement=True) for m in params["motif"]}
+            canonical_motifs = {compute_canonical_motif(m) for m in params["motif"]}
             clauses.append(f"CanonicalMotif IN ({','.join('?' * len(canonical_motifs))})")
             sql_params.extend(sorted(canonical_motifs))
         else:
@@ -2033,7 +2027,7 @@ def split_outlier_entries(outlier_string):
     return entries
 
 
-def parse_outlier_samples(outlier_string, sample_lookup, affected_lookup, analysis_lookup):
+def parse_outlier_samples(outlier_string, sample_lookup):
     """Parse an OutlierSampleIds string and enrich with sample metadata.
 
     The format is comma-separated "{allele}x:{sample_id}" entries (split_outlier_entries).
@@ -2042,55 +2036,31 @@ def parse_outlier_samples(outlier_string, sample_lookup, affected_lookup, analys
         list of dicts with allele_size, sample_id, family_id, affected_status,
         analysis_status, sex, ancestry and phenotype_description.
     """
-    return [{"allele_size": allele_size, **describe_sample(sample_id, sample_lookup, affected_lookup, analysis_lookup)}
+    return [{"allele_size": allele_size, **describe_sample(sample_id, sample_lookup)}
             for allele_size, sample_id in split_outlier_entries(outlier_string)]
 
 
-def describe_sample(sample_id, sample_lookup, affected_lookup, analysis_lookup):
+def describe_sample(sample_id, sample_lookup):
     """Return the sample-table fields the page shows for a sample, with statuses title-cased.
+
+    The statuses are the sample row's, so "possibly affected" is shown as it was entered, as in
+    the swim plot; read_sample_metadata's affected lookup collapses it to "affected" for the
+    analysis logic only.
 
     Args:
         sample_id: Sample identifier.
         sample_lookup: dict mapping sample_id to row data.
-        affected_lookup: dict mapping sample_id to affected status.
-        analysis_lookup: dict mapping sample_id to analysis status.
 
     Returns:
         dict with sample_id, family_id, affected_status, analysis_status, sex, ancestry and
-        phenotype_description.
+        phenotype_description. A missing or blank status is "Unknown".
     """
     sample_row = sample_lookup.get(sample_id, {})
-
-    # Prefer the raw sample-row affected_status for display/export so
-    # "possibly affected" is preserved; affected_lookup collapses it to
-    # "affected" for analysis logic only (the affected_status handling in
-    # swim_plot.generate_swim_plot_table mirrors this). Fall back to affected_lookup
-    # when the sample has no usable raw status.
-    affected_raw = str(sample_row.get("affected_status") or "").strip()
-    if analysis_columns.blank_to_none(affected_raw) is None:
-        affected_raw = affected_lookup.get(sample_id, "unknown") or "unknown"
-    if affected_raw.lower() == "affected":
-        affected_display = "Affected"
-    elif affected_raw.lower() == "unaffected":
-        affected_display = "Unaffected"
-    else:
-        affected_display = affected_raw.title()
-
-    analysis_raw = analysis_lookup.get(sample_id, "unknown")
-    if analysis_raw == "solved":
-        analysis_display = "Solved"
-    elif analysis_raw == "unsolved":
-        analysis_display = "Unsolved"
-    elif analysis_raw == "unaffected":
-        analysis_display = "Unaffected"
-    else:
-        analysis_display = analysis_raw.title() if analysis_raw else "Unknown"
-
     return {
         "sample_id": sample_id,
         "family_id": sample_row.get("family_id"),
-        "affected_status": affected_display,
-        "analysis_status": analysis_display,
+        "affected_status": analysis_columns.title_case_status_for_display(sample_row.get("affected_status")),
+        "analysis_status": analysis_columns.title_case_status_for_display(sample_row.get("analysis_status")),
         "sex": sample_row.get("sex"),
         "ancestry": sample_row.get("ancestry"),
         "phenotype_description": sample_row.get("phenotype_description"),
@@ -2127,7 +2097,7 @@ def build_sample_details(row_dict, raw_row, lookups, per_outlier_scores, populat
         outlier_str = raw_row[col_name] if col_name in raw_row.keys() else ""
         if not outlier_str:
             continue
-        parsed = parse_outlier_samples(outlier_str, lookups["sample"], lookups["affected"], lookups["analysis"])
+        parsed = parse_outlier_samples(outlier_str, lookups["sample"])
         score_lookup = {(s["sample_id"], s["allele_size"]): s for s in per_outlier_scores.get(score_key, [])}
 
         qualifying = []
@@ -2351,19 +2321,8 @@ def fetch_phenotype_scores(conn, locus_id):
             (locus_id,),
         ).fetchall()
         for outlier_type, *values in rows:
-            result["per_locus"][outlier_type] = {
-                column: None if isinstance(value, float) and value != value else value
-                for column, value in zip(PER_LOCUS_PHENOTYPE_SCORE_COLUMNS, values)}
+            result["per_locus"][outlier_type] = dict(zip(PER_LOCUS_PHENOTYPE_SCORE_COLUMNS, values))
     return result
-
-
-def row_to_full_dict(row):
-    """Convert a duckdb_compat.Row to a dict with all columns (NaN -> None)."""
-    d = dict(row)
-    for k, v in d.items():
-        if isinstance(v, float) and v != v:
-            d[k] = None
-    return d
 
 
 # ---------------------------------------------------------------------------
@@ -2667,14 +2626,14 @@ def fetch_selected_sample_or_family_alleles(conn, params, locus_ids):
     return alleles
 
 
-# group_sort values of /api/v1/outlier_samples: the groups CTE column each one sorts by, and the
-# direction it sorts in unless group_sort_direction says otherwise
+# group_sort values of /api/v1/outlier_samples, each the groups CTE column it sorts by, mapped to
+# the direction it sorts in unless group_sort_direction says otherwise
 GROUPED_SORTS = {
-    "num_loci": ("num_loci", "desc"),
-    "num_disease_gene_loci": ("num_disease_gene_loci", "desc"),
-    "best_gene_phenotype_similarity": ("best_gene_phenotype_similarity", "desc"),
-    "largest_allele_size": ("largest_allele_size", "desc"),
-    "group_id": ("group_id", "asc"),
+    "num_loci": "desc",
+    "num_disease_gene_loci": "desc",
+    "best_gene_phenotype_similarity": "desc",
+    "largest_allele_size": "desc",
+    "group_id": "asc",
 }
 
 # Filters that describe a sample rather than a locus. The grouped view applies them to each row's
@@ -2738,7 +2697,7 @@ def validate_grouped_params():
     group_sort = request.args.get("group_sort") or "num_loci"
     if group_sort not in GROUPED_SORTS:
         return invalid((jsonify({"error": "Invalid parameter", "detail": f"group_sort must be one of: {', '.join(GROUPED_SORTS)}; got '{group_sort}'"}), 400))
-    group_sort_direction = request.args.get("group_sort_direction") or GROUPED_SORTS[group_sort][1]
+    group_sort_direction = request.args.get("group_sort_direction") or GROUPED_SORTS[group_sort]
     if group_sort_direction not in ("asc", "desc"):
         return invalid((jsonify({"error": "Invalid parameter", "detail": f"group_sort_direction must be one of: asc, desc; got '{group_sort_direction}'"}), 400))
     if not has_affected_unsolved_outliers_table():
@@ -2832,14 +2791,13 @@ def grouped_order_by(group_sort, group_sort_direction):
     broken by #Loci, then by group id.
 
     Args:
-        group_sort: A GROUPED_SORTS key.
+        group_sort: A GROUPED_SORTS key, which is the groups CTE column to sort by.
         group_sort_direction: "asc" or "desc".
 
     Returns:
         The ORDER BY terms, without the "ORDER BY" keyword.
     """
-    column = GROUPED_SORTS[group_sort][0]
-    return f"{column} {group_sort_direction.upper()} NULLS LAST, num_loci DESC, group_id"
+    return f"{group_sort} {group_sort_direction.upper()} NULLS LAST, num_loci DESC, group_id"
 
 
 def describe_groups(conn, ctes, ctes_params, group_column, group_rows, group_by, params):
@@ -2898,13 +2856,13 @@ def describe_groups(conn, ctes, ctes_params, group_column, group_rows, group_by,
             "largest_allele_delta_population": compute_delta_population(row["largest_allele_size"], locus_row, params),
         }
         if group_by == "sample":
-            result.update(describe_sample(row["group_id"], lookups["sample"], lookups["affected"], lookups["analysis"]))
+            result.update(describe_sample(row["group_id"], lookups["sample"]))
             # The family the build recorded, which the family view groups by, rather than the sample
             # table's, which is empty for a sample with no row there
             result["family_id"] = app.config.get("OUTLIER_TABLE_FAMILY_ID_BY_SAMPLE", {}).get(row["group_id"])
         else:
             result["family_id"] = row["group_id"]
-            result["members"] = [describe_sample(sample_id, lookups["sample"], lookups["affected"], lookups["analysis"])
+            result["members"] = [describe_sample(sample_id, lookups["sample"])
                                  for sample_id in sorted(members[row["group_id"]])]
         results.append(result)
     return results
@@ -3042,7 +3000,7 @@ def export_outlier_samples():
                             + LIST_COLUMNS_STATIC + LIST_COLUMNS_OT_SPECIFIC) + "\n"
             for row in conn.execute(pairs_query, ctes_params):
                 row_dict = dict(row)
-                sample = describe_sample(row_dict["pair_sample_id"], lookups["sample"], lookups["affected"], lookups["analysis"])
+                sample = describe_sample(row_dict["pair_sample_id"], lookups["sample"])
                 # The family the rows were grouped by, as the build recorded it
                 sample["family_id"] = row_dict["pair_family_id"]
                 allele_size = row_dict["pair_allele_size"]
@@ -3075,17 +3033,12 @@ def build_export_filename(outlier_type_key, total, ext):
     return f"tr_outliers.{search_type}.{total}_loci.{timestamp}.{ext}"
 
 
-def export_bed(conn, query, count_query, sql_params, params):
+def export_bed(conn, query, sql_params, total, params):
     """BED6 format, streamed with no header: chrom, start, end, LocusId as the name, score 0, strand ".".
 
     Score and strand hold the values BED defines for "none": a tandem repeat locus has no score,
     and it has no strand. The LocusId carries the motif.
     """
-    try:
-        total = conn.execute(count_query, sql_params).fetchone()[0]
-    except Exception:
-        conn.close()
-        raise
     def generate():
         try:
             for row in conn.execute(query, sql_params):
@@ -3098,13 +3051,8 @@ def export_bed(conn, query, count_query, sql_params, params):
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
-def export_tsv(conn, query, count_query, sql_params, ot, params):
+def export_tsv(conn, query, sql_params, total, ot, params):
     """TSV format: all list columns with header. Streamed, gzip-compressed."""
-    try:
-        total = conn.execute(count_query, sql_params).fetchone()[0]
-    except Exception:
-        conn.close()
-        raise
     def generate():
         try:
             yield "\t".join(LIST_COLUMNS_STATIC + LIST_COLUMNS_OT_SPECIFIC) + "\n"
@@ -3133,26 +3081,48 @@ def row_to_export_dict(row, ot, tags_by_locus):
     return row_dict
 
 
-def export_json(conn, query, count_query, sql_params, ot, params):
-    """JSON format: {"metadata": {...}, "loci": [...]}.
+def iterate_export_dicts_with_samples(conn, query, sql_params, ot):
+    """Return an iterator over the exported loci, the rows the JSON exports write.
 
     A locus with qualifying outlier samples (build_sample_details) gets a "Samples" key listing
     each of them (allele size, sample/family id, sex, ancestry, affected/analysis status,
     phenotype, and phenotype-similarity scores); a locus without any has no "Samples" key. The
-    exported loci's phenotype scores are bulk-loaded once up front
-    (fetch_per_outlier_phenotype_scores_of_loci) rather than per row. Rows still stream from the
-    cursor.
+    exported loci's phenotype scores are bulk-loaded once, by this call
+    (fetch_per_outlier_phenotype_scores_of_loci), rather than per row, so a failure there comes
+    before the export has written anything. The rows then stream from the cursor.
+
+    Args:
+        conn: DuckDB database connection.
+        query: The loci query of the export, without LIMIT/OFFSET.
+        sql_params: The parameters of query.
+        ot: The outlier type's column suffix, e.g. "AllAlleles".
+
+    Returns:
+        Iterator of (loci row, export dict) pairs, the export dict being row_to_export_dict's,
+        plus the "Samples" key described above.
     """
     tags_by_locus = app.config["ANNOTATIONS"]["tags"]
     lookups = app.config["LOOKUPS"]
     population_gate_cohorts = app.config["POPULATION_GATE_COHORTS"]
+    per_outlier_scores_by_locus = fetch_per_outlier_phenotype_scores_of_loci(conn, query, sql_params)
 
-    try:
-        total = conn.execute(count_query, sql_params).fetchone()[0]
-    except Exception:
-        conn.close()
-        raise
+    def generate():
+        for raw_row in conn.execute(query, sql_params):
+            row_dict = row_to_export_dict(raw_row, ot, tags_by_locus)
+            sample_details = build_sample_details(
+                row_dict, raw_row, lookups, per_outlier_scores_by_locus.get(row_dict.get("LocusId", ""), {}),
+                population_gate_cohorts)
+            if sample_details:
+                row_dict["Samples"] = sample_details
+            yield raw_row, row_dict
+    return generate()
 
+
+def export_json(conn, query, sql_params, total, ot, params):
+    """JSON format: {"metadata": {...}, "loci": [...]}. Streamed, gzip-compressed.
+
+    The loci are written as iterate_export_dicts_with_samples gives them.
+    """
     metadata = {
         "outlier_type": params["outlier_type"],
         "sort_by": params.get("sort_by") or ["count"],
@@ -3163,16 +3133,10 @@ def export_json(conn, query, count_query, sql_params, ot, params):
 
     def generate():
         try:
-            per_outlier_scores_by_locus = fetch_per_outlier_phenotype_scores_of_loci(conn, query, sql_params)
+            export_dicts = iterate_export_dicts_with_samples(conn, query, sql_params, ot)
             yield '{\n  "metadata": ' + json.dumps(metadata, indent=2).replace("\n", "\n  ") + ',\n  "loci": [\n'
             first = True
-            for raw_row in conn.execute(query, sql_params):
-                row_dict = row_to_export_dict(raw_row, ot, tags_by_locus)
-                sample_details = build_sample_details(
-                    row_dict, raw_row, lookups, per_outlier_scores_by_locus.get(row_dict.get("LocusId", ""), {}),
-                    population_gate_cohorts)
-                if sample_details:
-                    row_dict["Samples"] = sample_details
+            for _, row_dict in export_dicts:
                 yield ("" if first else ",\n") + "    " + json.dumps(row_dict, indent=2).replace("\n", "\n    ")
                 first = False
             yield "\n  ]\n}"
@@ -3184,20 +3148,27 @@ def export_json(conn, query, count_query, sql_params, ot, params):
 
 
 def compute_plot_thresholds(row_dict, all_allele_outliers_str, short_allele_outliers_str, affected_lookup,
-                            population_gate_cohorts):
+                            analysis_lookup, population_gate_cohorts):
     """Compute PlotReadVisualization thresholds for the ExpansionHunter export.
 
-    A locus's largest outlier earns a threshold when it is affected and above every unaffected
-    outlier; for the long allele it also has to be above the largest 99th percentile of the
-    population_gate_cohorts, the cohorts the build gated its counts with.
+    Samples are split as the build's #Aff count splits them
+    (analysis_columns.is_unaffected_or_solved_status): an unaffected or solved sample is part of
+    the bar to beat, and every other sample, including one of unknown status, is a candidate. A
+    locus's largest outlier earns a threshold when it is a candidate and above every unaffected
+    or solved outlier; for the long allele it also has to be above the largest 99th percentile of
+    the population_gate_cohorts, the cohorts the build gated its counts with.
 
     Returns a dict with LongAllele/ShortAllele thresholds, or None if no criteria met.
     """
-    def find_threshold(outliers, lookup, comparison_value):
+    def is_unaffected_or_solved(sample_id):
+        return analysis_columns.is_unaffected_or_solved_status(
+            affected_lookup.get(sample_id), analysis_lookup.get(sample_id))
+
+    def find_threshold(outliers, comparison_value):
         if not outliers:
             return None
         allele_size, sample_id = outliers[0]
-        if lookup.get(sample_id, "") == "affected" and allele_size > comparison_value:
+        if not is_unaffected_or_solved(sample_id) and allele_size > comparison_value:
             return allele_size
         return None
 
@@ -3206,17 +3177,17 @@ def compute_plot_thresholds(row_dict, all_allele_outliers_str, short_allele_outl
     if not long_outliers and not short_outliers:
         return None
 
-    long_unaffected = [a for a, s in long_outliers if affected_lookup.get(s, "") != "affected"]
-    short_unaffected = [a for a, s in short_outliers if affected_lookup.get(s, "") != "affected"]
-    max_long_unaffected = max(long_unaffected) if long_unaffected else 0
-    max_short_unaffected = max(short_unaffected) if short_unaffected else 0
+    long_unaffected_or_solved = [a for a, s in long_outliers if is_unaffected_or_solved(s)]
+    short_unaffected_or_solved = [a for a, s in short_outliers if is_unaffected_or_solved(s)]
+    max_long_unaffected_or_solved = max(long_unaffected_or_solved) if long_unaffected_or_solved else 0
+    max_short_unaffected_or_solved = max(short_unaffected_or_solved) if short_unaffected_or_solved else 0
 
     long_comparison = max(
-        max_long_unaffected,
+        max_long_unaffected_or_solved,
         analysis_columns.get_population_p99_threshold(row_dict, population_gate_cohorts) or 0,
     )
-    long_threshold = find_threshold(long_outliers, affected_lookup, long_comparison)
-    short_threshold = find_threshold(short_outliers, affected_lookup, max_short_unaffected)
+    long_threshold = find_threshold(long_outliers, long_comparison)
+    short_threshold = find_threshold(short_outliers, max_short_unaffected_or_solved)
 
     if long_threshold is None and short_threshold is None:
         return None
@@ -3229,31 +3200,22 @@ def compute_plot_thresholds(row_dict, all_allele_outliers_str, short_allele_outl
     return result
 
 
-def export_expansion_hunter(conn, query, count_query, sql_params, ot, params):
+def export_expansion_hunter(conn, query, sql_params, total, ot, params):
     """ExpansionHunter variant catalog format, streamed.
 
-    A locus gets a "PlotReadVisualization" key when it has read-visualization thresholds
-    (compute_plot_thresholds), and a "Samples" key when it has qualifying outlier samples
-    (build_sample_details); a locus without them lacks that key. As in export_json, the exported
-    loci's phenotype scores are loaded once up front rather than per row.
+    Each locus is written as iterate_export_dicts_with_samples gives it, plus the fields
+    ExpansionHunter reads and a "PlotReadVisualization" key when it has read-visualization
+    thresholds (compute_plot_thresholds); a locus without them lacks that key.
     """
-    tags_by_locus = app.config["ANNOTATIONS"]["tags"]
     lookups = app.config["LOOKUPS"]
     population_gate_cohorts = app.config["POPULATION_GATE_COHORTS"]
 
-    try:
-        total = conn.execute(count_query, sql_params).fetchone()[0]
-    except Exception:
-        conn.close()
-        raise
-
     def generate():
         try:
-            per_outlier_scores_by_locus = fetch_per_outlier_phenotype_scores_of_loci(conn, query, sql_params)
+            export_dicts = iterate_export_dicts_with_samples(conn, query, sql_params, ot)
             yield "[\n"
             first = True
-            for raw_row in conn.execute(query, sql_params):
-                row_dict = row_to_export_dict(raw_row, ot, tags_by_locus)
+            for raw_row, row_dict in export_dicts:
                 row_dict["ReferenceRegion"] = f"{row_dict['Chrom']}:{row_dict['Start0Based']}-{row_dict['End1Based']}"
                 row_dict["LocusStructure"] = f"({row_dict['Motif']})*"
                 row_dict["VariantType"] = "Repeat"
@@ -3264,6 +3226,7 @@ def export_expansion_hunter(conn, query, count_query, sql_params, ot, params):
                     raw_row_columns.get("OutlierSampleIds_AllAlleles"),
                     raw_row_columns.get("OutlierSampleIds_ShortAlleles"),
                     lookups["affected"],
+                    lookups["analysis"],
                     population_gate_cohorts,
                 )
                 if thresholds:
@@ -3271,11 +3234,6 @@ def export_expansion_hunter(conn, query, count_query, sql_params, ot, params):
                         {"If": allele, "Is": ">=", "Threshold": thresholds[allele]}
                         for allele in ("LongAllele", "ShortAllele") if allele in thresholds
                     ]
-                sample_details = build_sample_details(
-                    row_dict, raw_row, lookups, per_outlier_scores_by_locus.get(row_dict.get("LocusId", ""), {}),
-                    population_gate_cohorts)
-                if sample_details:
-                    row_dict["Samples"] = sample_details
                 yield ("" if first else ",\n") + json.dumps(row_dict, indent=2)
                 first = False
             yield "\n]"
@@ -3303,13 +3261,19 @@ def export_loci():
     base_query = select_query.replace(" LIMIT ? OFFSET ?", "")
 
     conn = get_db()
+    # The exporters close conn once their streamed body is written
+    try:
+        total = conn.execute(count_query, sql_params).fetchone()[0]
+    except Exception:
+        conn.close()
+        raise
     if format_param == "bed":
-        return export_bed(conn, base_query, count_query, sql_params, params)
+        return export_bed(conn, base_query, sql_params, total, params)
     if format_param == "tsv":
-        return export_tsv(conn, base_query, count_query, sql_params, ot, params)
+        return export_tsv(conn, base_query, sql_params, total, ot, params)
     if format_param == "json":
-        return export_json(conn, base_query, count_query, sql_params, ot, params)
-    return export_expansion_hunter(conn, base_query, count_query, sql_params, ot, params)
+        return export_json(conn, base_query, sql_params, total, ot, params)
+    return export_expansion_hunter(conn, base_query, sql_params, total, ot, params)
 
 
 @app.route("/api/v1/loci/<locus_id>")
@@ -3320,7 +3284,7 @@ def get_locus_detail(locus_id):
         row = conn.execute("SELECT * FROM loci WHERE LocusId = ?", (locus_id,)).fetchone()
         if row is None:
             return jsonify({"error": "Not found", "detail": f"No locus found with LocusId: {locus_id}"}), 404
-        row_dict = row_to_full_dict(row)
+        row_dict = dict(row)
         phenotype_scores = fetch_phenotype_scores(conn, locus_id)
     finally:
         conn.close()
@@ -3329,9 +3293,7 @@ def get_locus_detail(locus_id):
     outlier_samples = {}
     for ot_suffix in OUTLIER_TYPE_MAP.values():
         outlier_samples[ot_suffix] = parse_outlier_samples(
-            row_dict.get(f"OutlierSampleIds_{ot_suffix}", ""),
-            lookups["sample"], lookups["affected"], lookups["analysis"],
-        )
+            row_dict.get(f"OutlierSampleIds_{ot_suffix}", ""), lookups["sample"])
 
     known_disease = compute_known_disease_info(row_dict, lookups)
 
@@ -3466,26 +3428,7 @@ def get_swim_plot_data():
                 FROM swim_plot
                 WHERE outlier_type = ? AND motif_category = ?""" + extra_where + """
                 ORDER BY allele_size DESC, LocusId, sample_id LIMIT 500""")
-            for row in conn.execute(query, [ot, motif_category] + row_params).fetchall():
-                entry = {
-                    "rowid": row["rowid"],
-                    "allele_size": row["allele_size"],
-                    "motif_category": row["motif_category"],
-                    "affected_status": row["affected_status"],
-                    "LocusId": row["LocusId"],
-                    "sample_id": row["sample_id"],
-                    "Motif": row["Motif"],
-                    "gene_region": row["gene_region"],
-                    "GeneTableGeneSymbol": row["GeneTableGeneSymbol"],
-                    "family_id": row["family_id"],
-                    "sex": row["sex"],
-                    "analysis_status": row["analysis_status"],
-                    "phenotype_description": row["phenotype_description"],
-                }
-                for key, val in entry.items():
-                    if isinstance(val, float) and val != val:
-                        entry[key] = None
-                all_data.append(entry)
+            all_data.extend(dict(row) for row in conn.execute(query, [ot, motif_category] + row_params).fetchall())
     finally:
         conn.close()
 
@@ -3503,9 +3446,7 @@ def get_swim_plot_data():
 @app.route("/api/v1/sample_qc_data")
 def get_sample_qc_data():
     """Return per-sample outlier counts grouped by motif size bin (pre-computed at startup)."""
-    # configure_app always sets SAMPLE_QC_CACHE to a dict (empty rank1/top10 when
-    # there is no swim_plot table), so an empty payload is returned in that case.
-    return jsonify(app.config.get("SAMPLE_QC_CACHE") or {"rank1": [], "top10": []})
+    return jsonify(app.config["SAMPLE_QC_CACHE"])
 
 
 # The fewest trios a sequencing center needs for the QC2 page to chart its violation fractions
@@ -3691,6 +3632,11 @@ def get_schema():
             "include_loci_without_population_data": {
                 "type": "boolean",
                 "description": "When require_above_population is set, also include loci without population data",
+            },
+            "population_metric": {
+                "type": "enum",
+                "values": ["99th", "max"],
+                "description": "The population value require_above_population and min_repeats_above_population compare against: each cohort's 99th percentile (default) or its largest allele. The grouped view's Δpop values and its exports use it too",
             },
             "min_expansion": {"type": "int", "min": 0},
             "min_repeats_threshold": {"type": "int", "min": 0},

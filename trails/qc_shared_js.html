@@ -28,17 +28,6 @@ function isAffectedStatus(status) {
     return normalized === 'affected' || normalized === 'possibly affected';
 }
 
-// Populate a Semantic UI dropdown's menu from values that came out of the database (tags,
-// sample ids), which are arbitrary user-supplied strings.
-//
-// Semantic UI's 'setup menu' builds its markup by string concatenation
-// ('<div class="item" data-value="' + value + '">' + name + '</div>'), so an unescaped value
-// containing markup executes, and one containing a double quote breaks out of the attribute.
-// Escaping both fixes that, but leaves the escaped text sitting in data-value, so this then
-// writes the raw strings back with .attr()/.data()/.text(), which assign literally rather than
-// parsing HTML. The menu is therefore safe to build AND dropdown('get value') still returns the
-// value exactly as stored, so the filter it sends matches the database.
-//
 // Settings for every dropdown that accepts typed-in values (allowAdditions: true). Semantic UI
 // writes such a value into the page as HTML twice: in the "Add <b>value</b>" menu item
 // (templates.addition) and in the selection's label (templates.label, for a multiple-selection
@@ -55,6 +44,17 @@ const ESCAPING_ADDITIONS_DROPDOWN_SETTINGS = {
     },
 };
 
+// Populate a Semantic UI dropdown's menu from values that came out of the database (tags,
+// sample ids), which are arbitrary user-supplied strings.
+//
+// Semantic UI's 'setup menu' builds its markup by string concatenation
+// ('<div class="item" data-value="' + value + '">' + name + '</div>'), so an unescaped value
+// containing markup executes, and one containing a double quote breaks out of the attribute.
+// Escaping both fixes that, but leaves the escaped text sitting in data-value, so this then
+// writes the raw strings back with .attr()/.data()/.text(), which assign literally rather than
+// parsing HTML. The menu is therefore safe to build AND dropdown('get value') still returns the
+// value exactly as stored, so the filter it sends matches the database.
+//
 // `items` is an array of {name, value} objects holding the raw, unescaped strings.
 function setupDropdownMenu($dropdown, items) {
     $dropdown.dropdown('setup menu', {

@@ -21,6 +21,7 @@ from analysis_columns import (
     normalize_affected_status_for_logic,
     parse_outlier_entries,
     parse_population_gate_cohorts,
+    title_case_status_for_display,
 )
 
 
@@ -78,6 +79,22 @@ class StatusTruthTableTests(unittest.TestCase):
         self.assertFalse(is_unaffected_or_solved_status("affected", "partially solved"))
         self.assertFalse(is_unaffected_or_solved_status("unknown", "unsolved"))
         self.assertFalse(is_unaffected_or_solved_status(None, None))
+
+
+class StatusNormalizationTests(unittest.TestCase):
+    def test_affected_title_casing(self):
+        self.assertEqual(title_case_status_for_display("affected"), "Affected")
+        self.assertEqual(title_case_status_for_display("UNAFFECTED"), "Unaffected")
+        self.assertEqual(title_case_status_for_display(" possibly affected "), "Possibly Affected")
+
+    def test_analysis_title_casing(self):
+        self.assertEqual(title_case_status_for_display("solved"), "Solved")
+        self.assertEqual(title_case_status_for_display("UNSOLVED"), "Unsolved")
+        self.assertEqual(title_case_status_for_display("partially solved"), "Partially Solved")
+
+    def test_missing_and_blank_statuses_are_unknown(self):
+        for blank in (None, float("nan"), "", "  ", "NA", "n/a", "null"):
+            self.assertEqual(title_case_status_for_display(blank), "Unknown", repr(blank))
 
 
 class BlankMetadataValueTests(unittest.TestCase):
@@ -175,8 +192,9 @@ class PopulationThresholdTests(unittest.TestCase):
             parse_population_gate_cohorts("")
 
     def test_is_above_unaffected(self):
-        self.assertTrue(is_above_unaffected(5, {}, "AllAlleles"))  # NULL first unaffected
-        self.assertFalse(is_above_unaffected(0, {}, "AllAlleles"))
+        # With no unaffected sample (NULL first unaffected), every allele is above, even 0.
+        self.assertTrue(is_above_unaffected(5, {}, "AllAlleles"))
+        self.assertTrue(is_above_unaffected(0, {}, "AllAlleles"))
         row = {"FirstUnaffectedAlleleSize_AllAlleles": 20}
         self.assertTrue(is_above_unaffected(21, row, "AllAlleles"))
         self.assertFalse(is_above_unaffected(20, row, "AllAlleles"))
@@ -536,8 +554,8 @@ class AddGeneColumnsTests(unittest.TestCase):
 class OutputColumnsTests(unittest.TestCase):
 
     def test_exact_count_and_uniqueness(self):
-        self.assertEqual(len(OUTPUT_COLUMNS), 131)
-        self.assertEqual(len(set(OUTPUT_COLUMNS)), 131)
+        self.assertEqual(len(OUTPUT_COLUMNS), 137)
+        self.assertEqual(len(set(OUTPUT_COLUMNS)), 137)
 
     def test_anchor_positions(self):
         # Spot-check fixed positions in OUTPUT_COLUMNS (the trailing comments give 1-based
@@ -546,8 +564,14 @@ class OutputColumnsTests(unittest.TestCase):
         self.assertEqual(OUTPUT_COLUMNS[32], "pLI")  # col 33
         self.assertEqual(OUTPUT_COLUMNS[33], "inheritance")  # col 34
         self.assertEqual(OUTPUT_COLUMNS[34], "FirstAffectedAlleleSize_AllAlleles")  # col 35
-        self.assertEqual(OUTPUT_COLUMNS[128], "VariationClusterSizeDiff")  # col 129
-        self.assertEqual(OUTPUT_COLUMNS[130], "VariationClusterFilterReason")  # col 131
+        self.assertEqual(OUTPUT_COLUMNS[134], "VariationClusterSizeDiff")  # col 135
+        self.assertEqual(OUTPUT_COLUMNS[136], "VariationClusterFilterReason")  # col 137
+
+    def test_each_cohort_has_median_and_mode_after_its_max_allele(self):
+        for cohort in ("AoU1027", "HPRC256", "TenK10K"):
+            position = OUTPUT_COLUMNS.index(f"{cohort}_MaxAllele")
+            self.assertEqual(OUTPUT_COLUMNS[position + 1:position + 3],
+                             [f"{cohort}_Median", f"{cohort}_Mode"], cohort)
 
 
 class GeneTableColumnsTests(unittest.TestCase):

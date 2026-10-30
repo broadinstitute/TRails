@@ -357,7 +357,7 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
                 locus_annotations.matches_disease_locus("chr2-500-530-CCG", {}, strchive_trees),
                 "STR_B")
             self.assertIn(
-                locus_annotations.compute_canonical_motif("CCG", include_reverse_complement=True),
+                locus_annotations.compute_canonical_motif("CCG"),
                 locus_annotations.collect_known_disease_canonical_motifs({}, strchive_trees))
         finally:
             os.remove(strchive_path)
@@ -493,7 +493,7 @@ class MatchesDiseaseLocusTests(unittest.TestCase):
         # The same locus's motif also counts as known, so IsKnownMotif agrees with
         # KnownDiseaseLocus.
         self.assertIn(
-            locus_annotations.compute_canonical_motif("AAGGG", include_reverse_complement=True),
+            locus_annotations.compute_canonical_motif("AAGGG"),
             locus_annotations.collect_known_disease_canonical_motifs({}, strchive_trees))
 
 
@@ -518,7 +518,7 @@ class StrchiveLocusMotifsTests(unittest.TestCase):
             ["AAGGG"])
 
 
-class KnownMotifAndMendelianGeneTests(unittest.TestCase):
+class KnownMotifTests(unittest.TestCase):
 
     def setUp(self):
         self.catalog = [{
@@ -614,6 +614,9 @@ class PolyalanineDiseaseLocusTests(unittest.TestCase):
         for motif, expected in (("GCG", 1), ("GCC", 1), ("AAT", 0)):
             self.assertEqual(locus_annotations.compute_is_known_motif(
                 locus_annotations.compute_canonical_motif(motif), known), expected, motif)
+
+
+class IsInMendelianGeneTests(unittest.TestCase):
 
     def test_is_in_mendelian_gene(self):
         # A table with neither an inheritance nor a sources column counts every gene it lists.

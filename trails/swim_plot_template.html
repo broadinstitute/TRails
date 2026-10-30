@@ -503,10 +503,9 @@ function renderSwimChart(data) {
         if (parsedMin !== Infinity) yMin = Math.max(1, Math.min(parsedMin, 25));
         if (parsedMax !== -Infinity) yMax = Math.min(parsedMax, 25);
     }
-    // Unknown-motif-size loci map to a dedicated row at y=0 (labelled "Unknown");
-    // extend the axis floor to include it only when such points are present, so the
-    // normal chart (no Unknown loci) is unchanged. Without this they get y=NaN and
-    // are silently dropped by Chart.js.
+    // Loci with an unknown motif size sit in their own row at y=0 (labelled "Unknown"). Extend
+    // the axis down to it only when such points exist; otherwise the axis starts at yMin, and
+    // the Unknown row, which would fall below it, is not shown.
     const yFloor = data.some(item => item.motif_category === 'Unknown') ? 0 : yMin;
 
     const ctx = document.getElementById('swim-chart-canvas').getContext('2d');

@@ -75,12 +75,12 @@ AFFECTED_UNSOLVED_OUTLIERS_COLUMN_TYPES = {
 # compares ``pLI`` to a number. Comparing a number against a VARCHAR column is a binder
 # error in DuckDB. Any real value in the column overrides this set.
 #
-# The generated names are a superset of the schema (there is no
-# ``ThirdUnaffectedAlleleSize_*``, and only AoU1027 carries the OE_* statistics), which
-# keeps the patterns readable and costs nothing: a name no column ever uses is never
-# looked up. The cohort-statistic patterns also cover the ``HPRC256_Mode`` /
-# ``HPRC256_Median`` / ``HPRC256_90thPercentile`` style columns an input matrix can
-# supply outside ``OUTPUT_COLUMNS``.
+# The cohort-statistic names are generated for every cohort and statistic, a superset of
+# the schema: only AoU1027 carries the OE_* statistics, TenK10K has no stdev rank or stdev
+# percentile, and no cohort has a 90th percentile in ``OUTPUT_COLUMNS``. That keeps the
+# pattern readable and costs nothing, since a name no column uses is never looked up, and
+# it also covers the ``HPRC256_90thPercentile`` style columns an input matrix can supply
+# outside ``OUTPUT_COLUMNS``.
 NUMERIC_COLUMNS = frozenset(
     [
         "IsKnownMotif", "IsInMendelianGene", "Start0Based", "End1Based", "MotifSize",
@@ -178,7 +178,7 @@ def infer_column_types(column_order, rows):
 
 
 def write_table_from_dicts(connection, table_name, rows, column_order=None,
-                           primary_key_column=None, integer_columns=None):
+                           primary_key_column=None):
     """Creates ``table_name`` and bulk-inserts a list of row dicts.
 
     The rows go in through ``duckdb_compat.insert_rows``, a chunk per INSERT
@@ -189,8 +189,8 @@ def write_table_from_dicts(connection, table_name, rows, column_order=None,
     otherwise from the insertion order of the first row's keys (so the producing
     module's dict layout defines the schema). The table is dropped first, so the
     call is idempotent. ``NULL`` is written for any column absent from a given
-    row dict. Column types come from ``infer_column_types`` unless the caller
-    names the column explicitly.
+    row dict. Column types come from ``infer_column_types``, except for the
+    primary key column.
 
     Args:
         connection: An open duckdb_compat connection.
@@ -200,8 +200,6 @@ def write_table_from_dicts(connection, table_name, rows, column_order=None,
         column_order: Optional explicit list of column names defining the
             written column order. When omitted, the first row's keys are used.
         primary_key_column: Optional column name to declare ``TEXT PRIMARY KEY``.
-        integer_columns: Optional collection of column names to declare
-            ``BIGINT`` regardless of the values present.
 
     Returns:
         The number of rows inserted.
@@ -210,7 +208,6 @@ def write_table_from_dicts(connection, table_name, rows, column_order=None,
         if not rows:
             return 0
         column_order = list(rows[0].keys())
-    integer_columns = set(integer_columns or ())
     column_types = infer_column_types(column_order, rows)
 
     column_definitions = []
@@ -220,8 +217,6 @@ def write_table_from_dicts(connection, table_name, rows, column_order=None,
         # not corrupt the CREATE TABLE DDL.
         if column == primary_key_column:
             definition = f'"{column}" TEXT PRIMARY KEY'
-        elif column in integer_columns:
-            definition = f'"{column}" BIGINT'
         else:
             definition = f'"{column}" {column_types[column]}'
         column_definitions.append(definition)
@@ -251,7 +246,7 @@ def write_loci_table(connection, records, output_columns, extra_columns=None):
         output_columns: The full ordered ``OUTPUT_COLUMNS`` schema; the written
             schema columns are this list filtered to columns present in ``records``.
         extra_columns: Optional names of annotation columns the input matrix
-            supplied outside ``output_columns`` (e.g. ``HPRC256_Mode``). Those
+            supplied outside ``output_columns`` (e.g. ``HPRC256_90thPercentile``). Those
             present in the records are appended, sorted, after the schema columns.
 
     Returns:
@@ -267,9 +262,9 @@ def write_loci_table(connection, records, output_columns, extra_columns=None):
     if not present_columns:
         present_columns = list(output_columns)
     # Recognized annotation columns the input supplied that are not part of the
-    # fixed OUTPUT_COLUMNS schema (e.g. cohort HPRC256_Mode / _Median /
-    # _90thPercentile that the locus-detail view reads) are appended after the
-    # schema columns so they are persisted rather than silently dropped.
+    # fixed OUTPUT_COLUMNS schema (e.g. the cohort HPRC256_90thPercentile that the
+    # locus-detail view reads) are appended after the schema columns so they are
+    # persisted rather than silently dropped.
     if extra_columns:
         for column in sorted(extra_columns):
             if column in present and column not in output_columns:
@@ -470,7 +465,7 @@ def write_mendelian_tables(connection, per_sample_rows, per_motif_rows):
 
 def _write_mendelian_table(connection, table_name, rows):
     """Writes one Mendelian table: ``sample_id`` first as a TEXT primary key, every other
-    column declared BIGINT.
+    column BIGINT (each holds an int count, which infer_column_types declares BIGINT).
 
     Args:
         connection: An open duckdb_compat connection.
@@ -485,8 +480,7 @@ def _write_mendelian_table(connection, table_name, rows):
         column for column in rows[0].keys() if column != "sample_id"]
     return write_table_from_dicts(
         connection, table_name, rows, column_order=column_order,
-        primary_key_column="sample_id",
-        integer_columns=[c for c in column_order if c != "sample_id"])
+        primary_key_column="sample_id")
 
 
 def write_affected_unsolved_outliers_table(connection, rows):

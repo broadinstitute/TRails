@@ -812,7 +812,7 @@ class GroupResultsByTests(unittest.TestCase):
         self.assertEqual(set(re.findall(r'^    "(\w+)":', server_sorts, re.MULTILINE)),
                          set(re.findall(r'class="item" data-value="(\w+)"', menu)))
         # The id sorts A to Z by default, as the page's GROUP_SORT_NATURAL_DIRECTIONS assumes.
-        self.assertIn('"group_id": ("group_id", "asc"),', server_sorts)
+        self.assertIn('"group_id": "asc",', server_sorts)
         self.assertIn("const GROUP_SORT_NATURAL_DIRECTIONS = {group_id: 'asc'};", self.template)
 
     def test_every_state_function_handles_them(self):
@@ -1069,6 +1069,16 @@ class AnnotationBadgeTests(unittest.TestCase):
         self.assertIn("renderAnnotationBadges(ann.tags || [], ann.note != null)",
                       js_function_body(template, "async function refreshRowAnnotations("))
 
+    def test_every_row_listing_the_locus_is_repainted_on_its_own(self):
+        # In a grouped view the same locus can be open under several groups, and only some of their
+        # rows may have a badges row yet, so each row decides on its own whether to update or create one
+        refresh = js_function_body(read_template("index_page_template.html"), "async function refreshRowAnnotations(")
+        each_row = refresh[refresh.index("$(`tr.locus-row[data-locus-id=\"${locusId}\"]`).each(function() {"):]
+        self.assertLess(each_row.index("const $badgesRow = $locusCell.find('.badges-row');"),
+                        each_row.index("if ($badgesRow.length) {"))
+        self.assertIn("$locusCell.find('.cell-main').after(`<div class=\"cell-sub badges-row\">${newContent}</div>`);",
+                      each_row)
+
 
 class CdnIntegrityTests(unittest.TestCase):
     """Every CDN file the pages load names an exact version and carries a Subresource Integrity hash."""
@@ -1152,6 +1162,23 @@ class TypedInDropdownValueEscapingTests(unittest.TestCase):
         apply_state = js_function_body(template, "function applyStateToUI(")
         self.assertIn("inputsWithValue(name, currentState[name] || '').parent().checkbox('check');", apply_state)
         self.assertIn("inputsWithValue('population_metric', currentState.population_metric || '99th')", apply_state)
+
+    def test_the_url_sort_list_is_compared_rather_than_written_into_a_selector(self):
+        # performSearch marks the sorted headers before its try block, so a selector made invalid by
+        # a URL sort field such as `size"]` would stop the search
+        indicator = js_function_body(read_template("index_page_template.html"), "function syncSortHeaderIndicator(")
+        self.assertIn("$('#results-table thead th[data-sort]')\n"
+                      "        .filter(function() { return fields.includes(this.getAttribute('data-sort')); })\n"
+                      "        .addClass('sorted-active');", indicator)
+
+
+class SearchErrorResponseTests(unittest.TestCase):
+    """A failed search whose response is not JSON (e.g. a proxy's error page) reports its HTTP status."""
+
+    def test_the_error_body_is_read_with_a_fallback(self):
+        search = js_function_body(read_template("index_page_template.html"), "async function performSearch(")
+        self.assertIn("const errorData = await response.json().catch(() => ({}));\n"
+                      "            throw new Error(errorData.detail || `HTTP ${response.status}`);", search)
 
 
 class SwimPlotMendelianGeneFilterTests(unittest.TestCase):

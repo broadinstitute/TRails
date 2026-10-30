@@ -121,7 +121,9 @@ def _build_minimal_db(path):
     conn.close()
 
 
-class ResultsServerTests(ServerTestCase):
+class MinimalDatabaseTestCase(ServerTestCase):
+    """Points the server at the _build_minimal_db fixture."""
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -129,6 +131,8 @@ class ResultsServerTests(ServerTestCase):
         _build_minimal_db(cls.db_path)
         cls.configure_server(cls.db_path)
 
+
+class ResultsServerTests(MinimalDatabaseTestCase):
     def test_loci_returns_rows(self):
         response = self.client.get("/api/v1/loci?outlier_type=all")
         self.assertEqual(response.status_code, 200)
@@ -169,6 +173,23 @@ class ResultsServerTests(ServerTestCase):
         data = self.client.get("/api/v1/schema").get_json()
         self.assertIn("total_samples", data)
         self.assertIsNone(data["total_samples"])
+
+    def test_schema_lists_the_population_metric_values_the_loci_endpoint_accepts(self):
+        values = self.client.get("/api/v1/schema").get_json()["filters"]["population_metric"]["values"]
+        self.assertEqual(values, ["99th", "max"])
+        for value in values:
+            self.assertEqual(self.client.get(f"/api/v1/loci?outlier_type=all&population_metric={value}").status_code,
+                             200, value)
+        self.assertEqual(self.client.get("/api/v1/loci?outlier_type=all&population_metric=median").status_code, 400)
+
+    def test_the_page_escapes_the_gate_cohort_names(self):
+        with mock.patch.dict(results_server.app.config, {"POPULATION_GATE_COHORTS": ('<img src=x onerror="f()">',)}):
+            page = self.client.get("/").get_data(as_text=True)
+        self.assertNotIn('<img src=x onerror="f()">', page)
+        # The #Fam title attribute shows the name as text. The Group Results By help popup inserts
+        # its data-html attribute's decoded value as HTML, so the name is escaped once more there.
+        self.assertIn("built with (&lt;img src=x onerror=&#34;f()&#34;&gt;; #Aff counted by family)", page)
+        self.assertIn("built with (&amp;lt;img src=x onerror=&amp;#34;f()&amp;#34;&amp;gt;). A row expands", page)
 
     def test_variation_cluster_sort_is_accepted(self):
         # The sort key the "Variation Cluster" checkbox sends. This fixture has no
@@ -268,23 +289,23 @@ class ResultsServerTests(ServerTestCase):
         self.assertEqual(entry["VariantType"], "Repeat")
         self.assertEqual(by_locus["chr2-200-209-AAG"]["ReferenceRegion"], "chr2:200-209")
         self.assertEqual(by_locus["chr2-200-209-AAG"]["LocusStructure"], "(AAG)*")
-        # No sample table was supplied, so no outlier is known to be affected and no locus gets
-        # a read-visualization threshold.
-        self.assertNotIn("PlotReadVisualization", entry)
+        # No sample table was supplied, so every outlier is of unknown status and, as #Aff counts
+        # it, a candidate: the largest outlier of each list earns a read-visualization threshold.
+        self.assertEqual(entry["PlotReadVisualization"], [{"If": "LongAllele", "Is": ">=", "Threshold": 6},
+                                                          {"If": "ShortAllele", "Is": ">=", "Threshold": 5}])
 
     def test_export_expansion_hunter_read_visualization_thresholds(self):
         # chr1's largest outlier (6x:sampleA) is affected and sits above the largest unaffected
         # outlier (5x:sampleB), so it earns a LongAllele threshold. The ShortAlleles outlier list
-        # holds only the unaffected sampleB, so there is no ShortAllele threshold.
-        lookups = results_server.app.config["LOOKUPS"]
-        original = lookups["affected"]
-        lookups["affected"] = {"sampleA": "affected", "sampleB": "unaffected"}
-        try:
+        # holds only the unaffected sampleB, so there is no ShortAllele threshold. chr2's only
+        # outlier, sampleC, is affected but solved, so it is part of the bar and earns nothing.
+        with mock.patch.dict(results_server.app.config["LOOKUPS"], {
+                "affected": {"sampleA": "affected", "sampleB": "unaffected", "sampleC": "affected"},
+                "analysis": {"sampleC": "solved"}}):
             response = self.client.get("/api/v1/export?outlier_type=all&format=expansion_hunter")
+            # The body streams, so it is read while the patched lookups are in place.
             self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
             catalog = {entry["LocusId"]: entry for entry in json.loads(response.get_data())}
-        finally:
-            lookups["affected"] = original
         self.assertEqual(catalog["chr1-100-110-AT"]["PlotReadVisualization"],
                          [{"If": "LongAllele", "Is": ">=", "Threshold": 6}])
         self.assertNotIn("PlotReadVisualization", catalog["chr2-200-209-AAG"])
@@ -501,28 +522,23 @@ class ResultsServerTests(ServerTestCase):
 
     # -- Sample keyword filter ---------------------------------------------------
 
-    def _sample_id_like_ids(self, keyword):
-        response = self.client.get(f"/api/v1/loci?outlier_type=all&sample_id_like={keyword}")
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
-        return {r["LocusId"] for r in response.get_json()["results"]}
-
     def test_sample_id_like_does_not_match_allele_sizes(self):
         # OutlierSampleIds_AllAlleles is "6x:sampleA,5x:sampleB" at chr1 and "4x:sampleC" at chr2,
         # so a numeric keyword must not match the allele size in front of every sample id.
-        self.assertEqual(self._sample_id_like_ids("6"), set())
-        self.assertEqual(self._sample_id_like_ids("4"), set())
+        self.assertEqual(self.get_locus_ids("sample_id_like=6"), set())
+        self.assertEqual(self.get_locus_ids("sample_id_like=4"), set())
         # The "x:" delimiter is not part of a sample id either.
-        self.assertEqual(self._sample_id_like_ids("x:"), set())
+        self.assertEqual(self.get_locus_ids("sample_id_like=x:"), set())
 
     def test_sample_id_like_still_matches_sample_ids(self):
-        self.assertEqual(self._sample_id_like_ids("sampleA"), {"chr1-100-110-AT"})
-        self.assertEqual(self._sample_id_like_ids("ampleC"), {"chr2-200-209-AAG"})
-        self.assertEqual(self._sample_id_like_ids("sample"),
+        self.assertEqual(self.get_locus_ids("sample_id_like=sampleA"), {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("sample_id_like=ampleC"), {"chr2-200-209-AAG"})
+        self.assertEqual(self.get_locus_ids("sample_id_like=sample"),
                          {"chr1-100-110-AT", "chr2-200-209-AAG"})
 
     def test_sample_id_like_treats_underscore_literally(self):
         # "_" is ILIKE's single-character wildcard, so without escaping this would match "sampleA".
-        self.assertEqual(self._sample_id_like_ids("sample_A"), set())
+        self.assertEqual(self.get_locus_ids("sample_id_like=sample_A"), set())
 
     def test_phenotype_keyword_is_answered_from_swim_plot(self):
         # This fixture writes a swim_plot whose phenotype_description column is populated, so the
@@ -530,10 +546,7 @@ class ResultsServerTests(ServerTestCase):
         # fallback for a database without swim_plot phenotypes is covered by
         # PhenotypeKeywordFallbackColumnSubsetTests below.
         self.assertTrue(results_server.app.config["HAS_SWIM_PLOT_PHENOTYPES"])
-        response = self.client.get("/api/v1/loci?outlier_type=all&phenotype_keyword=seizures")
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
-        self.assertEqual({r["LocusId"] for r in response.get_json()["results"]},
-                         {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=seizures"), {"chr1-100-110-AT"})
 
     # -- Merged search box: locus ids -------------------------------------------
 
@@ -945,7 +958,7 @@ class SplitOutlierEntriesTests(unittest.TestCase):
 
     def test_parse_outlier_samples_describes_each_sample(self):
         parsed = results_server.parse_outlier_samples(
-            "6x:sA,5x:sB", {"sA": {"family_id": "F1", "sex": "male"}}, {}, {})
+            "6x:sA,5x:sB", {"sA": {"family_id": "F1", "sex": "male"}})
         self.assertEqual([(s["allele_size"], s["sample_id"], s["family_id"], s["sex"]) for s in parsed],
                          [(6, "sA", "F1", "male"), (5, "sB", None, None)])
 
@@ -956,10 +969,11 @@ class ComputePlotThresholdsTests(unittest.TestCase):
     AFFECTED = {"sampleA": "affected", "sampleB": "unaffected", "sampleC": "affected"}
     LONG_READ_GATE = ("HPRC256", "AoU1027")
 
-    def _thresholds(self, row_dict, long_outliers, short_outliers, affected_lookup,
+    def _thresholds(self, row_dict, long_outliers, short_outliers, affected_lookup, analysis_lookup=None,
                     population_gate_cohorts=LONG_READ_GATE):
         return results_server.compute_plot_thresholds(
-            row_dict, long_outliers, short_outliers, affected_lookup, population_gate_cohorts)
+            row_dict, long_outliers, short_outliers, affected_lookup, analysis_lookup or {},
+            population_gate_cohorts)
 
     def test_largest_affected_above_the_largest_unaffected(self):
         self.assertEqual(self._thresholds({}, "6x:sampleA,5x:sampleB", "", self.AFFECTED), {"LongAllele": 6})
@@ -980,7 +994,7 @@ class ComputePlotThresholdsTests(unittest.TestCase):
         row_dict = {"HPRC256_99thPercentile": 4, "TenK10K_99thPercentile": 10}
         self.assertEqual(self._thresholds(row_dict, "6x:sampleA,5x:sampleB", "", self.AFFECTED), {"LongAllele": 6})
         self.assertIsNone(self._thresholds(row_dict, "6x:sampleA,5x:sampleB", "", self.AFFECTED,
-                                           ("HPRC256", "AoU1027", "TenK10K")))
+                                           population_gate_cohorts=("HPRC256", "AoU1027", "TenK10K")))
 
     def test_the_largest_outlier_has_to_be_affected(self):
         # sampleB is the largest here, and it is unaffected, so nothing qualifies even though a
@@ -993,12 +1007,36 @@ class ComputePlotThresholdsTests(unittest.TestCase):
         self.assertEqual(self._thresholds({}, "6x:sampleA,5x:sampleB", "5x:sampleC", self.AFFECTED),
                          {"LongAllele": 6, "ShortAllele": 5})
 
-    def test_no_outliers_and_unknown_samples(self):
+    def test_no_outliers_and_entries_that_do_not_parse(self):
         self.assertIsNone(self._thresholds({}, "", "", self.AFFECTED))
-        # A sample with no metadata row is not known to be affected.
-        self.assertIsNone(self._thresholds({}, "6x:sampleZ", "", {}))
         # Entries that do not parse are skipped rather than raising.
         self.assertIsNone(self._thresholds({}, "garbage", "", self.AFFECTED))
+
+    def test_solved_samples_set_the_bar_and_unknown_samples_are_candidates(self):
+        affected = {"SOLVED": "affected", "UNKNOWN": "unknown", "AFFECTED": "affected"}
+        analysis = {"SOLVED": "solved", "AFFECTED": "unsolved"}
+        # A solved affected sample is part of the bar, so the unsolved one below it earns nothing.
+        self.assertIsNone(self._thresholds({}, "60x:SOLVED,50x:AFFECTED", "", affected, analysis))
+        # A sample of unknown status is a candidate, and so is one with no metadata row.
+        self.assertEqual(self._thresholds({}, "60x:UNKNOWN,50x:AFFECTED", "", affected, analysis), {"LongAllele": 60})
+        self.assertEqual(self._thresholds({}, "6x:sampleZ", "", {}), {"LongAllele": 6})
+
+    def test_a_threshold_is_set_exactly_when_the_build_counts_a_sample(self):
+        # The build's #Aff count (find_affected_unsolved_samples_above_unaffected) and the
+        # long-allele threshold have to agree on every locus: the threshold is the largest allele
+        # the build counts, and there is none when the build counts no sample.
+        affected = {"A1": "affected", "A2": "affected", "U1": "unaffected", "S1": "affected", "K1": "unknown"}
+        analysis = {"A1": "unsolved", "A2": "partially solved", "S1": "probably solved"}
+        row_dict = {"HPRC256_99thPercentile": 8}
+        for long_outliers in ("10x:A1,9x:U1", "10x:U1,9x:A1", "10x:S1,9x:A1", "10x:K1,9x:A1", "10x:A1,10x:U1",
+                              "9x:A2,7x:A1", "8x:A1", "12x:NOT_IN_THE_TABLE,11x:S1"):
+            build_samples = analysis_columns.find_affected_unsolved_samples_above_unaffected(
+                {"OutlierSampleIds_AllAlleles": long_outliers, **row_dict}, affected, analysis,
+                {"AllAlleles": analysis_columns.parse_outlier_entries(long_outliers)},
+                self.LONG_READ_GATE)[0]
+            thresholds = self._thresholds(row_dict, long_outliers, "", affected, analysis)
+            self.assertEqual(thresholds and thresholds["LongAllele"],
+                             max(build_samples.values()) if build_samples else None, long_outliers)
 
 
 def _build_db_with_unknown_category(path):
@@ -1029,23 +1067,20 @@ class AffectedStatusDisplayTests(unittest.TestCase):
     """Display keeps "possibly affected" rather than collapsing it to "affected"."""
 
     def test_possibly_affected_preserved(self):
-        sample_lookup = {"sA": {"affected_status": "possibly affected",
+        sample_lookup = {"sA": {"affected_status": "possibly affected", "analysis_status": "unsolved",
                                 "family_id": "f1", "sex": "male"}}
-        affected_lookup = {"sA": "affected"}  # collapsed for analysis logic only
-        analysis_lookup = {"sA": "unsolved"}
-        parsed = results_server.parse_outlier_samples(
-            "60x:sA", sample_lookup, affected_lookup, analysis_lookup)
-        self.assertEqual(parsed[0]["affected_status"], "Possibly Affected")
+        parsed = results_server.parse_outlier_samples("60x:sA", sample_lookup)
+        self.assertEqual((parsed[0]["affected_status"], parsed[0]["analysis_status"]),
+                         ("Possibly Affected", "Unsolved"))
 
-    def test_falls_back_to_lookup_when_row_missing(self):
-        parsed = results_server.parse_outlier_samples(
-            "60x:sB", {}, {"sB": "affected"}, {"sB": "unsolved"})
-        self.assertEqual(parsed[0]["affected_status"], "Affected")
+    def test_a_sample_without_a_row_is_unknown(self):
+        parsed = results_server.parse_outlier_samples("60x:sB", {})
+        self.assertEqual((parsed[0]["affected_status"], parsed[0]["analysis_status"]), ("Unknown", "Unknown"))
 
     def test_every_blank_status_displays_as_unknown(self):
         # An "NA" cell is no status, so the locus-detail page shows "Unknown" rather than "Na".
         for value in ("", "nan", "none", "na", "n/a", "null", "NA", " N/A ", "Null"):
-            described = results_server.describe_sample("S1", {"S1": {"affected_status": value}}, {}, {})
+            described = results_server.describe_sample("S1", {"S1": {"affected_status": value}})
             self.assertEqual(described["affected_status"], "Unknown", repr(value))
 
 
@@ -1119,8 +1154,17 @@ class PermissiveSampleTableTests(unittest.TestCase):
         # Absent statuses are falsy (treated as not-unaffected downstream) and display as Unknown.
         self.assertFalse(affected_lookup["S1"])
         self.assertFalse(analysis_lookup["S1"])
-        described = results_server.describe_sample("S1", sample_rows, affected_lookup, analysis_lookup)
+        described = results_server.describe_sample("S1", sample_rows)
         self.assertEqual((described["affected_status"], described["analysis_status"]), ("Unknown", "Unknown"))
+
+    def test_statuses_are_shown_as_entered_with_the_analysis_status_remapped(self):
+        # The sample row keeps "Possibly Affected" as entered and holds the analysis status after
+        # read_sample_metadata's remapping, so the pages show what the analysis logic reads.
+        path = self._write("sample_id\taffected_status\tanalysis_status\nS1\tPossibly Affected\tRNCC\n")
+        sample_rows, _affected, _analysis = results_server.load_sample_table(path)
+        described = results_server.describe_sample("S1", sample_rows)
+        self.assertEqual((described["affected_status"], described["analysis_status"]),
+                         ("Possibly Affected", "Unsolved"))
 
     def test_case_insensitive_id_and_extra_columns_preserved(self):
         path = self._write("Sample ID\tancestry\nS1\tEUR\n")
@@ -1360,10 +1404,7 @@ class PhenotypeKeywordFallbackColumnSubsetTests(ServerTestCase):
         self.assertEqual(sql_params[-1:], ["%seizures%"])
 
     def test_the_keyword_still_matches_through_the_endpoint(self):
-        response = self.client.get("/api/v1/loci?outlier_type=all&phenotype_keyword=seizures")
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
-        self.assertEqual({r["LocusId"] for r in response.get_json()["results"]},
-                         {"chr1-100-110-AT"})
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=seizures"), {"chr1-100-110-AT"})
 
     def test_an_unmatched_keyword_returns_nothing(self):
         response = self.client.get("/api/v1/loci?outlier_type=all&phenotype_keyword=myopathy")
@@ -1525,17 +1566,6 @@ class DegradedModeFallbackTests(unittest.TestCase):
         row = {"LocusId": "chr1-100-110-AT", "Chrom": "chr1", "Start0Based": 100, "End1Based": 110, "Motif": "AT"}
         self.assertIsNone(self.degraded.compute_known_disease_info(row, lookups))
         self.assertIsNone(self.degraded.known_disease_pathogenic_min("chr1", 100, 110, "AT", {}, {}))
-
-
-class MinimalDatabaseTestCase(ServerTestCase):
-    """Points the server at the _build_minimal_db fixture."""
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
-        _build_minimal_db(cls.db_path)
-        cls.configure_server(cls.db_path)
 
 
 class RequestCheckTests(MinimalDatabaseTestCase):

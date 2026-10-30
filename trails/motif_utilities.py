@@ -2,7 +2,7 @@
 
   * ``reverse_complement`` over the full IUPAC ``COMPLEMENT`` table,
   * ``compute_canonical_motif``: the alphabetically first rotation of the motif or
-    (optionally) of its reverse complement,
+    of its reverse complement,
   * ``compute_canonical_motifs_with_n_as_any_base``: the canonical motifs of every
     concrete motif an N-containing motif stands for, and
   * ``generate_all_canonical_motifs``: the set of all canonical motifs up to a length.
@@ -71,34 +71,25 @@ def _alphabetically_first_motif_under_shift(motif):
     return minimal_motif
 
 
-def compute_canonical_motif(motif, include_reverse_complement=True):
+def compute_canonical_motif(motif):
     """Return the canonical representation of a tandem-repeat motif.
 
     The canonical motif is the rearrangement of the motif's bases -- considering
-    all cyclic rotations, and optionally the rotations of its reverse complement
-    -- that is alphabetically first. For example, ``compute_canonical_motif("GAA")``
-    returns ``"AAG"`` (the first among ``GAA``, ``AGA``, ``AAG``, and the
+    all cyclic rotations of the motif and of its reverse complement -- that is
+    alphabetically first. For example, ``compute_canonical_motif("GAA")`` returns
+    ``"AAG"`` (the first among ``GAA``, ``AGA``, ``AAG``, and the
     reverse-complement rotations ``TTC``, ``TCT``, ``CTT``).
 
     Args:
         motif: A repeat motif such as ``"CAG"``. Case-insensitive (upcased
             internally).
-        include_reverse_complement: When True (default), the reverse complement
-            of the motif and its rotations are also considered.
 
     Returns:
         The canonical (alphabetically first) motif string.
     """
     motif = motif.upper()
-    minimal_motif = _alphabetically_first_motif_under_shift(motif)
-
-    if include_reverse_complement:
-        minimal_motif_reverse_complement = _alphabetically_first_motif_under_shift(
-            reverse_complement(motif))
-        if minimal_motif_reverse_complement < minimal_motif:
-            return minimal_motif_reverse_complement
-
-    return minimal_motif
+    return min(_alphabetically_first_motif_under_shift(motif),
+               _alphabetically_first_motif_under_shift(reverse_complement(motif)))
 
 
 def compute_canonical_motifs_with_n_as_any_base(motif):
@@ -114,8 +105,7 @@ def compute_canonical_motifs_with_n_as_any_base(motif):
         motif: A repeat motif such as ``"GCN"``. Case-insensitive.
 
     Returns:
-        A set of canonical motif strings (``compute_canonical_motif``, with reverse
-        complement).
+        A set of canonical motif strings (``compute_canonical_motif``).
     """
     base_choices = [("A", "C", "G", "T") if base == "N" else (base,) for base in motif.upper()]
     return {compute_canonical_motif("".join(bases)) for bases in itertools.product(*base_choices)}

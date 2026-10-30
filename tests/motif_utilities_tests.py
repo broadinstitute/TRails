@@ -86,17 +86,15 @@ class ComputeCanonicalMotifTests(unittest.TestCase):
         # CAG rotations: CAG, AGC, GCA -> AGC. RC is CTG -> CTG. AGC < CTG.
         self.assertEqual(compute_canonical_motif("CAG"), "AGC")
 
-    def test_reverse_complement_flag_does_not_matter_when_the_forward_rotation_is_smallest(self):
-        with_rc = compute_canonical_motif("GAA", include_reverse_complement=True)
-        without_rc = compute_canonical_motif("GAA", include_reverse_complement=False)
-        self.assertEqual(with_rc, "AAG")
-        # Without RC, only GAA/AGA/AAG considered -> still AAG (RC not smaller here).
-        self.assertEqual(without_rc, "AAG")
+    def test_forward_rotation_kept_when_it_is_smallest(self):
+        # GAA's rotations give AAG; its reverse complement TTC's give CTT, which is larger.
+        self.assertEqual(_alphabetically_first_motif_under_shift("GAA"), "AAG")
+        self.assertEqual(compute_canonical_motif("GAA"), "AAG")
 
-    def test_reverse_complement_flag_picks_rc_when_smaller(self):
-        # TTC rotations: TTC, TCT, CTT -> CTT. Its RC is GAA -> AAG which is smaller.
-        self.assertEqual(compute_canonical_motif("TTC", include_reverse_complement=True), "AAG")
-        self.assertEqual(compute_canonical_motif("TTC", include_reverse_complement=False), "CTT")
+    def test_reverse_complement_rotation_picked_when_it_is_smallest(self):
+        # TTC's own rotations give CTT; its reverse complement GAA gives AAG, which is smaller.
+        self.assertEqual(_alphabetically_first_motif_under_shift("TTC"), "CTT")
+        self.assertEqual(compute_canonical_motif("TTC"), "AAG")
 
     def test_case_insensitive(self):
         self.assertEqual(compute_canonical_motif("gaa"), "AAG")

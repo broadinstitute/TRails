@@ -109,7 +109,8 @@
 
     <!-- Group Results By: one row per locus, or per unsolved affected sample or family -->
     <div class="field">
-        <label style="display: inline;">Group Results By</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="<b>Locus:</b> one row per locus, expanding to the samples at that locus.<br /><br /><b>Unsolved affected sample / family:</b> one row per sample (or family) that <b>#Aff</b> counts at one or more of the loci matching the filters, i.e. affected and not solved, with an allele larger than every unaffected or solved sample's and above the 99th percentiles of the population cohorts the database was built with ({{ population_gate_cohorts | join(', ') }}). A row expands to those loci.<br /><br />The Sample Id and Phenotype filters then pick the samples (in the family view, the families with such a sample) instead of the loci."></i>
+        {# The cohort names are escaped twice in data-html: the attribute decodes one level, and the popup inserts the rest as HTML #}
+        <label style="display: inline;">Group Results By</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="<b>Locus:</b> one row per locus, expanding to the samples at that locus.<br /><br /><b>Unsolved affected sample / family:</b> one row per sample (or family) that <b>#Aff</b> counts at one or more of the loci matching the filters, i.e. affected and not solved, with an allele larger than every unaffected or solved sample's and above the 99th percentiles of the population cohorts the database was built with ({{ population_gate_cohorts | join(', ') | forceescape | forceescape }}). A row expands to those loci.<br /><br />The Sample Id and Phenotype filters then pick the samples (in the family view, the families with such a sample) instead of the loci."></i>
         <div class="radio-group">
             <div class="ui radio checkbox">
                 <input type="radio" name="group_by" value="locus" checked>
@@ -377,7 +378,7 @@
                                 <th class="col-delta-ref col-numeric">&Delta;ref</th>
                                 <th class="col-delta-pop col-numeric">&Delta;pop</th>
                                 <th class="col-aff-unsolved col-numeric" data-sort="count">#Aff<span class="sort-icon">&#8597;</span></th>
-                                <th class="col-fam-unsolved col-numeric" data-sort="family_count" title="Distinct affected, unsolved families with an allele larger than every unaffected or solved sample's and above the 99th percentiles of the population cohorts the database was built with ({{ population_gate_cohorts | join(', ') }}; #Aff counted by family)">#Fam<span class="sort-icon">&#8597;</span></th>
+                                <th class="col-fam-unsolved col-numeric" data-sort="family_count" title="Distinct affected, unsolved families with an allele larger than every unaffected or solved sample's and above the 99th percentiles of the population cohorts the database was built with ({{ population_gate_cohorts | join(', ') | e }}; #Aff counted by family)">#Fam<span class="sort-icon">&#8597;</span></th>
                                 <th class="col-inheritance">Inher.</th>
                                 <th class="col-gene-pheno">Gene Phenotype</th>
                                 <th class="col-pli col-numeric">pLI</th>
@@ -609,8 +610,6 @@ $(document).ready(function() {
 // URL Hash State Management
 // =========================================================================
 
-// Default State
-
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
 const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
 // 99th-percentile outlier warnings, keyed by sample_id
@@ -619,6 +618,7 @@ const OUTLIER_WARNINGS = {{ outlier_warnings | tojson }};
 // Population filter that a page opened with no saved filters starts with ('' for none)
 const INITIAL_REQUIRE_ABOVE_POPULATION = {{ initial_require_above_population | tojson }};
 
+// Default State
 const DEFAULT_STATE = {
     outlier_type: 'all',
     require_above_unaffected: '',
@@ -1022,10 +1022,13 @@ function describeFetchError(error) {
 // removal all funnel through performSearch(), so updating the indicator here keeps the
 // highlighted headers consistent with the sort actually applied.
 function syncSortHeaderIndicator() {
+    const fields = getSortList();
     $('#results-table thead th').removeClass('sorted-active');
-    for (const field of getSortList()) {
-        $(`#results-table thead th[data-sort="${field}"]`).addClass('sorted-active');
-    }
+    // The fields are compared rather than written into the selector because the sort list can
+    // come from the URL (see inputsWithValue)
+    $('#results-table thead th[data-sort]')
+        .filter(function() { return fields.includes(this.getAttribute('data-sort')); })
+        .addClass('sorted-active');
 }
 
 // =========================================================================
@@ -1126,7 +1129,8 @@ async function performSearch() {
         const response = await fetchWithTimeout(grouped ? buildGroupedApiUrl() : buildApiUrl());
         if (requestId !== searchRequestSeq) return;  // superseded by a newer search
         if (!response.ok) {
-            const errorData = await response.json();
+            // An error page that is not JSON (e.g. from a proxy) falls back to the HTTP status
+            const errorData = await response.json().catch(() => ({}));
             throw new Error(errorData.detail || `HTTP ${response.status}`);
         }
         const data = await response.json();
@@ -1167,7 +1171,6 @@ async function performSearch() {
 // Button Handlers
 $('#search-button').on('click', function() {
     readStateFromUI();
-    currentState.page = 1;
     performSearch();
 });
 
@@ -1175,7 +1178,6 @@ $('#search-button').on('click', function() {
 $('#filter-panel input[type="text"], #filter-panel input[type="number"]').on('keypress', function(e) {
     if (e.which === 13) {
         readStateFromUI();
-        currentState.page = 1;
         performSearch();
     }
 });
@@ -1189,7 +1191,6 @@ async function performExport(format) {
     // the table is actually showing back (restored in the finally block below).
     const savedState = JSON.parse(JSON.stringify(currentState));
     readStateFromUI();
-    currentState.page = savedState.page;
     // The export menu only offers the formats of the table on screen (locus or grouped), so its
     // grouping is kept too, even if the Group Results By radios were changed without a search.
     currentState.group_by = savedState.group_by;
@@ -2632,24 +2633,26 @@ async function refreshRowAnnotations(locusId) {
         const response = await fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`);
         if (!response.ok) return;
         const ann = await response.json();
-        const $row = $(`tr.locus-row[data-locus-id="${locusId}"]`);
-        const $locusCell = $row.find('.col-locus');
-        const $badgesRow = $locusCell.find('.badges-row');
 
         // Build new tag badges and note icon
         const newContent = renderAnnotationBadges(ann.tags || [], ann.note != null);
 
-        // Update or create the badges row
-        if ($badgesRow.length) {
-            // Remove old annotation-badges span and prepend new one (user tags come first)
-            $badgesRow.find('.annotation-badges').remove();
-            if (newContent) {
-                $badgesRow.prepend(newContent);
+        // Update or create the badges row of every row that lists the locus: in a grouped view the
+        // same locus can be open under several groups, and only some of them may have a badges row
+        $(`tr.locus-row[data-locus-id="${locusId}"]`).each(function() {
+            const $locusCell = $(this).find('.col-locus');
+            const $badgesRow = $locusCell.find('.badges-row');
+            if ($badgesRow.length) {
+                // Remove old annotation-badges span and prepend new one (user tags come first)
+                $badgesRow.find('.annotation-badges').remove();
+                if (newContent) {
+                    $badgesRow.prepend(newContent);
+                }
+            } else if (newContent) {
+                // No badges row exists yet, create one after cell-main
+                $locusCell.find('.cell-main').after(`<div class="cell-sub badges-row">${newContent}</div>`);
             }
-        } else if (newContent) {
-            // No badges row exists yet, create one after cell-main
-            $locusCell.find('.cell-main').after(`<div class="cell-sub badges-row">${newContent}</div>`);
-        }
+        });
     } catch (e) {
         console.error('Refresh row annotations error:', e);
     }

@@ -59,45 +59,33 @@ def allele_matches_any(allele, genotype, threshold):
     return any(abs(allele - other_allele) < threshold for other_allele in genotype)
 
 
-def check_violation(child_genotype, mother_genotype, father_genotype, threshold, chrom_category):
-    """Return True if the child's genotype violates Mendelian inheritance.
+def check_violation(child_genotype, mother_genotype, father_genotype, threshold):
+    """Return True if the child's genotype violates Mendelian inheritance from both parents.
 
     A genotype is consistent with Mendelian inheritance if the child could have
     inherited one allele from the mother and one from the father. Alleles are
     considered matching if they differ by strictly fewer than ``threshold``
-    repeats.
+    repeats. A hemizygous father (on chrX, for a daughter) passes on his single
+    allele.
 
-    Handles hemizygous calls (1-element tuples) for sex chromosomes:
-      * Hemizygous child on chrX (a son): the single allele must come from the
-        mother.
-      * Hemizygous father on chrX: a daughter inherits his single allele.
-    (chrY and chrM are handled by the per-chromosome dispatch in
-    ``_process_trio`` and never reach this function.)
-
-    A single-allele child call on an autosome means something different: the
-    caller only reported one allele, and it could have come from either parent,
-    so ``chrom_category`` decides which rule applies.
+    This is the comparison for the autosomes and a diploid chrX child. The loci
+    inherited from one parent (chrY, chrM and a hemizygous son's chrX) are
+    compared by ``_process_trio`` with that parent alone and never reach this
+    function, so a single-allele child call here is just a one-allele call, which
+    either parent could have supplied.
 
     Args:
         child_genotype: Tuple of alleles for the child (1 or 2 elements).
         mother_genotype: Tuple of alleles for the mother (1 or 2 elements).
-        father_genotype: Tuple of alleles for the father (1 or 2 elements), or
-            None for a hemizygous chrX child, whose father is not consulted.
+        father_genotype: Tuple of alleles for the father (1 or 2 elements).
         threshold: Alleles match if they differ by strictly fewer than this many
             repeats.
-        chrom_category: The locus's chromosome category, as returned by
-            ``get_chrom_category`` -- "chrX" or "autosome" here.
 
     Returns:
         True if the genotype is a Mendelian violation, False otherwise.
     """
-    # Case 1: the child has a single allele. On chrX that means a hemizygous son,
-    # whose one X allele comes from the mother regardless of her ploidy. On an
-    # autosome it is just a one-allele call, which either parent could have
-    # supplied. (chrY is handled separately and never reaches here.)
+    # Case 1: a one-allele call, which either parent could have supplied.
     if len(child_genotype) == 1:
-        if chrom_category == "chrX":
-            return not allele_matches_any(child_genotype[0], mother_genotype, threshold)
         return not (allele_matches_any(child_genotype[0], mother_genotype, threshold)
                     or allele_matches_any(child_genotype[0], father_genotype, threshold))
 
@@ -302,55 +290,32 @@ def _process_trio(child_id, mother_id, father_id, prepared_loci, threshold):
         if child_genotype is None:
             continue
 
+        # chrY comes from the father, chrM from the mother, and a hemizygous son's single X allele
+        # from the mother, so those loci are compared with that one parent; the other parent is
+        # not consulted and need not have a call.
         if chrom_category == "chrY":
-            father_genotype = parse_genotype(genotypes.get(father_id))
-            if father_genotype is None:
+            single_parent_id = father_id
+        elif chrom_category == "chrM" or (chrom_category == "chrX" and len(child_genotype) == 1):
+            single_parent_id = mother_id
+        else:
+            single_parent_id = None
+
+        if single_parent_id is not None:
+            parent_genotype = parse_genotype(genotypes.get(single_parent_id))
+            if parent_genotype is None:
                 continue
             # The "at least 2 distinct alleles" variability filter degenerates on a haploid
-            # comparison: with one allele on each side, "2 distinct" is exactly "father and son
+            # comparison: with one allele on each side, "2 distinct" is exactly "parent and child
             # disagree", so applying it would leave only discordant loci in the denominator and
             # violations/total would stop being a violation rate. Keep it only when at least one
             # side is diploid, where it still means what it does on the autosomes.
-            if (len(child_genotype) > 1 or len(father_genotype) > 1) \
-                    and len(set(child_genotype) | set(father_genotype)) < 2:
+            if (len(child_genotype) > 1 or len(parent_genotype) > 1) \
+                    and len(set(child_genotype) | set(parent_genotype)) < 2:
                 continue
             is_violation = any(
-                not allele_matches_any(child_allele, father_genotype, threshold)
+                not allele_matches_any(child_allele, parent_genotype, threshold)
                 for child_allele in child_genotype
             )
-            _tally(stats, per_motif_stats, "chrY", motif_size_category, canonical_motif, is_violation)
-
-        elif chrom_category == "chrM":
-            mother_genotype = parse_genotype(genotypes.get(mother_id))
-            if mother_genotype is None:
-                continue
-            # Same haploid caveat as chrY above.
-            if (len(child_genotype) > 1 or len(mother_genotype) > 1) \
-                    and len(set(child_genotype) | set(mother_genotype)) < 2:
-                continue
-            is_violation = any(
-                not allele_matches_any(child_allele, mother_genotype, threshold)
-                for child_allele in child_genotype
-            )
-            _tally(stats, per_motif_stats, "chrM", motif_size_category, canonical_motif, is_violation)
-
-        elif chrom_category == "chrX" and len(child_genotype) == 1:
-            # A hemizygous son's single X allele comes from the mother, so check_violation
-            # never consults the father here. Requiring his genotype would drop the locus
-            # for no reason, so require only the mother, as on chrM.
-            mother_genotype = parse_genotype(genotypes.get(mother_id))
-            if mother_genotype is None:
-                continue
-            # Same haploid caveat as chrY above: the child has one allele here, so the
-            # "at least 2 distinct alleles" filter only means what it does elsewhere when
-            # the mother is diploid.
-            if len(mother_genotype) > 1 and len(set(child_genotype) | set(mother_genotype)) < 2:
-                continue
-            _tally(
-                stats, per_motif_stats, "chrX", motif_size_category, canonical_motif,
-                check_violation(child_genotype, mother_genotype, None, threshold, "chrX"),
-            )
-
         else:
             mother_genotype = parse_genotype(genotypes.get(mother_id))
             father_genotype = parse_genotype(genotypes.get(father_id))
@@ -358,11 +323,9 @@ def _process_trio(child_id, mother_id, father_id, prepared_loci, threshold):
                 continue
             if len(set(child_genotype) | set(mother_genotype) | set(father_genotype)) < 2:
                 continue
-            _tally(
-                stats, per_motif_stats, chrom_category, motif_size_category, canonical_motif,
-                check_violation(child_genotype, mother_genotype, father_genotype, threshold,
-                                chrom_category),
-            )
+            is_violation = check_violation(child_genotype, mother_genotype, father_genotype, threshold)
+
+        _tally(stats, per_motif_stats, chrom_category, motif_size_category, canonical_motif, is_violation)
 
     return stats, per_motif_stats
 

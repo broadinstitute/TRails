@@ -204,28 +204,33 @@ class TRExplorerAnnotationsDatabaseCacheTests(unittest.TestCase):
         shutil.rmtree(self.tmpdir)
 
     def test_a_database_recorded_under_another_format_is_rebuilt_from_the_same_url(self):
-        # A cached database recorded without the current database format may lack columns that
-        # add_trexplorer_annotations reads, so it is rebuilt. The download URL stays the plain one.
+        # A cached database recorded without the current database format, or under an earlier
+        # one, may lack columns that add_trexplorer_annotations reads, so it is rebuilt. The
+        # download URL stays the plain one.
         name, source, fetch, trails_option = next(entry for entry in trails_setup.REFERENCE_FILES
                                                   if entry[0] == trails_setup.TREXPLORER_ANNOTATIONS_DATABASE_NAME)
         self.assertIn(f"database_format={trails_setup.TREXPLORER_ANNOTATIONS_DATABASE_FORMAT_VERSION}", source)
-        database_path = os.path.join(self.tmpdir, name)
-        manifest_path = os.path.join(self.tmpdir, trails_setup.CACHE_MANIFEST_NAME)
-        with open(database_path, "w") as f:
-            f.write("a database built in an older format")
-        with open(manifest_path, "w") as f:
-            json.dump({name: trails_setup.TREXPLORER_ANNOTATIONS_TSV_URL}, f)
+        url = trails_setup.TREXPLORER_ANNOTATIONS_TSV_URL
+        earlier_format = trails_setup.TREXPLORER_ANNOTATIONS_DATABASE_FORMAT_VERSION - 1
+        for recorded_source in (url, f"{url}#database_format={earlier_format}"):
+            with self.subTest(recorded_source=recorded_source):
+                database_path = os.path.join(self.tmpdir, name)
+                manifest_path = os.path.join(self.tmpdir, trails_setup.CACHE_MANIFEST_NAME)
+                with open(database_path, "w") as f:
+                    f.write("a database built in an older format")
+                with open(manifest_path, "w") as f:
+                    json.dump({name: recorded_source}, f)
 
-        with mock.patch.object(trails_setup, "REFERENCE_FILES", [(name, source, fetch, trails_option)]), \
-                mock.patch.object(trails_setup, "_download") as download, \
-                mock.patch.object(trexplorer_annotations, "build_trexplorer_annotations_database") as build:
-            self.assertEqual(trails_setup.fetch_reference_data(self.tmpdir), {name: database_path})
+                with mock.patch.object(trails_setup, "REFERENCE_FILES", [(name, source, fetch, trails_option)]), \
+                        mock.patch.object(trails_setup, "_download") as download, \
+                        mock.patch.object(trexplorer_annotations, "build_trexplorer_annotations_database") as build:
+                    self.assertEqual(trails_setup.fetch_reference_data(self.tmpdir), {name: database_path})
 
-        downloaded_table = database_path + ".download.tsv.gz"
-        download.assert_called_once_with(trails_setup.TREXPLORER_ANNOTATIONS_TSV_URL, downloaded_table)
-        build.assert_called_once_with(downloaded_table, database_path)
-        with open(manifest_path) as f:
-            self.assertEqual(json.load(f), {name: source})
+                downloaded_table = database_path + ".download.tsv.gz"
+                download.assert_called_once_with(url, downloaded_table)
+                build.assert_called_once_with(downloaded_table, database_path)
+                with open(manifest_path) as f:
+                    self.assertEqual(json.load(f), {name: source})
 
 
 if __name__ == "__main__":

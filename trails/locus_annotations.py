@@ -367,8 +367,6 @@ def collect_known_disease_canonical_motifs(interval_trees, strchive_trees=None):
     for trees, locus_motifs, _source in _catalogs_with_their_motifs(interval_trees, strchive_trees):
         for tree in trees.values():
             for interval in tree:
-                if not interval.data:
-                    continue
                 for motif in locus_motifs(interval.data):
                     if len(motif) <= MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE:
                         known_canonical_motifs.update(compute_canonical_motifs_with_n_as_any_base(motif))
@@ -528,8 +526,7 @@ def add_derived_locus_columns(locus_records, source_label="", repeat_copy_number
             record["Source"] = source_label
 
         validate_motif(record["Motif"], record["LocusId"], repeat_copy_numbers_tsv)
-        record["CanonicalMotif"] = compute_canonical_motif(
-            record["Motif"], include_reverse_complement=True)
+        record["CanonicalMotif"] = compute_canonical_motif(record["Motif"])
 
         if record.get("gene_id") is None:
             record["gene_id"] = record.get("GencodeGeneId")

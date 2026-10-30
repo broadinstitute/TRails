@@ -27,6 +27,11 @@ MIN_JACCARD_SIMILARITY = 0.66
 
 TREXPLORER_LOCI_TABLE = "trexplorer_loci"
 
+# Each cohort's most common allele size. TRExplorer calls it {cohort}_ModeAllele; the loci table
+# and the results server call it {cohort}_Mode, so TRAILS_COLUMN_BY_TREXPLORER_COLUMN renames it.
+# Kept as DOUBLE, like the other allele-size statistics.
+MODE_ALLELE_COLUMNS = ["HPRC256_ModeAllele", "AoU1027_ModeAllele", "TenK10K_ModeAllele"]
+
 # Columns copied from the matched TRExplorer locus onto the TRails locus: {TRExplorer column:
 # TRails column}. A value the repeat-copy-numbers table already supplies for a column is kept.
 TRAILS_COLUMN_BY_TREXPLORER_COLUMN = {
@@ -40,16 +45,20 @@ TRAILS_COLUMN_BY_TREXPLORER_COLUMN = {
     "VariationCluster": "VariationCluster",
     "VariationClusterSizeDiff": "VariationClusterSizeDiff",
     "VariationClusterFilterReason": "VariationClusterFilterReason",
+    **{column: column.replace("_ModeAllele", "_Mode") for column in MODE_ALLELE_COLUMNS},
 }
 INTEGER_POPULATION_COLUMNS = [
     "HPRC256_MaxAllele", "HPRC256_StdevRankByMotif", "HPRC256_StdevRankTotalNumberByMotif",
     "AoU1027_MaxAllele", "AoU1027_StdevRankByMotif", "AoU1027_StdevRankTotalNumberByMotif",
     "TenK10K_MaxAllele",
 ]
+# Medians are DOUBLE because some are not whole numbers (e.g. TenK10K's, which can fall halfway
+# between two allele sizes).
 FLOAT_POPULATION_COLUMNS = [
-    "HPRC256_99thPercentile", "HPRC256_Stdev",
-    "AoU1027_99thPercentile", "AoU1027_Stdev", "AoU1027_OE_Length", "AoU1027_OE_LengthPercentile",
-    "TenK10K_99thPercentile", "TenK10K_Stdev",
+    "HPRC256_99thPercentile", "HPRC256_Median", "HPRC256_Stdev",
+    "AoU1027_99thPercentile", "AoU1027_Median", "AoU1027_Stdev", "AoU1027_OE_Length",
+    "AoU1027_OE_LengthPercentile",
+    "TenK10K_99thPercentile", "TenK10K_Median", "TenK10K_Stdev",
 ]
 
 # A chromosome's place in one genome-wide coordinate (CHROMOSOME_INDEX * GENOME_COORDINATE_STRIDE
@@ -89,7 +98,8 @@ def build_trexplorer_annotations_database(annotations_tsv_path, database_path):
     region_coordinates = "split_part(ReferenceRegion, ':', 2)"
     numeric_columns = (
         [f"TRY_CAST({c} AS BIGINT) AS {c}" for c in INTEGER_POPULATION_COLUMNS + ["VariationClusterSizeDiff"]]
-        + [f"TRY_CAST({c} AS DOUBLE) AS {c}" for c in FLOAT_POPULATION_COLUMNS + ["ReferenceRepeatPurity"]])
+        + [f"TRY_CAST({c} AS DOUBLE) AS {c}"
+           for c in FLOAT_POPULATION_COLUMNS + MODE_ALLELE_COLUMNS + ["ReferenceRepeatPurity"]])
     text_columns = ["Motif", "CanonicalMotif", "ReferenceRegion", "Source", "GencodeGeneId", "GencodeGeneRegion",
                     "VariationCluster", "VariationClusterFilterReason"]
     connection, tmp_path = result_database.open_new_database(database_path)
@@ -174,7 +184,10 @@ def add_trexplorer_annotations(locus_records, annotations_database_path):
 
     A value the repeat-copy-numbers table already supplies for a column is kept; TRExplorer
     fills only the columns it left empty. A locus whose gene region is filled here gets its
-    gene_region_rank recomputed, since add_derived_locus_columns derived it before.
+    gene_region_rank recomputed, since add_derived_locus_columns derived it before. A column
+    the database lacks stays empty: trails_setup keeps using a database built in an older format
+    when downloading the table to rebuild it fails (e.g. offline), and that copy can predate a
+    column.
 
     Args:
         locus_records: Per-locus dicts after locus_annotations.add_derived_locus_columns.
@@ -194,9 +207,9 @@ def add_trexplorer_annotations(locus_records, annotations_database_path):
             record["TRExplorerLocusJaccardSimilarity"] = round(match["jaccard_similarity"], 4)
         for trexplorer_column, trails_column in TRAILS_COLUMN_BY_TREXPLORER_COLUMN.items():
             if record.get(trails_column) is None:
-                record[trails_column] = match[trexplorer_column]
+                record[trails_column] = match.get(trexplorer_column)
         for column in INTEGER_POPULATION_COLUMNS + FLOAT_POPULATION_COLUMNS:
             if record.get(column) is None:
-                record[column] = match[column]
+                record[column] = match.get(column)
         record["gene_region_rank"] = locus_annotations.gene_region_rank(record.get("gene_region"))
     return num_matched_by_locus_id, len(matches) - num_matched_by_locus_id

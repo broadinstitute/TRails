@@ -7,7 +7,7 @@ fetches TRExplorer's population statistics and locus annotations, and genelookup
 are never fetched here.
 
 CLI, from the TRails directory (the TRExplorer step needs the packages in .venv/):
-    .venv/bin/python trails/trails_setup.py [fetch] [--dir reference_data] [--remote] [--force]
+    .venv/bin/python trails/trails_setup.py [--dir reference_data] [--remote] [--force]
 """
 
 import argparse
@@ -39,7 +39,7 @@ TREXPLORER_CATALOG_VERSION = "v2.1"   # TRExplorer repeat catalog release (gs://
 # columns that database keeps or how it builds them. It is part of the source the
 # reference-versions manifest records for the database, so a bump makes existing installs rebuild
 # their copy instead of reading columns it does not have.
-TREXPLORER_ANNOTATIONS_DATABASE_FORMAT_VERSION = 1
+TREXPLORER_ANNOTATIONS_DATABASE_FORMAT_VERSION = 2
 
 TREXPLORER_ANNOTATIONS_TSV_URL = (
     f"https://storage.googleapis.com/tandem-repeat-catalog/{TREXPLORER_CATALOG_VERSION}/"
@@ -244,8 +244,6 @@ def fetch_reference_data(dest_dir=DEFAULT_REFERENCE_DIR, remote=False, force=Fal
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", nargs="?", default="fetch", choices=["fetch"],
-                        help="only 'fetch' is supported (the default)")
     parser.add_argument("--dir", default=DEFAULT_REFERENCE_DIR,
                         help="reference-data directory (default: reference_data/ in the TRails directory)")
     parser.add_argument("--remote", action="store_true",

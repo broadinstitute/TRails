@@ -15,14 +15,15 @@ CATALOG_COLUMNS = (
     ["LocusId", "ReferenceRegion", "LocusStructure", "Motif", "CanonicalMotif", "Source", "GencodeGeneId",
      "GencodeGeneRegion", "VariationCluster", "VariationClusterSizeDiff", "VariationClusterFilterReason",
      "ReferenceRepeatPurity"]
-    + trexplorer_annotations.INTEGER_POPULATION_COLUMNS + trexplorer_annotations.FLOAT_POPULATION_COLUMNS)
+    + trexplorer_annotations.INTEGER_POPULATION_COLUMNS + trexplorer_annotations.FLOAT_POPULATION_COLUMNS
+    + trexplorer_annotations.MODE_ALLELE_COLUMNS)
 
 
 def catalog_row(locus_id, **values):
     """Returns one catalog row for a locus id chrom-start-end-motif, with defaults for the rest."""
     chrom, start, end, motif = locus_id.split("-")
     row = {"LocusId": locus_id, "ReferenceRegion": f"chr{chrom}:{start}-{end}", "Motif": motif,
-           "CanonicalMotif": locus_annotations.compute_canonical_motif(motif, include_reverse_complement=True),
+           "CanonicalMotif": locus_annotations.compute_canonical_motif(motif),
            "Source": "TRExplorerV1:PerfectRepeatsInReference", "GencodeGeneRegion": "intergenic",
            "ReferenceRepeatPurity": "1.0"}
     row.update(values)
@@ -34,7 +35,7 @@ def user_locus(locus_id, **values):
     chrom, start, end, motif = locus_id.split("-")
     record = {"LocusId": locus_id, "Chrom": f"chr{chrom.replace('chr', '')}", "Start0Based": int(start),
               "End1Based": int(end), "Motif": motif,
-              "CanonicalMotif": locus_annotations.compute_canonical_motif(motif, include_reverse_complement=True)}
+              "CanonicalMotif": locus_annotations.compute_canonical_motif(motif)}
     record.update(values)
     return record
 
@@ -163,6 +164,37 @@ class AddTRExplorerAnnotationsTests(TRExplorerAnnotationsTestCase):
         self.assertEqual(annotated["TRExplorerLocusJaccardSimilarity"], 1.0)
         self.assertEqual((annotated["VariationCluster"], annotated["VariationClusterSizeDiff"]), ("1-90-140", 20))
         self.assertNotIn("HPRC256_99thPercentile", records[1])
+
+    def test_medians_and_modes_reach_the_locus_under_the_names_the_server_reads(self):
+        # The results server's population line reads {cohort}_Median and {cohort}_Mode;
+        # TRExplorer calls the mode {cohort}_ModeAllele. A median can be a half allele.
+        database_path = self.build_database([catalog_row(
+            "1-100-130-CAG", HPRC256_Median="11.0", HPRC256_ModeAllele="10.0", TenK10K_Median="4.5",
+            TenK10K_ModeAllele="4.0")])
+        records = [user_locus("1-100-130-CAG", AoU1027_Mode=7)]
+        trexplorer_annotations.add_trexplorer_annotations(records, database_path)
+        self.assertEqual(
+            {column: records[0][column] for column in
+             ["HPRC256_Median", "HPRC256_Mode", "TenK10K_Median", "TenK10K_Mode", "AoU1027_Median", "AoU1027_Mode"]},
+            {"HPRC256_Median": 11.0, "HPRC256_Mode": 10.0, "TenK10K_Median": 4.5, "TenK10K_Mode": 4.0,
+             "AoU1027_Median": None, "AoU1027_Mode": 7})  # AoU1027_Mode supplied by the matrix, so kept
+        self.assertNotIn("HPRC256_ModeAllele", records[0])
+
+    def test_a_database_from_before_the_median_and_mode_columns_still_annotates(self):
+        # trails_setup keeps an older-format copy when the download to rebuild it fails.
+        database_path = self.build_database([catalog_row("1-100-130-CAG", HPRC256_99thPercentile="12.5")])
+        connection = duckdb_compat.connect(database_path)
+        try:
+            for column in (trexplorer_annotations.MODE_ALLELE_COLUMNS
+                           + ["HPRC256_Median", "AoU1027_Median", "TenK10K_Median"]):
+                connection.execute(f"ALTER TABLE trexplorer_loci DROP COLUMN {column}")
+        finally:
+            connection.close()
+        records = [user_locus("1-100-130-CAG")]
+        self.assertEqual(trexplorer_annotations.add_trexplorer_annotations(records, database_path), (1, 0))
+        self.assertEqual(records[0]["HPRC256_99thPercentile"], 12.5)
+        self.assertIsNone(records[0]["HPRC256_Median"])
+        self.assertIsNone(records[0]["HPRC256_Mode"])
 
     def test_counts_overlap_matches_separately(self):
         database_path = self.build_database([catalog_row("1-100-130-CAG")])

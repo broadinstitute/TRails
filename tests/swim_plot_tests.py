@@ -2,11 +2,11 @@
 
 import unittest
 
+import analysis_columns
 from swim_plot import (
     SWIM_PLOT_COLUMNS,
     SWIM_PLOT_LOCUS_COLUMNS,
     _compute_motif_category,
-    _title_case_status,
     generate_swim_plot_table,
 )
 
@@ -58,22 +58,6 @@ class MotifCategoryTests(unittest.TestCase):
     def test_missing_motif_size(self):
         self.assertEqual(_compute_motif_category(None), "Unknown")
         self.assertEqual(_compute_motif_category(float("nan")), "Unknown")
-
-
-class StatusNormalizationTests(unittest.TestCase):
-    def test_affected_title_casing(self):
-        self.assertEqual(_title_case_status("affected"), "Affected")
-        self.assertEqual(_title_case_status("UNAFFECTED"), "Unaffected")
-        self.assertEqual(_title_case_status(" possibly affected "), "Possibly Affected")
-
-    def test_analysis_title_casing(self):
-        self.assertEqual(_title_case_status("solved"), "Solved")
-        self.assertEqual(_title_case_status("UNSOLVED"), "Unsolved")
-        self.assertEqual(_title_case_status("partially solved"), "Partially Solved")
-
-    def test_missing_and_blank_statuses_are_unknown(self):
-        for blank in (None, float("nan"), "", "  ", "NA", "n/a", "null"):
-            self.assertEqual(_title_case_status(blank), "Unknown", repr(blank))
 
 
 class GenerateSwimPlotTableTests(unittest.TestCase):
@@ -154,8 +138,21 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
             FirstUnaffectedAlleleSize_AllAlleles=None,
         )]
         rows = generate_swim_plot_table(records, sample_lookup)
-        self.assertEqual(rows[0]["is_above_first_unaffected"], 1)  # >0 with no baseline
+        self.assertEqual(rows[0]["is_above_first_unaffected"], 1)  # no unaffected baseline
         self.assertIsNone(rows[0]["FirstUnaffectedAlleleSize"])
+
+    def test_a_zero_repeat_allele_is_flagged_as_the_affected_count_counts_it(self):
+        # With no unaffected sample, #Aff counts a 0-repeat (fully deleted) affected allele, so
+        # the swim plot's is_above_first_unaffected flag must say the same.
+        records = [_make_record(OutlierSampleIds_ShortAlleles="7x:S3,5x:S2,0x:S1")]
+        sample_lookup = {sample_id: {"affected_status": "affected"} for sample_id in ("S1", "S2", "S3")}
+        affected_lookup = {sample_id: "affected" for sample_id in sample_lookup}
+        counted_rows = analysis_columns.add_all_outlier_columns(records, sample_lookup, affected_lookup, {})
+        self.assertIn(("S1", 0), [(row["sample_id"], row["allele_size"]) for row in counted_rows])
+        self.assertEqual(records[0]["NumAffectedUnsolvedSamplesAboveUnaffected_ShortAlleles"], 3)
+        swim_rows = generate_swim_plot_table(records, sample_lookup)
+        self.assertEqual({row["sample_id"]: row["is_above_first_unaffected"] for row in swim_rows
+                          if row["outlier_type"] == "ShortAlleles"}, {"S1": 1, "S2": 1, "S3": 1})
 
     def test_motif_category_bins(self):
         sample_lookup = self._sample_lookup()

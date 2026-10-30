@@ -7,7 +7,7 @@ analysis columns: the First/Second/Third affected and unaffected allele sizes
 ids, the NumAffectedUnsolved{Samples,Families}AboveUnaffected counts, and the
 rows of the affected_unsolved_outliers_above_unaffected table that lists the
 samples those counts count. It also adds the gene-derived ``pLI`` /
-``inheritance`` columns, and exposes the exact 131-name ordered
+``inheritance`` columns, and exposes the exact 137-name ordered
 ``OUTPUT_COLUMNS`` list that defines the loci table.
 
 The in-memory representation is a list of dicts (one dict per locus), so there is
@@ -103,6 +103,25 @@ def normalize_affected_status_for_logic(value):
         return None
     normalized = str(value).strip().lower()
     return "affected" if normalized == "possibly affected" else normalized
+
+
+def title_case_status_for_display(raw_status):
+    """Title-case an affected_status or analysis_status for display, or "Unknown".
+
+    The swim plot and the results server's pages and exports show statuses this way. A blank
+    status ("", "NA", "N/A", "null", ...) means nothing was recorded, so it becomes "Unknown"
+    rather than the display values "Na", "N/A" or "Null", which would show up as extra facet
+    categories.
+
+    Args:
+        raw_status: The sample's raw status, or a missing value.
+
+    Returns:
+        "Unknown" when the status is missing or blank (``blank_to_none``), otherwise
+        the stripped, Title-cased value, e.g. "Affected" or "Partially Solved".
+    """
+    status = blank_to_none(raw_status)
+    return "Unknown" if status is None else str(status).strip().title()
 
 
 def is_missing_outlier_value(value):
@@ -257,7 +276,10 @@ def is_above_unaffected(allele_size, row, outlier_type):
 
     With one row per LocusId, FirstUnaffectedAlleleSize is the max unaffected
     allele, so "above first unaffected" means "above all unaffected". When there
-    is no unaffected sample (the column is NULL), any positive allele qualifies.
+    is no unaffected sample (the column is NULL), every allele qualifies, including
+    0 (a full deletion of the repeat): the same rule as the #Aff count
+    (``find_affected_unsolved_samples_above_unaffected``) and the results server's
+    above-unaffected filter.
 
     Args:
         allele_size: The outlier's allele size.
@@ -265,11 +287,12 @@ def is_above_unaffected(allele_size, row, outlier_type):
         outlier_type: One of AllAlleles / ShortAlleles / HemizygousAlleles.
 
     Returns:
-        bool: True if the allele exceeds the first (largest) unaffected allele.
+        bool: True if the allele exceeds the first (largest) unaffected allele, or
+        the locus has no unaffected sample.
     """
     first_unaffected = row.get(f"FirstUnaffectedAlleleSize_{outlier_type}")
     if is_none_or_nan(first_unaffected):
-        return allele_size > 0
+        return True
     return allele_size > first_unaffected
 
 
@@ -663,8 +686,9 @@ def add_gene_columns(records, gene_lookup):
         record["inheritance"] = record["GeneTableInheritance"]
 
 
-# The ordered 131-name loci-table schema. Other per-locus annotation columns the matrix
-# supplies (e.g. HPRC256_Mode) are appended after these by result_database.write_loci_table.
+# The ordered 137-name loci-table schema. Other per-locus annotation columns the matrix
+# supplies (e.g. HPRC256_90thPercentile) are appended after these by
+# result_database.write_loci_table.
 OUTPUT_COLUMNS = [
     # Core locus info
     "LocusId",
@@ -806,10 +830,16 @@ OUTPUT_COLUMNS = [
     # Population reference data
     "AoU1027_99thPercentile",
     "AoU1027_MaxAllele",
+    "AoU1027_Median",
+    "AoU1027_Mode",
     "HPRC256_99thPercentile",
     "HPRC256_MaxAllele",
+    "HPRC256_Median",
+    "HPRC256_Mode",
     "TenK10K_99thPercentile",
     "TenK10K_MaxAllele",
+    "TenK10K_Median",
+    "TenK10K_Mode",
 
     # Additional TRExplorer columns
     "AoU1027_OE_Length",
