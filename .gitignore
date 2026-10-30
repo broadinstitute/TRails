@@ -240,7 +240,7 @@ snapshot_pre_refactor/
 # IDE / local tooling artifacts
 .idea/
 .memory/
-.code_review_local/
+.code_review/
 
 # TRails runtime artifacts (created by install.sh / trails.py, never source)
 .trails_version

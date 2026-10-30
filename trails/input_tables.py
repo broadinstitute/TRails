@@ -24,7 +24,7 @@ Column-name matching across the input tables is case-insensitive AND
 underscore/space-insensitive (see ``normalize_column_name``); ``sample_id``
 *values* are still joined exactly. The readers here are deliberately permissive:
 optional columns absent -> the field is simply omitted / NULL, and the build
-continues (with a printed warning) rather than hard-failing.
+continues rather than hard-failing.
 """
 
 import gzip
@@ -230,15 +230,6 @@ def read_repeat_copy_numbers(path):
     return locus_rows, sample_id_list
 
 
-def _is_blank(value):
-    """Return True if a metadata cell should be treated as missing."""
-    if value is None:
-        return True
-    if isinstance(value, float):
-        return pandas.isna(value)
-    return str(value).strip().lower() in locus_annotations.BLANK_STATUS_VALUES
-
-
 def read_sample_metadata(path):
     """Read the sample-metadata table and build lookup dictionaries.
 
@@ -303,7 +294,7 @@ def read_sample_metadata(path):
             lambda v: ANALYSIS_STATUS_REMAP.get(str(v).strip().lower(), str(v).strip().lower())
         )
         df["analysis_status"] = df["analysis_status"].apply(
-            lambda v: "unknown" if v in locus_annotations.BLANK_STATUS_VALUES else v
+            lambda v: "unknown" if analysis_columns.blank_to_none(v) is None else v
         )
 
     # Strip leading "NA; " from phenotype_description.
@@ -339,7 +330,7 @@ def _validate_status_column(df, column, allowed_set):
         return
     errors = []
     for sample_id, value in zip(df["sample_id"], df[column]):
-        if _is_blank(value):
+        if analysis_columns.blank_to_none(value) is None:
             continue
         if str(value).strip().lower() not in allowed_set:
             errors.append(f"Unexpected {column} '{value}' for sample_id {sample_id}")
@@ -436,7 +427,7 @@ def read_gene_table(path):
         # "1100.0" into GeneTableHgncGeneId. Render it back as an id string; blanks stay NaN so
         # analysis_columns.add_gene_columns (is_none_or_nan) still normalizes them to None.
         df["hgnc_gene_id"] = df["hgnc_gene_id"].apply(
-            lambda value: value if _is_blank(value)
+            lambda value: value if analysis_columns.blank_to_none(value) is None
             else str(int(value)) if isinstance(value, float) else str(value))
 
     return df[columns_to_keep].set_index("gene_id").to_dict(orient="index")

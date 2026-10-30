@@ -16,13 +16,15 @@ module presents on top of DuckDB, so three things stay in one place:
      request. DuckDB keeps one instance per file, so those share a cached connection and get
      an independent cursor each, which is DuckDB's supported way to query from threads.
 
-The surface is exactly what TRails calls, and nothing more. Adding a name here that no
-caller needs is how this module grows a second, subtly different DB-API, so the list is:
+The surface is what TRails' code and its tests call, and nothing more. Adding a name here that
+no caller needs is how this module grows a second, subtly different DB-API, so the list is:
 
-  - ``Error`` / ``OperationalError``: what a failed query raises.
+  - ``Error`` / ``OperationalError``: what a failed query raises (``Error`` is used only by
+    the tests; the code catches ``OperationalError``).
   - ``connect(path, read_only=False)`` -> ``Connection``.
-  - ``Connection``: ``execute``, ``executemany``, ``register``, ``unregister``, ``commit``,
-    ``close``, and the ``row_factory`` attribute. There is deliberately no context manager:
+  - ``Connection``: ``execute``, ``executemany`` (used only by the tests' fixtures; the build
+    loads tables with ``insert_rows``), ``register``, ``unregister``, ``commit``, ``close``,
+    and the ``row_factory`` attribute. There is deliberately no context manager:
     ``sqlite3.Connection.__exit__`` commits and leaves the connection OPEN, which is not
     what a reader of ``with duckdb_compat.connect(...)`` would get from a close, so every
     caller uses an explicit ``try: ... finally: conn.close()`` instead.

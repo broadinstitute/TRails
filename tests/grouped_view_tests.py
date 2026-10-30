@@ -8,12 +8,12 @@ table is written by hand here, with the rows the build derives from the loci tab
 
 import gzip
 import os
-import tempfile
 import unittest
 
 import duckdb_compat
 import results_server
 from result_database import AFFECTED_UNSOLVED_OUTLIERS_TABLE, write_population_gate_cohorts
+from tests.server_test_fixtures import ServerTestCase
 
 # sample_id -> (family_id, affected status, analysis status, phenotype). S4 is solved and S5
 # unaffected, so neither is ever counted; S6's analysis status is blank, which still counts as
@@ -105,12 +105,8 @@ def build_test_database(directory, with_outliers_table=True, population_gate_coh
     return db_path, sample_table_path
 
 
-class GroupedViewTestCase(unittest.TestCase):
-    """Points the server at a test database through configure_app, the shared startup path.
-
-    configure_app rewrites the whole of app.config, which other test modules share, so the config
-    is snapshotted and put back afterwards.
-    """
+class GroupedViewTestCase(ServerTestCase):
+    """Points the server at a test database through configure_app, the shared startup path."""
 
     WITH_OUTLIERS_TABLE = True
     WITH_SAMPLE_TABLE = True
@@ -118,19 +114,17 @@ class GroupedViewTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path, sample_table_path = build_test_database(cls.tmpdir, cls.WITH_OUTLIERS_TABLE,
                                                              cls.POPULATION_GATE_COHORTS)
-        cls._saved_config = dict(results_server.app.config)
-        results_server.configure_app(cls.db_path, sample_table=sample_table_path if cls.WITH_SAMPLE_TABLE else None,
-                                     annotations_db=os.path.join(cls.tmpdir, "annotations.duckdb"))
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
+        cls.configure_server(cls.db_path, sample_table=sample_table_path if cls.WITH_SAMPLE_TABLE else None)
 
-    @classmethod
-    def tearDownClass(cls):
-        results_server.app.config.clear()
-        results_server.app.config.update(cls._saved_config)
+    def _export(self, **params):
+        response = self.client.get("/api/v1/outlier_samples/export", query_string=dict({"outlier_type": "all"}, **params))
+        self.assertEqual(response.status_code, 200)
+        lines = gzip.decompress(response.data).decode().splitlines()
+        header = lines[0].split("\t")
+        return response, [dict(zip(header, line.split("\t"))) for line in lines[1:]]
 
 
 class GroupedViewTests(GroupedViewTestCase):
@@ -266,13 +260,6 @@ class GroupedViewTests(GroupedViewTestCase):
                      "min_repeats_above_population"):
             self.assertIn(name, data["filters"])
 
-    def _export(self, **params):
-        response = self.client.get("/api/v1/outlier_samples/export", query_string=dict({"outlier_type": "all"}, **params))
-        self.assertEqual(response.status_code, 200)
-        lines = gzip.decompress(response.data).decode().splitlines()
-        header = lines[0].split("\t")
-        return response, [dict(zip(header, line.split("\t"))) for line in lines[1:]]
-
     def test_export_one_row_per_sample(self):
         response, rows = self._export(group_by="sample", format="groups_tsv")
         self.assertIn("4_samples", response.headers["Content-Disposition"])
@@ -361,10 +348,10 @@ class NoSampleTableTests(GroupedViewTestCase):
         self.assertEqual(groups(group_by="sample")["S1"]["family_id"], "F1")
 
     def test_exports_carry_the_recorded_family_ids(self):
-        rows = GroupedViewTests._export(self, group_by="family", format="group_loci_tsv")[1]
+        rows = self._export(group_by="family", format="group_loci_tsv")[1]
         self.assertEqual({(r["family_id"], r["sample_id"]) for r in rows},
                          {("F1", "S1"), ("F1", "S2"), ("F2", "S3"), ("F5", "S6")})
-        rows = GroupedViewTests._export(self, group_by="sample", format="groups_tsv")[1]
+        rows = self._export(group_by="sample", format="groups_tsv")[1]
         self.assertEqual({r["sample_id"]: r["family_id"] for r in rows}, {"S1": "F1", "S2": "F1", "S3": "F2", "S6": "F5"})
 
 

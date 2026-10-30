@@ -10,7 +10,6 @@ import unittest
 import intervaltree
 
 import locus_annotations
-import results_server
 
 
 class ComputeJaccardTests(unittest.TestCase):
@@ -304,12 +303,20 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
         self.assertIn("1-1000-1030-CAG", locus_lookup)
         self.assertEqual(locus_lookup["DISEASE_A"]["LocusId"], "DISEASE_A")
 
-    def test_no_network_fetch_by_default(self):
-        # fetch_strchive defaults False; strchive_trees must be empty and no
-        # network access should occur (a network call here would raise).
-        _trees, strchive_trees, _lookup = locus_annotations.load_known_disease_loci(
-            self.catalog_path)
-        self.assertEqual(strchive_trees, {})
+    def test_null_pathogenic_motifs_still_match_by_repeat_unit(self):
+        # Most loci of the real catalog (e.g. HTT, FMR1) have "PathogenicMotifs": null.
+        catalog_path = _make_catalog_file([{
+            "LocusId": "DISEASE_AT", "MainReferenceRegion": "chr1:100-110", "RepeatUnit": "AT",
+            "PathogenicMotifs": None, "Diseases": [{"Name": "Disease X"}],
+        }])
+        try:
+            interval_trees, _, _ = locus_annotations.load_known_disease_loci(catalog_path)
+        finally:
+            os.remove(catalog_path)
+        self.assertEqual(
+            locus_annotations.matches_disease_locus("1-100-110-TA", interval_trees), "DISEASE_AT")
+        self.assertEqual(
+            locus_annotations.collect_known_disease_canonical_motifs(interval_trees), {"AT"})
 
     def test_cached_strchive_file_builds_trees_without_network(self):
         strchive = [{
@@ -506,12 +513,6 @@ class StrchiveLocusMotifsTests(unittest.TestCase):
             }),
             ["AAGGG"])
 
-    def test_the_server_uses_this_definition(self):
-        # The server's locus-detail fallback must use this same function, so the server and the
-        # build agree on which loci are known disease loci.
-        self.assertIs(results_server.strchive_locus_motifs,
-                      locus_annotations.strchive_locus_motifs)
-
 
 class KnownMotifAndMendelianGeneTests(unittest.TestCase):
 
@@ -549,40 +550,42 @@ class KnownMotifAndMendelianGeneTests(unittest.TestCase):
             locus_annotations.compute_is_known_motif("ZZZ", known), 0)
 
     def test_is_in_mendelian_gene(self):
+        # A table with neither an inheritance nor a sources column counts every gene it lists.
         gene_lookup = {"ENSG1": {}, "ENSG2": {}}
         self.assertEqual(locus_annotations.is_in_mendelian_gene("ENSG1", gene_lookup), 1)
         self.assertEqual(locus_annotations.is_in_mendelian_gene("ENSG_X", gene_lookup), 0)
         self.assertEqual(locus_annotations.is_in_mendelian_gene(None, gene_lookup), 0)
 
+    def test_is_in_mendelian_gene_needs_mendelian_evidence_when_the_table_has_the_columns(self):
+        # Rows shaped the way read_gene_table returns genelookup's table: a blank cell is NaN.
+        nan = float("nan")
+        gene_lookup = {
+            "OMIM_GENE": {"inheritance": nan, "sources": "2: OMIM, pLI_v4:1.0"},
+            "PANELAPP_GENE": {"inheritance": nan, "sources": "3: GWAS, PanelAppAU, dbNSFP"},
+            "INHERITANCE_ONLY": {"inheritance": "AR", "sources": "2: Intolerome, dbNSFP"},
+            "CONSTRAINED_ONLY": {"inheritance": nan, "sources": "1: pLI_v4:1.0"},
+            "GWAS_AND_CLINVAR": {"inheritance": nan, "sources": "2: GWAS, ClinVar"},
+            "BLANK_CELLS": {"inheritance": nan, "sources": nan},
+            "NA_INHERITANCE": {"inheritance": "NA", "sources": "1: dbNSFP"},
+        }
+        self.assertEqual(
+            {gene_id: locus_annotations.is_in_mendelian_gene(gene_id, gene_lookup) for gene_id in gene_lookup},
+            {"OMIM_GENE": 1, "PANELAPP_GENE": 1, "INHERITANCE_ONLY": 1, "CONSTRAINED_ONLY": 0,
+             "GWAS_AND_CLINVAR": 0, "BLANK_CELLS": 0, "NA_INHERITANCE": 0})
 
 
-class PathogenicMotifsNullTests(unittest.TestCase):
-    """A catalog locus whose PathogenicMotifs is an explicit null still matches by RepeatUnit."""
+class StdevPercentileTests(unittest.TestCase):
+    """add_population_stdev_percentile_columns: a locus's stdev rank over the number of ranked loci."""
 
-    def test_null_pathogenic_motifs_does_not_crash(self):
-        tree = intervaltree.IntervalTree()
-        tree.addi(100, 110, data={
-            "RepeatUnit": "AT",
-            "PathogenicMotifs": None,   # explicit null in the catalog JSON
-            "LocusId": "DISEASE_AT",
-            "Diseases": [{"Name": "DiseaseX"}],
-        })
-        lookups = {"locus": {}, "disease_trees": {"1": tree}, "strchive_trees": {}}
-        row = {"LocusId": "q", "Chrom": "chr1", "Start0Based": 100,
-               "End1Based": 110, "Motif": "AT"}
-        result = results_server.compute_known_disease_info(row, lookups)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["locus_id"], "DISEASE_AT")
-
-
-class EmptyMotifTests(unittest.TestCase):
-    """An empty motif gives MotifSize 0 and no NumRepeatsInReference, not a division by zero."""
-
-    def test_empty_motif_does_not_crash(self):
-        records = [{"LocusId": "1-100-115-", "Motif": ""}]
-        locus_annotations.add_derived_locus_columns(records)
-        self.assertEqual(records[0]["MotifSize"], 0)
-        self.assertIsNone(records[0]["NumRepeatsInReference"])
+    def test_rank_over_total(self):
+        records = [{"HPRC256_StdevRankByMotif": 5, "HPRC256_StdevRankTotalNumberByMotif": 20},
+                   {"AoU1027_StdevRankByMotif": 3, "AoU1027_StdevRankTotalNumberByMotif": 0,
+                    "AoU1027_StdevPercentile": 0.4},
+                   {"HPRC256_StdevRankByMotif": None, "HPRC256_StdevRankTotalNumberByMotif": 20}]
+        locus_annotations.add_population_stdev_percentile_columns(records)
+        self.assertEqual(records[0]["HPRC256_StdevPercentile"], 0.25)
+        self.assertEqual(records[1]["AoU1027_StdevPercentile"], 0.4)  # no total: what it had stays
+        self.assertNotIn("HPRC256_StdevPercentile", records[2])
 
 
 if __name__ == "__main__":

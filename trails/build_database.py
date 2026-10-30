@@ -53,7 +53,7 @@ import trexplorer_annotations
 def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
           phenotypes_table=None, gene_table=None, genes_to_phenotype=None,
           known_loci_json=None, n_loci=None, skip_phenotype_scores=False,
-          source_label="", fetch_strchive=False, mendelian_threshold=2,
+          source_label="", mendelian_threshold=2,
           n_outlier_sample_ids=10, strchive_loci_json=None,
           population_gate_cohorts=analysis_columns.POPULATION_P99_GATE_COHORTS,
           trexplorer_annotations_database=None):
@@ -82,8 +82,6 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
         skip_phenotype_scores: Skip phenotype scoring when True.
         source_label: Value stored in the loci ``Source`` column (and swim-plot
             ``SourceDb``). Defaults to the empty string.
-        fetch_strchive: When True, allow ``load_known_disease_loci`` to fetch the
-            STRchive locus set over the network. Off by default for hermetic builds.
         mendelian_threshold: Alleles match within strictly fewer than this many
             repeats when checking Mendelian violations. Defaults to 2.
         n_outlier_sample_ids: Outlier-sample cap passed to the histogram builder.
@@ -181,10 +179,9 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
 
     # Stage 7: known-disease-locus match + IsKnownMotif + IsInMendelianGene.
     print("Annotating known-disease loci and known motifs ...")
-    if known_loci_json or strchive_loci_json or fetch_strchive:
+    if known_loci_json or strchive_loci_json:
         interval_trees, strchive_trees, _locus_lookup = locus_annotations.load_known_disease_loci(
-            known_loci_json, fetch_strchive=fetch_strchive,
-            strchive_filepath=strchive_loci_json)
+            known_loci_json, strchive_filepath=strchive_loci_json)
         known_canonical_motifs = locus_annotations.collect_known_disease_canonical_motifs(
             interval_trees, strchive_trees)
     else:
@@ -252,8 +249,7 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
         result_database.write_sample_count(connection, len(sample_id_list))
         result_database.write_population_gate_cohorts(connection, population_gate_cohorts)
 
-        swim_rows = swim_plot.generate_swim_plot_table(
-            records, sample_lookup, affected_lookup, analysis_lookup)
+        swim_rows = swim_plot.generate_swim_plot_table(records, sample_lookup, analysis_lookup)
         result_database.write_swim_plot(connection, swim_rows, columns=swim_plot.SWIM_PLOT_COLUMNS)
 
         result_database.write_affected_unsolved_outliers_table(connection, affected_unsolved_outlier_rows)
@@ -290,8 +286,6 @@ def main():
     parser.add_argument("--known-loci-json", help="known-loci catalog (reference)")
     parser.add_argument("--strchive-loci-json", help="cached STRchive-loci.json (reference, optional)")
     parser.add_argument("--source-label", default="", help="value for the loci 'Source' column")
-    parser.add_argument("--fetch-strchive", action="store_true",
-                        help="allow a live STRchive network fetch (off by default)")
     parser.add_argument("--mendelian-threshold", type=int, default=2,
                         help="alleles match within strictly fewer than this many repeats (default 2)")
     parser.add_argument("--n-outlier-sample-ids", type=int, default=10,
@@ -316,8 +310,7 @@ def main():
           phenotypes_table=args.phenotypes_table, gene_table=args.gene_table,
           genes_to_phenotype=args.genes_to_phenotype, known_loci_json=args.known_loci_json,
           n_loci=args.n_loci, skip_phenotype_scores=args.skip_phenotype_scores,
-          source_label=args.source_label, fetch_strchive=args.fetch_strchive,
-          mendelian_threshold=args.mendelian_threshold,
+          source_label=args.source_label, mendelian_threshold=args.mendelian_threshold,
           n_outlier_sample_ids=args.n_outlier_sample_ids,
           strchive_loci_json=args.strchive_loci_json,
           population_gate_cohorts=population_gate_cohorts,

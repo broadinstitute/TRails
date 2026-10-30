@@ -21,6 +21,8 @@ Outlier-sample-id strings are sorted DESCENDING by allele size, formatted
 "{allele}x:{sample_id}", with the skip/stop rules of convert_sample_ids_to_string.
 """
 
+import collections
+
 
 # The no-call markers of the matrix format. Any other cell that is not one or two
 # comma-separated integers is also returned as None by parse_genotype.
@@ -56,15 +58,24 @@ def parse_genotype(cell):
         return None
 
 
-def _record_sample_id(allele_to_sample_ids, allele, sample_id, occurrence_counts, n_outlier_sample_ids):
-    """Track a sample id for an allele, capped at 2 * n_outlier_sample_ids occurrences.
+def _add_allele(histogram, allele, sample_id, n_outlier_sample_ids):
+    """Count one routed allele in a histogram and track its sample id.
 
-    The occurrence count is incremented on every routed allele, so a homozygous
-    sample, which routes the same allele twice, counts twice toward the cap. The
-    sample id is appended at most once per allele.
+    The sample id is tracked only while the allele's count, including this
+    allele, is at most 2 * n_outlier_sample_ids, so a homozygous sample, which
+    routes the same allele twice, counts twice toward the cap. The sample id is
+    appended at most once per allele.
+
+    Args:
+        histogram: An ``(allele_counts, allele_to_sample_ids)`` pair of
+            defaultdicts, updated in place.
+        allele: The routed allele size.
+        sample_id: The sample carrying the allele.
+        n_outlier_sample_ids: The outlier cap.
     """
-    occurrence_counts[allele] += 1
-    if occurrence_counts[allele] <= 2 * n_outlier_sample_ids:
+    allele_counts, allele_to_sample_ids = histogram
+    allele_counts[allele] += 1
+    if allele_counts[allele] <= 2 * n_outlier_sample_ids:
         if sample_id not in allele_to_sample_ids[allele]:
             allele_to_sample_ids[allele].append(sample_id)
 
@@ -83,19 +94,8 @@ def accumulate_locus(genotypes_by_sample, n_outlier_sample_ids=10):
         maps allele_size -> count; allele_to_sample_ids maps allele_size -> list
         of sample ids (insertion order preserved).
     """
-    import collections
-
-    all_counts = collections.defaultdict(int)
-    all_sample_ids = collections.defaultdict(list)
-    all_occurrences = collections.defaultdict(int)
-
-    short_counts = collections.defaultdict(int)
-    short_sample_ids = collections.defaultdict(list)
-    short_occurrences = collections.defaultdict(int)
-
-    hemizygous_counts = collections.defaultdict(int)
-    hemizygous_sample_ids = collections.defaultdict(list)
-    hemizygous_occurrences = collections.defaultdict(int)
+    all_alleles, short_alleles, hemizygous_alleles = [
+        (collections.defaultdict(int), collections.defaultdict(list)) for _ in range(3)]
 
     for sample_id, cell in genotypes_by_sample.items():
         allele_sizes = parse_genotype(cell)
@@ -104,29 +104,21 @@ def accumulate_locus(genotypes_by_sample, n_outlier_sample_ids=10):
 
         is_hemizygous = len(allele_sizes) == 1
         short_allele = min(allele_sizes)
-        long_allele = max(allele_sizes)
 
         # AllAlleleHistogram: short allele always, long allele only if diploid.
-        all_counts[short_allele] += 1
-        _record_sample_id(all_sample_ids, short_allele, sample_id, all_occurrences, n_outlier_sample_ids)
+        _add_allele(all_alleles, short_allele, sample_id, n_outlier_sample_ids)
         if not is_hemizygous:
-            all_counts[long_allele] += 1
-            _record_sample_id(all_sample_ids, long_allele, sample_id, all_occurrences, n_outlier_sample_ids)
+            _add_allele(all_alleles, max(allele_sizes), sample_id, n_outlier_sample_ids)
 
         # ShortAlleleHistogram: short allele only.
-        short_counts[short_allele] += 1
-        _record_sample_id(short_sample_ids, short_allele, sample_id, short_occurrences, n_outlier_sample_ids)
+        _add_allele(short_alleles, short_allele, sample_id, n_outlier_sample_ids)
 
         # HemizygousAlleleHistogram: short allele only if hemizygous.
         if is_hemizygous:
-            hemizygous_counts[short_allele] += 1
-            _record_sample_id(hemizygous_sample_ids, short_allele, sample_id, hemizygous_occurrences, n_outlier_sample_ids)
+            _add_allele(hemizygous_alleles, short_allele, sample_id, n_outlier_sample_ids)
 
-    return (
-        (dict(all_counts), dict(all_sample_ids)),
-        (dict(short_counts), dict(short_sample_ids)),
-        (dict(hemizygous_counts), dict(hemizygous_sample_ids)),
-    )
+    return tuple((dict(allele_counts), dict(allele_to_sample_ids))
+                 for allele_counts, allele_to_sample_ids in (all_alleles, short_alleles, hemizygous_alleles))
 
 
 def convert_counts_to_histogram_string(allele_counts):

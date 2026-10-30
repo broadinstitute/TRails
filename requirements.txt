@@ -1,8 +1,8 @@
-# TRails runtime dependencies. TRails is standalone — it does not depend on any external
-# package for small pieces of functionality (e.g. canonical-motif / locus-id parsing are
-# reimplemented in motif_utilities.py rather than pulled from str-analysis).
+# TRails runtime dependencies. The canonical-motif helpers (motif_utilities.py) and locus-id
+# parsing (locus_annotations.parse_locus_id) are part of TRails itself, so no other package is
+# needed.
 flask            # the local results server
 pandas           # TSV I/O + the dataframes the analysis pipeline passes around
-numpy            # numeric helpers used by the analysis columns
+numpy            # the results server's sample-QC percentiles
 intervaltree     # interval-overlap lookups for known-disease-locus matching
 duckdb>=1.3      # the result-database engine; >=1.3 for the "lambda x: ..." syntax DuckDB 2.0 requires

@@ -21,6 +21,7 @@ import duckdb_compat
 import result_database
 import results_server
 import swim_plot
+from tests.server_test_fixtures import ServerTestCase, make_swim_plot_row
 
 
 # LocusId, Chrom, Start0Based, End1Based, CanonicalMotif, gene symbol, Ensembl id,
@@ -126,11 +127,11 @@ class ClassifySearchTermTests(unittest.TestCase):
         self.assertTrue(error)
 
 
-class SearchQueryTests(unittest.TestCase):
+class SearchQueryTests(ServerTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "test_results.duckdb")
         _build_test_db(cls.db_path)
         results_server.app.config["DB_PATH"] = cls.db_path
@@ -278,7 +279,7 @@ class SearchQueryTests(unittest.TestCase):
             results_server.app.config["DB_COLUMNS_SET"] = original
 
 
-class PopulationFilterTestCase(unittest.TestCase):
+class PopulationFilterTestCase(ServerTestCase):
     """Runs build_api_query against a small loci table of FirstAffectedAlleleSize_AllAlleles and
     population columns, given as rows of LOCI under the column names COLUMNS (after LocusId)."""
 
@@ -287,7 +288,7 @@ class PopulationFilterTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "population_filter.duckdb")
         conn = duckdb_compat.connect(cls.db_path)
         column_definitions = ", ".join(f"{c} {'INTEGER' if c.startswith('FirstAffected') else 'DOUBLE'}"
@@ -298,18 +299,12 @@ class PopulationFilterTestCase(unittest.TestCase):
         conn.close()
 
     def setUp(self):
-        self._saved = results_server.app.config.get("DB_COLUMNS_SET")
+        # Set before every test, since a test may narrow it
         conn = duckdb_compat.connect(self.db_path, read_only=True)
         try:
             results_server.app.config["DB_COLUMNS_SET"] = duckdb_compat.table_columns(conn, "loci")
         finally:
             conn.close()
-
-    def tearDown(self):
-        if self._saved is None:
-            results_server.app.config.pop("DB_COLUMNS_SET", None)
-        else:
-            results_server.app.config["DB_COLUMNS_SET"] = self._saved
 
     def _query(self, **extra_params):
         params = dict({"outlier_type": "all", "page": 1, "page_size": 50}, **extra_params)
@@ -435,12 +430,12 @@ class SplitSearchTermsTests(unittest.TestCase):
         self.assertEqual(results_server.split_search_terms(None), [])
 
 
-class VariationClusterSortTests(unittest.TestCase):
+class VariationClusterSortTests(ServerTestCase):
     """The ORDER BY the sort keys build: numeric size diffs, and a decided order for ties."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "sort_test_results.duckdb")
         conn = duckdb_compat.connect(cls.db_path)
         conn.execute("""CREATE TABLE loci (
@@ -460,27 +455,13 @@ class VariationClusterSortTests(unittest.TestCase):
         conn.commit()
         conn.close()
 
-    @classmethod
-    def tearDownClass(cls):
-        for name in os.listdir(cls.tmpdir):
-            os.remove(os.path.join(cls.tmpdir, name))
-        os.rmdir(cls.tmpdir)
-
     def setUp(self):
-        self._saved = {key: results_server.app.config.get(key)
-                       for key in ("DB_PATH", "DB_COLUMNS_SET")}
+        # Set before every test, since a test may narrow it
         results_server.app.config["DB_PATH"] = self.db_path
         results_server.app.config["DB_COLUMNS_SET"] = {
             "LocusId", "VariationClusterSizeDiff",
             "NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles",
             "OutlierSampleIds_AllAlleles"}
-
-    def tearDown(self):
-        for key, value in self._saved.items():
-            if value is None:
-                results_server.app.config.pop(key, None)
-            else:
-                results_server.app.config[key] = value
 
     def _ordered_locus_ids(self, **extra_params):
         """Run the select query for a set of params and return the LocusIds in row order."""
@@ -536,7 +517,7 @@ class VariationClusterSortTests(unittest.TestCase):
             ["1-100-110-AT", "2-200-209-AAG", "3-700-712-AGGG", "X-300-310-CCG"])
 
 
-class VariationClusterTypeTests(unittest.TestCase):
+class VariationClusterTypeTests(ServerTestCase):
     """The size-diff filter has to work on the column type the real build actually writes.
 
     result_database.infer_column_types declares VariationClusterSizeDiff BIGINT when every value
@@ -567,7 +548,7 @@ class VariationClusterTypeTests(unittest.TestCase):
 
     def _query(self, records, **extra_params):
         """Write records through the real writer, then run build_api_query's own select query."""
-        db_path = os.path.join(tempfile.mkdtemp(), "typed.duckdb")
+        db_path = os.path.join(tempfile.mkdtemp(dir=self.tmpdir), "typed.duckdb")
         conn = duckdb_compat.connect(db_path)
         try:
             result_database.write_loci_table(conn, records, self.COLUMNS)
@@ -578,25 +559,15 @@ class VariationClusterTypeTests(unittest.TestCase):
         finally:
             conn.close()
 
-        saved = {key: results_server.app.config.get(key) for key in ("DB_PATH", "DB_COLUMNS_SET")}
         results_server.app.config["DB_PATH"] = db_path
         results_server.app.config["DB_COLUMNS_SET"] = set(self.COLUMNS)
+        params = dict({"outlier_type": "all", "page": 1, "page_size": 50}, **extra_params)
+        select_query, _c, _m, _g, _p, sql_params_with_pagination = results_server.build_api_query(params)
+        conn = duckdb_compat.connect(db_path, read_only=True)
         try:
-            params = dict({"outlier_type": "all", "page": 1, "page_size": 50}, **extra_params)
-            select_query, _c, _m, _g, _p, sql_params_with_pagination = \
-                results_server.build_api_query(params)
-            conn = duckdb_compat.connect(db_path, read_only=True)
-            try:
-                return declared, {row[0] for row in
-                                  conn.execute(select_query, sql_params_with_pagination)}
-            finally:
-                conn.close()
+            return declared, {row[0] for row in conn.execute(select_query, sql_params_with_pagination)}
         finally:
-            for key, value in saved.items():
-                if value is None:
-                    results_server.app.config.pop(key, None)
-                else:
-                    results_server.app.config[key] = value
+            conn.close()
 
     def test_all_integer_column_is_written_bigint_and_still_filters(self):
         declared, kept = self._query(self._records(), max_variation_cluster_size_diff=20)
@@ -652,25 +623,20 @@ def _build_endpoint_test_db(path):
         OutlierSampleIds_AllAlleles TEXT
     )""")
     conn.executemany("INSERT INTO loci VALUES (" + ",".join("?" * 14) + ")", ENDPOINT_LOCI)
-
-    def _swim_row(**values):
-        """Return a full-width swim_plot row dict, defaulting every unnamed column to NULL."""
-        return {column: values.get(column) for column in swim_plot.SWIM_PLOT_COLUMNS}
-
     result_database.write_swim_plot(
         conn,
         [
             # The phenotypes match the loci table's FirstAffectedPhenotype_AllAlleles column: the
             # build fills both from the same sample metadata, and the phenotype_keyword filter is
             # answered from these rows.
-            _swim_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp",
-                      allele_size=6, sample_id="sampleA", affected_status="Affected",
-                      phenotype_description="seizures",
-                      LocusId="chr1-100-110-AT", Motif="AT", CanonicalMotif="AT", MotifSize=2),
-            _swim_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="3bp",
-                      allele_size=4, sample_id="sampleC", affected_status="Affected",
-                      phenotype_description="ataxia",
-                      LocusId="chr2-200-209-AAG", Motif="AAG", CanonicalMotif="AAG", MotifSize=3),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp",
+                               allele_size=6, sample_id="sampleA", affected_status="Affected",
+                               phenotype_description="seizures",
+                               LocusId="chr1-100-110-AT", Motif="AT", CanonicalMotif="AT", MotifSize=2),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="3bp",
+                               allele_size=4, sample_id="sampleC", affected_status="Affected",
+                               phenotype_description="ataxia",
+                               LocusId="chr2-200-209-AAG", Motif="AAG", CanonicalMotif="AAG", MotifSize=3),
         ],
         columns=swim_plot.SWIM_PLOT_COLUMNS,
     )
@@ -678,29 +644,15 @@ def _build_endpoint_test_db(path):
     conn.close()
 
 
-class EndpointConfigTestCase(unittest.TestCase):
-    """Base class for the tests that go through configure_app and the Flask test client.
-
-    configure_app rewrites the whole of app.config, which the query-building tests above share,
-    so the config is snapshotted and put back afterwards rather than left pointing at this
-    fixture.
-    """
+class EndpointConfigTestCase(ServerTestCase):
+    """Base class for the tests that go through configure_app and the Flask test client."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "endpoint_results.duckdb")
         _build_endpoint_test_db(cls.db_path)
-        cls._saved_config = dict(results_server.app.config)
-        results_server.configure_app(
-            cls.db_path, annotations_db=os.path.join(cls.tmpdir, "annotations.duckdb"))
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        results_server.app.config.clear()
-        results_server.app.config.update(cls._saved_config)
+        cls.configure_server(cls.db_path)
 
 
 class BlankFilterValueTests(EndpointConfigTestCase):
@@ -790,12 +742,12 @@ class VariationClusterFilterWithoutTheColumnTests(EndpointConfigTestCase):
         self.assertEqual(response.status_code, 400)
 
 
-class DiseaseCatalogStartupTests(unittest.TestCase):
+class DiseaseCatalogStartupTests(ServerTestCase):
     """Either disease catalog is enough on its own: a STRchive file alone loads the fallback."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "catalog_results.duckdb")
         _build_endpoint_test_db(cls.db_path)
         cls.strchive_path = os.path.join(cls.tmpdir, "STRchive-loci.json")
@@ -810,16 +762,8 @@ class DiseaseCatalogStartupTests(unittest.TestCase):
                 "pathogenic_motif_reference_orientation": ["AT"],
             }], output_file)
 
-    def setUp(self):
-        self._saved_config = dict(results_server.app.config)
-
-    def tearDown(self):
-        results_server.app.config.clear()
-        results_server.app.config.update(self._saved_config)
-
     def _configure(self, **kwargs):
-        results_server.configure_app(
-            self.db_path, annotations_db=os.path.join(self.tmpdir, "annotations.duckdb"), **kwargs)
+        self.configure_server(self.db_path, **kwargs)
         return results_server.app.config["LOOKUPS"]
 
     def test_strchive_only_startup_loads_the_fallback(self):
@@ -846,9 +790,9 @@ class DiseaseCatalogStartupTests(unittest.TestCase):
 # LocusId, Chrom, Start0Based, End1Based, Motif, CanonicalMotif, MotifSize, gene symbol, Ensembl
 # id, gene region, its rank, the outlier count and the outlier sample ids. The first locus spells
 # its motif in lower case, the way a TRGT catalog may write it and the way build_database stores
-# it; the second carries an underscore in its contig name, and the third is the same id with the
-# underscore replaced, which is what an unescaped ILIKE wildcard would also match. The fourth sits
-# at coordinates a genome browser writes with thousands separators.
+# it; the second carries an underscore in its contig name, and the third differs from the second
+# only where the second has the underscore, so a search that treated "_" as a wildcard would find
+# both. The fourth sits at coordinates a genome browser writes with thousands separators.
 SEARCH_LOCI_COLUMNS = ["LocusId", "Chrom", "Start0Based", "End1Based", "Motif", "CanonicalMotif",
                        "MotifSize", "GeneTableGeneSymbol", "gene_id", "gene_region",
                        "gene_region_rank",
@@ -873,17 +817,12 @@ def _build_search_endpoint_db(path):
         result_database.write_loci_table(
             conn, [dict(zip(SEARCH_LOCI_COLUMNS, locus)) for locus in SEARCH_LOCI],
             SEARCH_LOCI_COLUMNS)
-
-        def _swim_row(**values):
-            """Return a full-width swim_plot row dict, defaulting every unnamed column to NULL."""
-            return {column: values.get(column) for column in swim_plot.SWIM_PLOT_COLUMNS}
-
         result_database.write_swim_plot(
             conn,
-            [_swim_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="3bp",
-                       allele_size=6 + index, sample_id=f"sample{letter}",
-                       affected_status="Affected", LocusId=locus[0], Motif=locus[4],
-                       CanonicalMotif=locus[5], MotifSize=locus[6])
+            [make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="3bp",
+                                allele_size=6 + index, sample_id=f"sample{letter}",
+                                affected_status="Affected", LocusId=locus[0], Motif=locus[4],
+                                CanonicalMotif=locus[5], MotifSize=locus[6])
              for index, (letter, locus) in enumerate(zip("ABCD", SEARCH_LOCI))],
             columns=swim_plot.SWIM_PLOT_COLUMNS,
         )
@@ -892,28 +831,19 @@ def _build_search_endpoint_db(path):
         conn.close()
 
 
-class SearchEndToEndTests(unittest.TestCase):
+class SearchEndToEndTests(ServerTestCase):
     """The ?search= parameter driven through the Flask client, on a database the writers wrote.
 
-    The SQL-level tests above call build_api_query directly, so nothing exercised
-    validate_params -> split_search_terms -> classify_search_term -> build_api_query as one path.
+    Drives validate_params -> split_search_terms -> classify_search_term -> build_api_query as one
+    path, where the SQL-level tests above call build_api_query directly.
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "search_results.duckdb")
         _build_search_endpoint_db(cls.db_path)
-        cls._saved_config = dict(results_server.app.config)
-        results_server.configure_app(
-            cls.db_path, annotations_db=os.path.join(cls.tmpdir, "annotations.duckdb"))
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        results_server.app.config.clear()
-        results_server.app.config.update(cls._saved_config)
+        cls.configure_server(cls.db_path)
 
     def _loci(self, search):
         response = self.client.get("/api/v1/loci", query_string={"outlier_type": "all",
@@ -944,8 +874,7 @@ class SearchEndToEndTests(unittest.TestCase):
             self.assertEqual(self._swim_locus_ids(spelling), {"chr1-1-10-cag"}, spelling)
 
     def test_an_underscore_in_a_locus_id_matches_literally(self):
-        # "_" is ILIKE's single-character wildcard, so without escaping this would also return
-        # the chr1Xalt locus.
+        # The underscore is matched literally: the chr1Xalt locus is not returned.
         self.assertEqual(self._loci("chr1_alt-1-10-CAG"), {"chr1_alt-1-10-CAG"})
         self.assertEqual(self._swim_locus_ids("chr1_alt-1-10-cag"), {"chr1_alt-1-10-CAG"})
 

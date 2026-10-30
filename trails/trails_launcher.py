@@ -1,8 +1,8 @@
 """TRails — one command from your two tables to a running server.
 
-    python3 trails.py \
-        --repeat-copy-numbers-tsv your_cohort.tsv.gz \
-        --sample-metadata-tsv     your_samples.tsv.gz \
+    python3 trails.py \\
+        --repeat-copy-numbers-tsv your_cohort.tsv.gz \\
+        --sample-metadata-tsv     your_samples.tsv.gz \\
         [--phenotypes-table your_phenotypes.tsv.gz]
 
 In order, this:
@@ -49,21 +49,21 @@ BUILD_ENTRY_POINTS = ["trails_launcher.py", "build_database.py"]
 # import names of the runtime deps in requirements.txt that the code actually imports.
 REQUIRED_MODULES = ["flask", "pandas", "numpy", "intervaltree", "duckdb"]
 
-# Neither of these is needed on any default code path, so a missing one is a warning, not an exit:
-#   pyhpo    - ontology-aware phenotype similarity; phenotype_scoring falls back to Jaccard.
-#   requests - imported only inside locus_annotations.fetch_strchive_loci, the opt-in network
-#              fetch; trails_setup downloads reference data with urllib instead.
-OPTIONAL_MODULES = ["pyhpo", "requests"]
-
-# Written after the one optional-dependency install attempt, so a package that will not build here
-# does not make every later run re-try (and re-wait for) the same failing pip invocation.
-OPTIONAL_INSTALL_MARKER = os.path.join(TRAILS_DIRECTORY, ".trails_optional_deps_attempted")
+# Not needed on any default code path, so a missing one is a warning, not an exit: pyhpo gives
+# ontology-aware phenotype similarity, and phenotype_scoring falls back to Jaccard without it.
+OPTIONAL_MODULES = ["pyhpo"]
 
 # TRails' own Python virtual environment, which install.sh creates and installs the dependencies
 # into. Recent Homebrew and Linux system Pythons refuse pip installs outside a virtual environment
 # ("externally-managed-environment"), so TRails never installs into the Python it was started with.
 VIRTUAL_ENVIRONMENT_DIRECTORY = os.path.join(TRAILS_DIRECTORY, ".venv")
 VIRTUAL_ENVIRONMENT_PYTHON = os.path.join(VIRTUAL_ENVIRONMENT_DIRECTORY, "bin", "python")
+
+# Written after the one optional-dependency install attempt, so a package that will not build here
+# does not make every later run re-try (and re-wait for) the same failing pip invocation. It lives
+# inside the virtual environment, so recreating the environment, which removes every installed
+# package, also removes the marker, and the next run tries the optional install again.
+OPTIONAL_INSTALL_MARKER = os.path.join(VIRTUAL_ENVIRONMENT_DIRECTORY, ".trails_optional_deps_attempted")
 
 # The values results_server.py --initial-require-above-population accepts (the keys of its
 # POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION). Copied rather than imported: importing the
@@ -138,8 +138,8 @@ def ensure_dependencies():
         missing_optional = [m for m in OPTIONAL_MODULES if not _has_module(m)]
     if missing_optional:
         print(f"NOTE: optional dependencies not installed: {', '.join(missing_optional)}. "
-              f"Phenotype scoring falls back to Jaccard similarity without pyhpo; the opt-in "
-              f"STRchive fetch needs requests. Delete {OPTIONAL_INSTALL_MARKER} to retry.")
+              f"Phenotype scoring falls back to Jaccard similarity without pyhpo. "
+              f"Delete {OPTIONAL_INSTALL_MARKER} to retry.")
 
 
 def hash_file(path):
@@ -292,8 +292,6 @@ def run_build(args, db_path, gene_table, genes_to_phenotype, known_loci_json, st
         n_loci=args.n_loci, skip_phenotype_scores=args.skip_phenotype_scores,
         population_gate_cohorts=args.population_gate_cohorts,
         trexplorer_annotations_database=trexplorer_annotations_database)
-    if not os.path.exists(db_path):
-        sys.exit(f"ERROR: build_database did not produce {db_path}")
 
 
 def serve(db_path, args, known_loci_json=None, strchive_loci_json=None):

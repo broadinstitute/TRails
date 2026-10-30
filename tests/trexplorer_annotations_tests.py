@@ -88,6 +88,19 @@ class BuildDatabaseTests(TRExplorerAnnotationsTestCase):
         self.assertNotIn("LocusStructure", columns)
         self.assertFalse(os.path.exists(database_path + ".tmp"))
 
+    def test_a_write_ahead_log_left_next_to_the_old_copy_is_removed(self):
+        # DuckDB replays whatever "<database>.wal" sits next to a database, so one left by a
+        # killed writer of the old copy would otherwise be folded into the new one.
+        with open(os.path.join(self.tmpdir, "annotations.duckdb.wal"), "w") as f:
+            f.write("a write-ahead log left by a killed writer")
+        database_path = self.build_database([catalog_row("1-100-130-CAG")])
+        self.assertFalse(os.path.exists(database_path + ".wal"))
+        connection = duckdb_compat.connect(database_path, read_only=True)
+        try:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM trexplorer_loci").fetchone()[0], 1)
+        finally:
+            connection.close()
+
 
 class MatchLociTests(TRExplorerAnnotationsTestCase):
 
@@ -156,19 +169,6 @@ class AddTRExplorerAnnotationsTests(TRExplorerAnnotationsTestCase):
         records = [user_locus("1-100-131-CAG")]
         self.assertEqual(trexplorer_annotations.add_trexplorer_annotations(records, database_path), (0, 1))
         self.assertEqual(records[0]["TRExplorerLocusJaccardSimilarity"], round(30 / 31, 4))
-
-
-class StdevPercentileTests(unittest.TestCase):
-
-    def test_rank_over_total(self):
-        records = [{"HPRC256_StdevRankByMotif": 5, "HPRC256_StdevRankTotalNumberByMotif": 20},
-                   {"AoU1027_StdevRankByMotif": 3, "AoU1027_StdevRankTotalNumberByMotif": 0,
-                    "AoU1027_StdevPercentile": 0.4},
-                   {"HPRC256_StdevRankByMotif": None, "HPRC256_StdevRankTotalNumberByMotif": 20}]
-        locus_annotations.add_population_stdev_percentile_columns(records)
-        self.assertEqual(records[0]["HPRC256_StdevPercentile"], 0.25)
-        self.assertEqual(records[1]["AoU1027_StdevPercentile"], 0.4)  # no total: what it had stays
-        self.assertNotIn("HPRC256_StdevPercentile", records[2])
 
 
 if __name__ == "__main__":

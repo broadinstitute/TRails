@@ -4,8 +4,8 @@ The swim plot visualizes every outlier sample's allele size against the locus's
 unaffected baseline. This module flattens the per-locus loci records (each of
 which carries the three ``OutlierSampleIds_*`` strings) into a long table with
 exactly one row per outlier entry, per outlier type, enriched with the sample's
-metadata (family / sex / affected status / analysis status / phenotype / purity /
-methylation) and a fixed set of locus-level passthrough columns.
+metadata (family / sex / affected status / analysis status / phenotype) and a
+fixed set of locus-level passthrough columns.
 
 The input is the in-memory list of locus dicts produced by the earlier build
 stages, so there is no pandas dependency. Per row:
@@ -14,13 +14,11 @@ stages, so there is no pandas dependency. Per row:
     which is DESCENDING by allele size — so rank 1 is the largest allele.
   * ``motif_category`` bins motif size as ``"{size}bp"`` for sizes <= 24, else
     ``"25+bp"``; a missing motif size becomes ``"Unknown"``.
-  * ``purity`` and ``methylation`` are the 3rd/4th fields ``parse_outlier_entries``
-    returns for each entry (None when absent or a literal ``"."``), as floats.
   * A blank family_id, sex or phenotype_description is stored as NULL, as in the
-    other tables (``analysis_columns.blank_to_none``).
+    other tables (``analysis_columns.blank_to_none``), and a blank affected or
+    analysis status is shown as ``"Unknown"``.
 """
 
-from locus_annotations import BLANK_STATUS_VALUES
 from analysis_columns import (
     OUTLIER_TYPES,
     blank_to_none,
@@ -55,15 +53,14 @@ SWIM_PLOT_LOCUS_COLUMNS = [
     "AoU1027_StdevPercentile",
 ]
 
-# The full swim_plot column order, matching the row dicts generate_swim_plot_table
-# emits (the per-row keys below, then the copied locus columns). Used by
-# result_database.write_swim_plot to create an empty-but-queryable table when a
-# build yields zero outlier rows.
+# The swim_plot table's columns, in order, matching the row dicts generate_swim_plot_table
+# emits (the per-row keys below, then the copied locus columns).
+# result_database.write_swim_plot builds the table from this list on every build, including
+# one that yields zero outlier rows.
 SWIM_PLOT_COLUMNS = [
     "outlier_type", "outlier_rank", "motif_category", "SourceDb", "allele_size",
     "sample_id", "family_id", "affected_status", "analysis_status", "sex",
-    "phenotype_description", "purity", "methylation", "FirstUnaffectedAlleleSize",
-    "is_above_first_unaffected",
+    "phenotype_description", "FirstUnaffectedAlleleSize", "is_above_first_unaffected",
 ] + SWIM_PLOT_LOCUS_COLUMNS
 
 
@@ -89,83 +86,32 @@ def _compute_motif_category(motif_size):
     return "25+bp"
 
 
-def _normalize_affected_status(raw_affected):
-    """Title-case-normalize an affected_status for display, or "Unknown".
+def _title_case_status(raw_status):
+    """Title-case an affected_status or analysis_status for display, or "Unknown".
+
+    A blank status ("", "NA", "N/A", "null", ...) means nothing was recorded, so it
+    becomes "Unknown" rather than the display values "Na", "N/A" or "Null", which
+    would show up as extra facet categories.
 
     Args:
-        raw_affected: The sample's raw affected_status, or a missing value.
+        raw_status: The sample's raw status, or a missing value.
 
     Returns:
-        "Affected"/"Unaffected" for those exact (case-insensitive) values,
-        otherwise the Title-cased value, or "Unknown" when missing/blank.
+        "Unknown" when the status is missing or blank (``blank_to_none``), otherwise
+        the stripped, Title-cased value, e.g. "Affected" or "Partially Solved".
     """
-    if is_none_or_nan(raw_affected):
-        return "Unknown"
-    normalized = str(raw_affected).strip().lower()
-    if normalized == "affected":
-        return "Affected"
-    if normalized == "unaffected":
-        return "Unaffected"
-    # "", "NA", "N/A", "null", ... all mean "nothing was recorded"; without this they would be
-    # title-cased into the display values "Na", "N/A" and "Null" and become extra facet categories.
-    if normalized in BLANK_STATUS_VALUES:
-        return "Unknown"
-    return str(raw_affected).strip().title()
+    status = blank_to_none(raw_status)
+    return "Unknown" if status is None else str(status).strip().title()
 
 
-def _normalize_analysis_status(raw_analysis):
-    """Title-case-normalize an analysis_status for display, or "Unknown".
-
-    Args:
-        raw_analysis: The sample's raw analysis_status, or a missing value.
-
-    Returns:
-        "Solved"/"Unsolved"/"Unaffected" for those exact (case-insensitive)
-        values, otherwise the Title-cased value, or "Unknown" when missing/blank.
-    """
-    if is_none_or_nan(raw_analysis):
-        return "Unknown"
-    normalized = str(raw_analysis).strip().lower()
-    if normalized == "solved":
-        return "Solved"
-    if normalized == "unsolved":
-        return "Unsolved"
-    if normalized == "unaffected":
-        return "Unaffected"
-    if normalized in BLANK_STATUS_VALUES:
-        return "Unknown"
-    return str(raw_analysis).strip().title()
-
-
-def _parse_stat_value(raw_value):
-    """Convert a purity/methylation string to a float, or None.
-
-    ``parse_outlier_entries`` already maps a literal ``"."`` (and absent fields)
-    to None, so by the time a value reaches here it is either None or a numeric
-    string. A non-numeric string degrades to None rather than raising.
-
-    Args:
-        raw_value: A purity or methylation string, or None.
-
-    Returns:
-        The float value, or None if missing / non-numeric.
-    """
-    if raw_value is None:
-        return None
-    try:
-        return float(raw_value)
-    except (ValueError, TypeError):
-        return None
-
-
-def generate_swim_plot_table(records, sample_lookup, affected_lookup, analysis_lookup):
+def generate_swim_plot_table(records, sample_lookup, analysis_lookup):
     """Flatten locus records into one swim-plot row per outlier allele.
 
     Walks the three outlier types and, for each locus record carrying a non-empty
     ``OutlierSampleIds_{outlier_type}`` string, parses it (descending by allele
     size) and emits one row per entry. Each row carries the outlier rank, the
     motif_category bin, the sample's metadata (family / sex / affected /
-    analysis / phenotype / purity / methylation), the locus's
+    analysis / phenotype), the locus's
     FirstUnaffectedAlleleSize for that outlier type, the is_above_first_unaffected
     flag, and the SWIM_PLOT_LOCUS_COLUMNS passthroughs.
 
@@ -174,8 +120,8 @@ def generate_swim_plot_table(records, sample_lookup, affected_lookup, analysis_l
             each carrying OutlierSampleIds_* plus the locus-level passthrough
             columns and FirstUnaffectedAlleleSize_*.
         sample_lookup: Mapping of sample_id -> sample row dict (family_id, sex,
-            phenotype_description). A sample id absent here yields None metadata.
-        affected_lookup: Mapping of sample_id -> affected_status.
+            affected_status, phenotype_description). A sample id absent here yields
+            None metadata and an "Unknown" status.
         analysis_lookup: Mapping of sample_id -> analysis_status.
 
     Returns:
@@ -197,19 +143,11 @@ def generate_swim_plot_table(records, sample_lookup, affected_lookup, analysis_l
             first_unaffected = record.get(f"FirstUnaffectedAlleleSize_{outlier_type}")
             first_unaffected = None if is_none_or_nan(first_unaffected) else int(first_unaffected)
 
-            for rank, (allele_size, sample_id, purity, methylation) in enumerate(
+            for rank, (allele_size, sample_id) in enumerate(
                 parse_outlier_entries(outlier_value, locus_id=record.get("LocusId"), column=column),
                 start=1,
             ):
                 sample_row = sample_lookup.get(sample_id)
-
-                # Prefer the raw sample-row affected_status so "possibly affected" is
-                # preserved for display; affected_lookup collapses it to "affected"
-                # (that collapsed value is only for analysis logic). Fall back to
-                # affected_lookup when the sample row or its field is missing.
-                raw_affected = sample_row.get("affected_status") if sample_row else None
-                if is_none_or_nan(raw_affected):
-                    raw_affected = affected_lookup.get(sample_id)
 
                 row = {
                     "outlier_type": outlier_type,
@@ -219,13 +157,15 @@ def generate_swim_plot_table(records, sample_lookup, affected_lookup, analysis_l
                     "allele_size": allele_size,
                     "sample_id": sample_id,
                     "family_id": get_family_id(sample_id, sample_lookup),
-                    "affected_status": _normalize_affected_status(raw_affected),
-                    "analysis_status": _normalize_analysis_status(analysis_lookup.get(sample_id)),
+                    # The sample row's affected_status, so "possibly affected" is shown as it
+                    # was entered; read_sample_metadata's affected_lookup collapses it to
+                    # "affected" for the analysis logic.
+                    "affected_status": _title_case_status(
+                        sample_row.get("affected_status") if sample_row else None),
+                    "analysis_status": _title_case_status(analysis_lookup.get(sample_id)),
                     "sex": blank_to_none(sample_row.get("sex")) if sample_row else None,
                     "phenotype_description": (
                         blank_to_none(sample_row.get("phenotype_description")) if sample_row else None),
-                    "purity": _parse_stat_value(purity),
-                    "methylation": _parse_stat_value(methylation),
                     "FirstUnaffectedAlleleSize": first_unaffected,
                     "is_above_first_unaffected": int(is_above_unaffected(allele_size, record, outlier_type)),
                 }

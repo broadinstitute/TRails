@@ -16,7 +16,8 @@ Tables written:
 
 - ``loci``: the wide per-locus table, one row per locus, columns written in
   ``output_columns`` order (only the columns actually present in the records).
-- ``swim_plot``: one row per outlier allele.
+- ``swim_plot``: one row per outlier allele, columns in ``swim_plot.SWIM_PLOT_COLUMNS``
+  order.
 - ``per_outlier_phenotype_scores`` / ``per_locus_phenotype_scores``: optional,
   written only when phenotype scoring produced rows.
 - ``mendelian_violations`` / ``mendelian_violations_per_motif``: optional,
@@ -28,9 +29,9 @@ Tables written:
   samples the database was built from, and the population cohorts that gated the
   NumAffectedUnsolved* counts and the phenotype scores.
 
-Column order for the secondary tables is taken from the insertion order of the
-keys of the first row dict (Python dicts preserve insertion order), so the
-producing modules define the schema and this writer reproduces it faithfully.
+Column order for the phenotype and Mendelian tables is taken from the insertion
+order of the keys of the first row dict (Python dicts preserve insertion order),
+so the producing modules define the schema and this writer reproduces it faithfully.
 
 All functions are pure aside from the explicit mutations they perform on the
 connection they are handed (and, for ``open_new_database`` / ``finalize_database``,
@@ -88,8 +89,7 @@ NUMERIC_COLUMNS = frozenset(
         "TRExplorerLocusJaccardSimilarity", "TRExplorerReferenceRepeatPurity",
         # swim_plot's own numeric columns. Its table is created empty (all columns, no
         # rows) when a build finds no outlier alleles, so it hits the same case.
-        "outlier_rank", "allele_size", "purity", "methylation",
-        "FirstUnaffectedAlleleSize", "is_above_first_unaffected",
+        "outlier_rank", "allele_size", "FirstUnaffectedAlleleSize", "is_above_first_unaffected",
     ]
     + [f"{prefix}AffectedAlleleSize_{outlier_type}{by_family}"
        for prefix in ("First", "Second", "Third")
@@ -301,8 +301,8 @@ def _read_metadata_value(connection, key):
         key: The metadata key.
 
     Returns:
-        The stored value, or ``None`` when the database predates the metadata table or
-        has no row for ``key``.
+        The stored value, or ``None`` when the database has no metadata table (it was not
+        written by build_database) or no row for ``key``.
     """
     if METADATA_TABLE not in duckdb_compat.list_tables(connection):
         return None
@@ -339,7 +339,7 @@ def read_sample_count(connection):
 
     Returns:
         The recorded number of samples as an int, or ``None`` when the database
-        predates the metadata table or has no sample-count row.
+        has no metadata table or no sample-count row.
     """
     value = _read_metadata_value(connection, SAMPLE_COUNT_KEY)
     return int(value) if value is not None else None
@@ -367,39 +367,32 @@ def read_population_gate_cohorts(connection):
         connection: An open duckdb_compat connection to a results database.
 
     Returns:
-        A tuple of cohort names. A database built before the cohorts were recorded has no
-        entry, and every such database was gated by the default,
-        ``analysis_columns.POPULATION_P99_GATE_COHORTS``, which is returned for it.
+        A tuple of cohort names. A database with no cohorts entry gets the default,
+        ``analysis_columns.POPULATION_P99_GATE_COHORTS``: a build that did not record its
+        cohorts was gated by that default.
     """
     value = _read_metadata_value(connection, POPULATION_GATE_COHORTS_KEY)
     return tuple(value.split(",")) if value is not None else POPULATION_P99_GATE_COHORTS
 
 
-def write_swim_plot(connection, swim_rows, columns=None):
+def write_swim_plot(connection, swim_rows, columns):
     """Writes the ``swim_plot`` table (one row per outlier allele).
 
-    The column schema and order come from the keys of the first swim row (as
-    produced by ``swim_plot.generate_swim_plot_table``). When ``swim_rows`` is
-    empty but ``columns`` (the canonical ``swim_plot.SWIM_PLOT_COLUMNS`` order) is
-    supplied, an empty-but-queryable table is still created so the server's
-    swim-plot endpoints return an empty result instead of 500-ing on a missing
-    table (a valid build can legitimately yield zero outlier rows).
+    The table's columns are ``columns``, in that order, whether or not there are
+    rows. With no rows the table is still created, so the server's swim-plot
+    endpoints return an empty result instead of 500-ing on a missing table (a
+    valid build can legitimately yield zero outlier rows).
 
     Args:
         connection: An open duckdb_compat connection.
         swim_rows: A list of swim-plot row dicts.
-        columns: Optional canonical column order used to create the table when
-            ``swim_rows`` is empty.
+        columns: The table's column order, ``swim_plot.SWIM_PLOT_COLUMNS`` in a
+            build. A column absent from a row dict is written as NULL.
 
     Returns:
         The number of rows written.
     """
-    if not swim_rows and not columns:
-        print("  swim_plot: 0 rows (skipped)")
-        return 0
-
-    column_order = None if swim_rows else list(columns)
-    row_count = write_table_from_dicts(connection, "swim_plot", swim_rows, column_order=column_order)
+    row_count = write_table_from_dicts(connection, "swim_plot", swim_rows, column_order=list(columns))
     connection.commit()
 
     print(f"  swim_plot: {row_count:,} rows")

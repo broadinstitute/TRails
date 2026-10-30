@@ -1,10 +1,13 @@
 # TRails input formats
 
 This documents every input TRails reads, how to produce the ones you must supply, and which
-inputs TRails downloads for you vs. which are your own data. **Only a few columns are required; almost
-everything is optional — a missing optional column disables just the feature that depends on
-it, never the whole run.** Column-name matching for the fixed/known columns is
-**case-insensitive and underscore-insensitive** across every TSV input (`sample_id` ≡
+inputs TRails downloads for you vs. which are your own data. **Only a few columns are required,
+and a missing optional column never stops the run.** Most missing columns just turn off the
+feature that depends on them. The exception is a sample's `affected_status` and
+`analysis_status`: a sample not marked unaffected or solved is still a candidate, so with these
+columns missing every sample counts as affected and unsolved (see section 2). Column-name
+matching for the fixed/known columns is **case-insensitive and underscore-insensitive** across
+every TSV input (`sample_id` ≡
 `Sample_id` ≡ `SampleId` ≡ `SAMPLE_ID`); the per-sample column headers and `sample_id` *values*
 still join exactly.
 
@@ -70,7 +73,7 @@ TRExplorer fills only the columns your matrix leaves empty.
 |-------|--------------------|------------------|
 | gene | `gene_id` / `GencodeGeneId`, `gene_region` / `GencodeGeneRegion` | **kept.** The `Gencode*` alias is used only when the plain name is absent |
 | gene | `gene_region_rank` | **discarded.** Always recomputed from `gene_region`, so the rank can never disagree with the region stored beside it (the results table sorts gene regions by this rank while displaying `gene_region`). Supply it only to keep the header out of the sample list; the build prints one line saying how many supplied values it ignored |
-| gene | `IsInMendelianGene` | **kept only without a gene table.** With one (genelookup's is downloaded by default) it is recomputed from `gene_id` |
+| gene | `IsInMendelianGene` | **kept only without a gene table.** With one (genelookup's is downloaded by default) it is recomputed from `gene_id`: 1 when the table gives the gene an `inheritance` mode, or its `sources` name OMIM, ClinGen, GenCC, PanelAppUK, PanelAppAU or Decipher. A gene listed only for GWAS, ClinVar, dbNSFP or constraint (pLI, LOEUF) gets 0. A gene table with neither an `inheritance` nor a `sources` column counts every gene it lists |
 | locus coordinates / motif | `Chrom`, `Start0Based`, `End1Based`, `MotifSize`, `CanonicalMotif` | **discarded.** Always recomputed from `trid` and `motif`. Supply them only to keep those headers out of the sample list |
 | locus coordinates / motif | `ReferenceRegion`, `NumRepeatsInReference` | **kept.** Derived from the coordinates and motif only when absent |
 | known-locus flags | `KnownDiseaseLocus`, `IsKnownMotif` | **kept only without a known-loci catalog** (`--known-loci-json` / STRchive). With a catalog the catalog wins |
@@ -134,14 +137,19 @@ PMGRC-1-2-1    Unaffected        Unaffected        FAM1                         
 | Column | Required? | Enables / values |
 |--------|-----------|------------------|
 | `sample_id` | **required** | joins to the sample columns of the repeat-copy-numbers TSV; may not contain `:` or `,` (both are delimiters in the packed `OutlierSampleIds_*` strings, so either one aborts the build with a `ValueError`) |
-| `affected_status` | optional | affected-vs-unaffected comparison + affected-unsolved prioritization. `Affected` / `Possibly Affected` (treated as `Affected`) / `Unaffected` / `Unknown`. Absent → unknown |
-| `analysis_status` | optional | solved/unsolved filtering + counts. `Solved` / `Unsolved` / `Unknown` / `Probably Solved` / `Partially Solved`. Absent → unknown |
+| `affected_status` | optional | affected-vs-unaffected comparison + affected-unsolved prioritization. `Affected` / `Possibly Affected` (treated as `Affected`) / `Unaffected` / `Unknown`. A blank, absent or `Unknown` value counts as affected (see below) |
+| `analysis_status` | optional | solved/unsolved filtering + counts. `Solved` / `Unsolved` / `Unknown` / `Probably Solved` / `Partially Solved`. A blank, absent or `Unknown` value counts as unsolved (see below) |
 | `family_id` | optional | distinct-family outlier counts |
 | `maternal_id`, `paternal_id` | optional | Mendelian-violation QC (requires trios) |
 | `sex` | optional | displayed only: shown in the sample tables (in the swim plot's outlier table only for chrX/chrY loci). No filter or calculation reads it; hemizygosity comes from the genotype having a single allele. `Male` / `Female` / `Unknown` |
 | `phenotype_description` | optional | free-text shown in the UI |
 
 Any additional columns are accepted and ignored. (Status values are case-insensitive.)
+
+A sample counts as an affected, unsolved candidate (in the `NumAffectedUnsolved*` counts, the
+`First/Second/ThirdAffected*` columns and the phenotype scores) unless its `affected_status` is
+`Unaffected` or its `analysis_status` is `Solved`, `Probably Solved` or `Unaffected`. A sample with
+no status, including one with no metadata row at all, has not been ruled out, so it counts.
 
 ### 3. Phenotype TSV (`--phenotypes-table`)  *(optional)*
 
@@ -168,27 +176,27 @@ You do **not** author this, and TRails does **not** write it to disk — `build_
 these per-locus records in memory directly from your TSV and populates the database. It is
 documented here only as the internal data model, for contributors. Each record carries:
 
-**Fields the build computes/reads:**
+**Fields every record gets:**
 
-| Key | Required? | Format |
-|-----|-----------|--------|
-| `LocusId` | **required** | `chrom-start-end-motif` |
-| `Motif` | **required** | repeat unit |
-| `AllAlleleHistogram` | **required** | `allele:count` pairs, comma-separated, e.g. `9x:6,10x:4086,11x:178` |
-| `ShortAlleleHistogram` | **required** | same format (shorter allele of each genotype); may be empty |
-| `HemizygousAlleleHistogram` | **required** | same format; may be empty |
-| `OutlierSampleIds_AllAlleles` | **required** | `allele:sample_id` entries, comma-separated, **sorted by allele size DESC**, e.g. `11x:GSS225379,11x:PMGRC-111-107-2` |
-| `OutlierSampleIds_ShortAlleles` | **required** | same format (short alleles) |
-| `OutlierSampleIds_HemizygousAlleles` | **required** | same format (hemizygous) |
-| `ReferenceRegion` | optional | `chrom:start-end`; computed from `LocusId` if absent |
-| `NumRepeatsInReference` | optional | reference allele size in repeat units; computed if absent |
+| Key | Format |
+|-----|--------|
+| `LocusId` | `chrom-start-end-motif`, from `trid` |
+| `Motif` | repeat unit, from `motif` |
+| `CanonicalMotif` | always computed from `Motif` |
+| `AllAlleleHistogram` | `allele:count` pairs, comma-separated, e.g. `9x:6,10x:4086,11x:178` |
+| `ShortAlleleHistogram` | same format (shorter allele of each genotype); may be empty |
+| `HemizygousAlleleHistogram` | same format; may be empty |
+| `OutlierSampleIds_AllAlleles` | `allele:sample_id` entries, comma-separated, **sorted by allele size DESC**, e.g. `11x:GSS225379,11x:PMGRC-111-107-2` |
+| `OutlierSampleIds_ShortAlleles` | same format (short alleles) |
+| `OutlierSampleIds_HemizygousAlleles` | same format (hemizygous) |
+| `ReferenceRegion` | `chrom:start-end`; your matrix's value when it has one, otherwise computed from `LocusId` |
+| `NumRepeatsInReference` | reference allele size in repeat units; your matrix's value when it has one, otherwise computed |
+| `gene_id`, `gene_region` | your matrix's `gene_id` / `gene_region`, or its `GencodeGeneId` / `GencodeGeneRegion` aliases when those are absent; otherwise TRExplorer's Gencode gene id and region; NULL when neither has one |
 
-**Optional annotation keys** (absent ⇒ the matching output column is NULL): `CanonicalMotif`,
-`Gencode*` (`GencodeGeneId`/`GencodeGeneRegion`/…), reference-quality fields, `TRExplorer*`,
-RepeatMasker intervals, and per-cohort population-stat columns (`HPRC256_*`, `AoU1027_*`,
-`TenK10K_*`). These come from TRExplorer's catalog, or from annotation columns of your matrix.
-`VariantType` is **not** read by the pipeline (the server synthesizes it only for the
-ExpansionHunter export) — optional/ignored.
+**Other annotation keys** (when absent, the matching output column is NULL): the `TRExplorer*`
+fields of the matched TRExplorer locus, RepeatMasker intervals, the variation cluster fields, and
+per-cohort population-stat columns (`HPRC256_*`, `AoU1027_*`, `TenK10K_*`). These come from
+TRExplorer's catalog, or from annotation columns of your matrix.
 
 ### 5. Generated result database  *(server input; built for you)*
 

@@ -1,4 +1,4 @@
-"""Unit tests for the single-database TRails Flask server (results_server.py).
+"""Unit tests for the TRails Flask server (results_server.py).
 
 These tests build a tiny temporary DuckDB database with a minimal ``loci`` table
 (plus a ``swim_plot`` table) and exercise the server through Flask's test client,
@@ -6,8 +6,7 @@ so no real TCP port is bound. They check that:
 
   * GET /api/v1/loci returns rows from the database,
   * a request carrying the ``?source=`` query parameter the pages send is answered
-    (the parameter is ignored, not rejected),
-  * there is no read-visualization route (it returns 404), and
+    (the parameter is ignored, not rejected), and
   * the pages and endpoints (schema, swim, export, qc) behave gracefully.
 """
 
@@ -19,12 +18,16 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
+
+import intervaltree
 
 import duckdb_compat
 import locus_annotations
 import result_database
 import results_server
 import swim_plot
+from tests.server_test_fixtures import ServerTestCase, make_swim_plot_row
 
 
 def _build_minimal_db(path):
@@ -89,53 +92,42 @@ def _build_minimal_db(path):
     # column list rather than a hand-picked subset and the real per-column types. A filter that
     # reads a column the build actually writes, or compares one of its numeric columns to a
     # number, is then exercised here instead of failing only in a real deployment.
-    swim_columns = swim_plot.SWIM_PLOT_COLUMNS
-
-    def _swim_row(**values):
-        """Return a full-width swim_plot row dict, defaulting every unnamed column to NULL."""
-        unknown = set(values) - set(swim_columns)
-        assert not unknown, "swim_plot has no column(s): %s" % sorted(unknown)
-        return {column: values.get(column) for column in swim_columns}
-
     result_database.write_swim_plot(
         conn,
         [
-            _swim_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp",
-                      allele_size=6, sample_id="sampleA", family_id="famA",
-                      affected_status="Affected", analysis_status="Unsolved", sex="male",
-                      phenotype_description="seizures", FirstUnaffectedAlleleSize=4,
-                      is_above_first_unaffected=1, LocusId="chr1-100-110-AT", Motif="AT",
-                      CanonicalMotif="AT", MotifSize=2, gene_region="CDS",
-                      GeneTableGeneSymbol="GENE1"),
-            _swim_row(outlier_type="AllAlleles", outlier_rank=2, motif_category="2bp",
-                      allele_size=5, sample_id="sampleB", family_id="famB",
-                      affected_status="Unaffected", analysis_status="Unaffected", sex="female",
-                      FirstUnaffectedAlleleSize=4, is_above_first_unaffected=0,
-                      LocusId="chr1-100-110-AT", Motif="AT", CanonicalMotif="AT", MotifSize=2,
-                      gene_region="CDS", GeneTableGeneSymbol="GENE1"),
-            _swim_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="3bp",
-                      allele_size=4, sample_id="sampleC", family_id="famC",
-                      affected_status="Affected", analysis_status="Unsolved", sex="male",
-                      phenotype_description="ataxia", is_above_first_unaffected=1,
-                      LocusId="chr2-200-209-AAG", Motif="AAG", CanonicalMotif="AAG", MotifSize=3,
-                      gene_region="intron", GeneTableGeneSymbol="GENE2"),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp",
+                               allele_size=6, sample_id="sampleA", family_id="famA",
+                               affected_status="Affected", analysis_status="Unsolved", sex="male",
+                               phenotype_description="seizures", FirstUnaffectedAlleleSize=4,
+                               is_above_first_unaffected=1, LocusId="chr1-100-110-AT", Motif="AT",
+                               CanonicalMotif="AT", MotifSize=2, gene_region="CDS",
+                               GeneTableGeneSymbol="GENE1"),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=2, motif_category="2bp",
+                               allele_size=5, sample_id="sampleB", family_id="famB",
+                               affected_status="Unaffected", analysis_status="Unaffected", sex="female",
+                               FirstUnaffectedAlleleSize=4, is_above_first_unaffected=0,
+                               LocusId="chr1-100-110-AT", Motif="AT", CanonicalMotif="AT", MotifSize=2,
+                               gene_region="CDS", GeneTableGeneSymbol="GENE1"),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="3bp",
+                               allele_size=4, sample_id="sampleC", family_id="famC",
+                               affected_status="Affected", analysis_status="Unsolved", sex="male",
+                               phenotype_description="ataxia", is_above_first_unaffected=1,
+                               LocusId="chr2-200-209-AAG", Motif="AAG", CanonicalMotif="AAG", MotifSize=3,
+                               gene_region="intron", GeneTableGeneSymbol="GENE2"),
         ],
-        columns=swim_columns,
+        columns=swim_plot.SWIM_PLOT_COLUMNS,
     )
     conn.commit()
     conn.close()
 
 
-class ResultsServerTests(unittest.TestCase):
+class ResultsServerTests(ServerTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
-        cls.annotations_db = os.path.join(cls.tmpdir, "annotations.duckdb")
         _build_minimal_db(cls.db_path)
-        results_server.configure_app(cls.db_path, annotations_db=cls.annotations_db)
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
+        cls.configure_server(cls.db_path)
 
     def test_loci_returns_rows(self):
         response = self.client.get("/api/v1/loci?outlier_type=all")
@@ -147,21 +139,13 @@ class ResultsServerTests(unittest.TestCase):
         self.assertIn("chr1-100-110-AT", locus_ids)
         self.assertIn("chr2-200-209-AAG", locus_ids)
 
-    def test_source_param_is_ignored_not_500(self):
+    def test_source_param_is_ignored(self):
         response = self.client.get("/api/v1/loci?outlier_type=all&source=foo")
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertEqual(data["total"], 2)
         # The ignored source must not leak into filters_applied.
         self.assertNotIn("source", data["filters_applied"])
-
-    def test_no_readviz_route(self):
-        for url in ("/readviz/chr1-100-110-AT",
-                    "/api/v1/readviz/chr1-100-110-AT",
-                    "/api/v1/readviz/request",
-                    "/api/v1/deepdive/request"):
-            response = self.client.get(url)
-            self.assertEqual(response.status_code, 404, f"{url} should not exist")
 
     def test_outlier_type_required(self):
         response = self.client.get("/api/v1/loci")
@@ -173,7 +157,6 @@ class ResultsServerTests(unittest.TestCase):
         data = response.get_json()
         self.assertEqual(data["locus"]["LocusId"], "chr1-100-110-AT")
         self.assertIn("AllAlleles", data["outlier_samples"])
-        self.assertEqual(data["system_tags"], [])
 
     def test_schema_has_single_source(self):
         response = self.client.get("/api/v1/schema")
@@ -181,7 +164,7 @@ class ResultsServerTests(unittest.TestCase):
         data = response.get_json()
         self.assertEqual(data["total_loci"], 2)
         self.assertEqual(data["available_sources"], ["TRails"])
-        # source must NOT be advertised as a filter in the single-DB server.
+        # source is accepted but ignored, so it is not advertised as a filter.
         self.assertNotIn("source", data["filters"])
 
     def test_schema_total_samples_is_null_without_the_metadata_table(self):
@@ -239,8 +222,16 @@ class ResultsServerTests(unittest.TestCase):
     def test_export_bed(self):
         response = self.client.get("/api/v1/export?outlier_type=all&format=bed")
         self.assertEqual(response.status_code, 200)
-        body = response.get_data(as_text=True)
-        self.assertIn("chr1\t100\t110\tchr1-100-110-AT", body)
+        records = [line.split("\t") for line in response.get_data(as_text=True).splitlines()]
+        self.assertEqual(records, [["chr1", "100", "110", "chr1-100-110-AT", "0", "."],
+                                   ["chr2", "200", "209", "chr2-200-209-AAG", "0", "."]])
+        # Every record is valid BED6: an integer interval with start before end, a name, a score
+        # from 0 to 1000 and a strand of +, - or .
+        for chrom, start, end, name, score, strand in records:
+            self.assertTrue(chrom and name)
+            self.assertLess(int(start), int(end))
+            self.assertTrue(0 <= int(score) <= 1000)
+            self.assertIn(strand, ("+", "-", "."))
 
     def test_export_json_nested_metadata_and_samples(self):
         response = self.client.get("/api/v1/export?outlier_type=all&format=json&min_pli=0.5")
@@ -386,8 +377,6 @@ class ResultsServerTests(unittest.TestCase):
     def test_index_page_renders(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        # The server has no read-visualization request route, so the page calls none.
-        self.assertNotIn("/readviz/request", response.get_data(as_text=True))
 
     def test_initial_require_above_population_reaches_the_index_page(self):
         self.addCleanup(setattr, sys, "argv", sys.argv)
@@ -589,30 +578,25 @@ def _build_db_for_sample_qc(path):
     """swim_plot DB where one sample holds two of a locus's first ten outlier entries."""
     conn = duckdb_compat.connect(path)
     conn.execute("CREATE TABLE loci (LocusId TEXT, Motif TEXT, KnownDiseaseLocus TEXT)")
-
-    def _swim_row(**values):
-        """Return a full-width swim_plot row dict, defaulting every unnamed column to NULL."""
-        return {column: values.get(column) for column in swim_plot.SWIM_PLOT_COLUMNS}
-
     result_database.write_swim_plot(
         conn,
         [
             # Both alleles of one diploid sample at one locus, the way accumulate_locus records
             # them: two swim_plot rows for the same (sample, locus).
-            _swim_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp",
-                      allele_size=9, sample_id="sampleA", LocusId="chr1-100-110-AT",
-                      Motif="AT", MotifSize=2),
-            _swim_row(outlier_type="AllAlleles", outlier_rank=2, motif_category="2bp",
-                      allele_size=8, sample_id="sampleA", LocusId="chr1-100-110-AT",
-                      Motif="AT", MotifSize=2),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp",
+                               allele_size=9, sample_id="sampleA", LocusId="chr1-100-110-AT",
+                               Motif="AT", MotifSize=2),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=2, motif_category="2bp",
+                               allele_size=8, sample_id="sampleA", LocusId="chr1-100-110-AT",
+                               Motif="AT", MotifSize=2),
             # A second locus in the same motif-size bin, so the expected count is not 1 by default.
-            _swim_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp",
-                      allele_size=7, sample_id="sampleA", LocusId="chr2-200-210-AT",
-                      Motif="AT", MotifSize=2),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp",
+                               allele_size=7, sample_id="sampleA", LocusId="chr2-200-210-AT",
+                               Motif="AT", MotifSize=2),
             # Another sample's entry at the first locus, to keep the grouping honest.
-            _swim_row(outlier_type="AllAlleles", outlier_rank=3, motif_category="2bp",
-                      allele_size=6, sample_id="sampleB", LocusId="chr1-100-110-AT",
-                      Motif="AT", MotifSize=2),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=3, motif_category="2bp",
+                               allele_size=6, sample_id="sampleB", LocusId="chr1-100-110-AT",
+                               Motif="AT", MotifSize=2),
         ],
         columns=swim_plot.SWIM_PLOT_COLUMNS,
     )
@@ -620,20 +604,14 @@ def _build_db_for_sample_qc(path):
     conn.close()
 
 
-class SampleQcLocusCountTests(unittest.TestCase):
+class SampleQcLocusCountTests(ServerTestCase):
     """The sample-QC counts are counts of loci, not of swim_plot allele rows."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
         _build_db_for_sample_qc(cls.db_path)
-
-    @classmethod
-    def tearDownClass(cls):
-        for name in os.listdir(cls.tmpdir):
-            os.remove(os.path.join(cls.tmpdir, name))
-        os.rmdir(cls.tmpdir)
 
     def test_both_alleles_at_one_locus_count_once(self):
         data = results_server.compute_sample_qc_data(self.db_path)
@@ -702,28 +680,18 @@ def _build_db_for_strchive(path):
     conn.close()
 
 
-class StrchivePathogenicMotifTests(unittest.TestCase):
+class StrchivePathogenicMotifTests(ServerTestCase):
     """The locus-detail endpoint and the build agree on STRchive pathogenic-motif matches."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
-        cls.annotations_db = os.path.join(cls.tmpdir, "annotations.duckdb")
         cls.strchive_json = os.path.join(cls.tmpdir, "STRchive-loci.json")
         with open(cls.strchive_json, "w") as output_file:
             json.dump(STRCHIVE_TEST_LOCI, output_file)
         _build_db_for_strchive(cls.db_path)
-        results_server.configure_app(cls.db_path, annotations_db=cls.annotations_db,
-                                     strchive_loci_json=cls.strchive_json)
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        for name in os.listdir(cls.tmpdir):
-            os.remove(os.path.join(cls.tmpdir, name))
-        os.rmdir(cls.tmpdir)
+        cls.configure_server(cls.db_path, strchive_loci_json=cls.strchive_json)
 
     def _known_disease_locus(self, locus_id):
         response = self.client.get(f"/api/v1/loci/{locus_id}")
@@ -802,7 +770,7 @@ def _build_db_with_all_affected_phenotypes(path):
     conn.close()
 
 
-class PhenotypeKeywordAcrossAffectedOutliersTests(unittest.TestCase):
+class PhenotypeKeywordAcrossAffectedOutliersTests(ServerTestCase):
     """The fallback for a database with no swim_plot table: the summary phenotype columns.
 
     With swim_plot present the filter is answered from it (see the class below), because that is
@@ -813,19 +781,10 @@ class PhenotypeKeywordAcrossAffectedOutliersTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
-        cls.annotations_db = os.path.join(cls.tmpdir, "annotations.duckdb")
         _build_db_with_all_affected_phenotypes(cls.db_path)
-        results_server.configure_app(cls.db_path, annotations_db=cls.annotations_db)
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        for name in os.listdir(cls.tmpdir):
-            os.remove(os.path.join(cls.tmpdir, name))
-        os.rmdir(cls.tmpdir)
+        cls.configure_server(cls.db_path)
 
     def _locus_ids(self, keyword):
         response = self.client.get(f"/api/v1/loci?outlier_type=all&phenotype_keyword={keyword}")
@@ -869,40 +828,35 @@ def _build_db_with_swim_plot_phenotypes(path):
         ("chr2-200-209-AAG", "chr2", 200, 209, "AAG", 3, "", "4x:sampleF",
          "myopathy", None, None),
     ])
-
-    def _swim_row(**values):
-        """Return a full-width swim_plot row dict, defaulting every unnamed column to NULL."""
-        return {column: values.get(column) for column in swim_plot.SWIM_PLOT_COLUMNS}
-
     result_database.write_swim_plot(
         conn,
         [
-            _swim_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp",
-                      allele_size=9, sample_id="sampleA", affected_status="Affected",
-                      phenotype_description="seizures", LocusId="chr1-100-110-AT",
-                      Motif="AT", CanonicalMotif="AT", MotifSize=2),
-            _swim_row(outlier_type="AllAlleles", outlier_rank=2, motif_category="2bp",
-                      allele_size=8, sample_id="sampleB", affected_status="Affected",
-                      phenotype_description="ataxia", LocusId="chr1-100-110-AT",
-                      Motif="AT", CanonicalMotif="AT", MotifSize=2),
-            _swim_row(outlier_type="AllAlleles", outlier_rank=3, motif_category="2bp",
-                      allele_size=7, sample_id="sampleC", affected_status="Affected",
-                      phenotype_description="dystonia", LocusId="chr1-100-110-AT",
-                      Motif="AT", CanonicalMotif="AT", MotifSize=2),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp",
+                               allele_size=9, sample_id="sampleA", affected_status="Affected",
+                               phenotype_description="seizures", LocusId="chr1-100-110-AT",
+                               Motif="AT", CanonicalMotif="AT", MotifSize=2),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=2, motif_category="2bp",
+                               allele_size=8, sample_id="sampleB", affected_status="Affected",
+                               phenotype_description="ataxia", LocusId="chr1-100-110-AT",
+                               Motif="AT", CanonicalMotif="AT", MotifSize=2),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=3, motif_category="2bp",
+                               allele_size=7, sample_id="sampleC", affected_status="Affected",
+                               phenotype_description="dystonia", LocusId="chr1-100-110-AT",
+                               Motif="AT", CanonicalMotif="AT", MotifSize=2),
             # The fourth affected outlier: past the three ranks the loci table summarizes.
-            _swim_row(outlier_type="AllAlleles", outlier_rank=4, motif_category="2bp",
-                      allele_size=6, sample_id="sampleD", affected_status="Affected",
-                      phenotype_description="neuropathy", LocusId="chr1-100-110-AT",
-                      Motif="AT", CanonicalMotif="AT", MotifSize=2),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=4, motif_category="2bp",
+                               allele_size=6, sample_id="sampleD", affected_status="Affected",
+                               phenotype_description="neuropathy", LocusId="chr1-100-110-AT",
+                               Motif="AT", CanonicalMotif="AT", MotifSize=2),
             # An unaffected outlier, which the summary columns never carry.
-            _swim_row(outlier_type="AllAlleles", outlier_rank=5, motif_category="2bp",
-                      allele_size=5, sample_id="sampleE", affected_status="Unaffected",
-                      phenotype_description="headache", LocusId="chr1-100-110-AT",
-                      Motif="AT", CanonicalMotif="AT", MotifSize=2),
-            _swim_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="3bp",
-                      allele_size=4, sample_id="sampleF", affected_status="Affected",
-                      phenotype_description="myopathy", LocusId="chr2-200-209-AAG",
-                      Motif="AAG", CanonicalMotif="AAG", MotifSize=3),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=5, motif_category="2bp",
+                               allele_size=5, sample_id="sampleE", affected_status="Unaffected",
+                               phenotype_description="headache", LocusId="chr1-100-110-AT",
+                               Motif="AT", CanonicalMotif="AT", MotifSize=2),
+            make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="3bp",
+                               allele_size=4, sample_id="sampleF", affected_status="Affected",
+                               phenotype_description="myopathy", LocusId="chr2-200-209-AAG",
+                               Motif="AAG", CanonicalMotif="AAG", MotifSize=3),
         ],
         columns=swim_plot.SWIM_PLOT_COLUMNS,
     )
@@ -910,7 +864,7 @@ def _build_db_with_swim_plot_phenotypes(path):
     conn.close()
 
 
-class PhenotypeKeywordAgreesWithTheSwimPlotTests(unittest.TestCase):
+class PhenotypeKeywordAgreesWithTheSwimPlotTests(ServerTestCase):
     """A keyword selects a locus when ANY of its outliers carries that phenotype, in both views.
 
     The results table matches every outlier's phenotype, as the swim plot does, rather than only
@@ -921,22 +875,10 @@ class PhenotypeKeywordAgreesWithTheSwimPlotTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
-        cls.annotations_db = os.path.join(cls.tmpdir, "annotations.duckdb")
         _build_db_with_swim_plot_phenotypes(cls.db_path)
-        cls._saved_config = dict(results_server.app.config)
-        results_server.configure_app(cls.db_path, annotations_db=cls.annotations_db)
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        results_server.app.config.clear()
-        results_server.app.config.update(cls._saved_config)
-        for name in os.listdir(cls.tmpdir):
-            os.remove(os.path.join(cls.tmpdir, name))
-        os.rmdir(cls.tmpdir)
+        cls.configure_server(cls.db_path)
 
     def _locus_ids(self, keyword):
         response = self.client.get(f"/api/v1/loci?outlier_type=all&phenotype_keyword={keyword}")
@@ -978,6 +920,25 @@ class PhenotypeKeywordAgreesWithTheSwimPlotTests(unittest.TestCase):
 
     def test_an_unmatched_keyword_returns_nothing(self):
         self.assertEqual(self._locus_ids("no_such_phenotype"), set())
+
+
+class SplitOutlierEntriesTests(unittest.TestCase):
+    """The one OutlierSampleIds parser behind the locus-detail samples and the read-visualization thresholds."""
+
+    OUTLIER_STRING = "6x:sA,5:sB,garbage,x:sC,7x:sD:extra,4x:sE"
+
+    def test_entries_that_do_not_parse_are_skipped_and_the_order_is_kept(self):
+        self.assertEqual(results_server.split_outlier_entries(self.OUTLIER_STRING),
+                         [(6, "sA"), (5, "sB"), (4, "sE")])
+        self.assertEqual(results_server.split_outlier_entries(None), [])
+        self.assertEqual(results_server.split_outlier_entries(""), [])
+
+    def test_parse_outlier_samples_describes_each_sample(self):
+        parsed = results_server.parse_outlier_samples(
+            "6x:sA,5x:sB", {"sA": {"family_id": "F1", "sex": "male"}}, {}, {})
+        self.assertEqual([(s["allele_size"], s["sample_id"], s["family_id"], s["sex"]) for s in parsed],
+                         [(6, "sA", "F1", "male"), (5, "sB", None, None)])
+        self.assertNotIn("purity", parsed[0])
 
 
 class ComputePlotThresholdsTests(unittest.TestCase):
@@ -1042,7 +1003,7 @@ def _build_db_with_unknown_category(path):
     conn.execute("""CREATE TABLE swim_plot (
         outlier_type TEXT, motif_category TEXT, allele_size INTEGER, sample_id TEXT,
         family_id TEXT, affected_status TEXT, analysis_status TEXT, sex TEXT,
-        phenotype_description TEXT, purity TEXT, methylation TEXT, LocusId TEXT,
+        phenotype_description TEXT, LocusId TEXT,
         Motif TEXT, gene_region TEXT, GeneTableGeneSymbol TEXT)""")
     conn.executemany(
         "INSERT INTO swim_plot (outlier_type, motif_category, allele_size, sample_id, "
@@ -1072,26 +1033,23 @@ class AffectedStatusDisplayTests(unittest.TestCase):
             "60x:sB", {}, {"sB": "affected"}, {"sB": "unsolved"})
         self.assertEqual(parsed[0]["affected_status"], "Affected")
 
+    def test_every_blank_status_displays_as_unknown(self):
+        # An "NA" cell is no status, so the locus-detail page shows "Unknown" rather than "Na".
+        for value in ("", "nan", "none", "na", "n/a", "null", "NA", " N/A ", "Null"):
+            described = results_server.describe_sample("S1", {"S1": {"affected_status": value}}, {}, {})
+            self.assertEqual(described["affected_status"], "Unknown", repr(value))
 
-class SchemaAndUnknownCategoryTests(unittest.TestCase):
+
+class SchemaAndUnknownCategoryTests(ServerTestCase):
     """schema sample_ids fall back to swim_plot, and Unknown-category rows are served."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
-        cls.annotations_db = os.path.join(cls.tmpdir, "annotations.duckdb")
         _build_db_with_unknown_category(cls.db_path)
         # No sample_table -> the sample dropdown must fall back to swim_plot IDs.
-        results_server.configure_app(cls.db_path, annotations_db=cls.annotations_db)
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        for name in os.listdir(cls.tmpdir):
-            os.remove(os.path.join(cls.tmpdir, name))
-        os.rmdir(cls.tmpdir)
+        cls.configure_server(cls.db_path)
 
     def test_schema_sample_ids_from_swim_plot(self):
         data = self.client.get("/api/v1/schema").get_json()
@@ -1114,24 +1072,15 @@ def _build_db_with_sample_count(path, num_samples):
     conn.close()
 
 
-class SchemaSampleCountTests(unittest.TestCase):
+class SchemaSampleCountTests(ServerTestCase):
     """/api/v1/schema reports the sample count build_database recorded in the database."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
-        cls.annotations_db = os.path.join(cls.tmpdir, "annotations.duckdb")
         _build_db_with_sample_count(cls.db_path, 2657)
-        results_server.configure_app(cls.db_path, annotations_db=cls.annotations_db)
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        for name in os.listdir(cls.tmpdir):
-            os.remove(os.path.join(cls.tmpdir, name))
-        os.rmdir(cls.tmpdir)
+        cls.configure_server(cls.db_path)
 
     def test_schema_reports_total_samples(self):
         data = self.client.get("/api/v1/schema").get_json()
@@ -1267,24 +1216,15 @@ def _build_db_with_phenotype_scores(path):
         conn.close()
 
 
-class ExportPhenotypeScoreQueryCountTests(unittest.TestCase):
+class ExportPhenotypeScoreQueryCountTests(ServerTestCase):
     """Both enriching exports bulk-load the phenotype scores once, not once per locus."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
-        cls.annotations_db = os.path.join(cls.tmpdir, "annotations.duckdb")
         _build_db_with_phenotype_scores(cls.db_path)
-        results_server.configure_app(cls.db_path, annotations_db=cls.annotations_db)
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        for name in os.listdir(cls.tmpdir):
-            os.remove(os.path.join(cls.tmpdir, name))
-        os.rmdir(cls.tmpdir)
+        cls.configure_server(cls.db_path)
 
     def _score_queries(self, recorded_queries):
         """The recorded statements that read the per-outlier phenotype-score table."""
@@ -1381,7 +1321,7 @@ def _build_db_with_only_the_first_phenotype_column(path):
     conn.close()
 
 
-class PhenotypeKeywordFallbackColumnSubsetTests(unittest.TestCase):
+class PhenotypeKeywordFallbackColumnSubsetTests(ServerTestCase):
     """The fallback narrowed to the phenotype columns a database actually declares.
 
     Without a swim_plot table the filter reads the summary columns, and it must name only the
@@ -1391,19 +1331,10 @@ class PhenotypeKeywordFallbackColumnSubsetTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
-        cls.annotations_db = os.path.join(cls.tmpdir, "annotations.duckdb")
         _build_db_with_only_the_first_phenotype_column(cls.db_path)
-        results_server.configure_app(cls.db_path, annotations_db=cls.annotations_db)
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        for name in os.listdir(cls.tmpdir):
-            os.remove(os.path.join(cls.tmpdir, name))
-        os.rmdir(cls.tmpdir)
+        cls.configure_server(cls.db_path)
 
     def test_the_swim_plot_branch_is_not_taken(self):
         self.assertFalse(results_server.app.config["HAS_SWIM_PLOT_PHENOTYPES"])
@@ -1445,24 +1376,15 @@ def _build_db_without_phenotype_columns(path):
     conn.close()
 
 
-class PhenotypeKeywordWithoutAnyPhenotypeColumnTests(unittest.TestCase):
+class PhenotypeKeywordWithoutAnyPhenotypeColumnTests(ServerTestCase):
     """A phenotype keyword matches nothing when the database records no phenotypes at all."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
-        cls.annotations_db = os.path.join(cls.tmpdir, "annotations.duckdb")
         _build_db_without_phenotype_columns(cls.db_path)
-        results_server.configure_app(cls.db_path, annotations_db=cls.annotations_db)
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        for name in os.listdir(cls.tmpdir):
-            os.remove(os.path.join(cls.tmpdir, name))
-        os.rmdir(cls.tmpdir)
+        cls.configure_server(cls.db_path)
 
     def test_the_filter_matches_no_rows_rather_than_being_ignored(self):
         select_query, _, _, _, _, _ = results_server.build_api_query({
@@ -1499,23 +1421,15 @@ def _build_db_with_family_counts(path):
     conn.close()
 
 
-class FamilyCountTests(unittest.TestCase):
+class FamilyCountTests(ServerTestCase):
     """Each locus carries its #Fam count, and sort_by=family_count orders by it."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
         _build_db_with_family_counts(cls.db_path)
-        cls._saved_config = dict(results_server.app.config)
-        results_server.configure_app(cls.db_path, annotations_db=os.path.join(cls.tmpdir, "annotations.duckdb"))
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        results_server.app.config.clear()
-        results_server.app.config.update(cls._saved_config)
+        cls.configure_server(cls.db_path)
 
     def _loci(self, query=""):
         response = self.client.get(f"/api/v1/loci?outlier_type=all{query}")
@@ -1568,7 +1482,7 @@ def _load_results_server_without_locus_annotations():
 
 
 class DegradedModeFallbackTests(unittest.TestCase):
-    """The ImportError stubs must treat blank statuses the way locus_annotations does."""
+    """Without locus_annotations, no locus matches a known disease locus."""
 
     @classmethod
     def setUpClass(cls):
@@ -1576,17 +1490,8 @@ class DegradedModeFallbackTests(unittest.TestCase):
 
     def test_the_fallback_really_is_a_stub(self):
         # If this fails the import did not raise and the assertions below would be testing the
-        # real locus_annotations values rather than the fallbacks.
+        # real locus_annotations functions rather than the fallbacks.
         self.assertEqual(self.degraded.load_known_disease_loci("ignored"), ({}, {}, {}))
-
-    def test_the_fallback_blank_spellings_agree_with_locus_annotations(self):
-        self.assertEqual(self.degraded.BLANK_STATUS_VALUES, locus_annotations.BLANK_STATUS_VALUES)
-
-    def test_every_blank_status_displays_as_unknown(self):
-        # An "NA" cell is no status, so the locus-detail page shows "Unknown" rather than "Na".
-        for value in ("", "nan", "none", "na", "n/a", "null", "NA", " N/A ", "Null"):
-            described = self.degraded.describe_sample("S1", {"S1": {"affected_status": value}}, {}, {})
-            self.assertEqual(described["affected_status"], "Unknown", repr(value))
 
     def test_a_locus_matches_no_known_disease_locus(self):
         lookups = {"locus": {}, "disease_trees": {}, "strchive_trees": {}}
@@ -1595,32 +1500,43 @@ class DegradedModeFallbackTests(unittest.TestCase):
         self.assertIsNone(self.degraded.known_disease_pathogenic_min("chr1", 100, 110, "AT", {}, {}))
 
 
-class MinimalDatabaseTestCase(unittest.TestCase):
-    """Points the server at the _build_minimal_db fixture, and restores app.config afterwards."""
+class MinimalDatabaseTestCase(ServerTestCase):
+    """Points the server at the _build_minimal_db fixture."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
         _build_minimal_db(cls.db_path)
-        cls._saved_config = dict(results_server.app.config)
-        results_server.configure_app(cls.db_path, annotations_db=os.path.join(cls.tmpdir, "annotations.duckdb"))
-        results_server.app.config["TESTING"] = True
-        cls.client = results_server.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        results_server.app.config.clear()
-        results_server.app.config.update(cls._saved_config)
+        cls.configure_server(cls.db_path)
 
 
 class RequestCheckTests(MinimalDatabaseTestCase):
-    """No response carries CORS headers, and the Host check stops DNS rebinding while bound to
-    loopback without getting in the way of a server bound to another address."""
+    """No response carries CORS headers, and the Host check stops DNS rebinding whatever the bind
+    address, while still answering other machines that use this one's address or names."""
+
+    THIS_MACHINES_HOST_NAMES = {"labhost", "labhost.local", "labhost.example.org", "labhost.example.org.local"}
+
+    def setUp(self):
+        self.addCleanup(results_server.app.config.pop, "THIS_MACHINES_HOST_NAMES", None)
+        results_server.app.config["THIS_MACHINES_HOST_NAMES"] = self.THIS_MACHINES_HOST_NAMES
 
     def _set_bind_host(self, bind_host):
         self.addCleanup(results_server.app.config.pop, "BIND_HOST", None)
         results_server.app.config["BIND_HOST"] = bind_host
+
+    def _rebound_requests(self):
+        """Read the results and write a note the way a page on rebound.example would.
+
+        Returns:
+            Tuple (read status, write status).
+        """
+        read = self.client.get("/api/v1/schema", base_url="http://rebound.example:5050")
+        write = self.client.put("/api/v1/annotations/chr2-200-209-AAG/note", json={"note_text": "rebound"},
+                                base_url="http://rebound.example:5050",
+                                headers={"Origin": "http://rebound.example:5050"})
+        self.assertNotIn("chr2-200-209-AAG", results_server.app.config["ANNOTATIONS"]["notes"])
+        return read.status_code, write.status_code
 
     def test_no_response_carries_cors_headers(self):
         response = self.client.get("/api/v1/loci?outlier_type=all", headers={"Origin": "https://other.example"})
@@ -1638,37 +1554,65 @@ class RequestCheckTests(MinimalDatabaseTestCase):
                     response = self.client.get(path, base_url=f"http://{host}")
                     self.assertEqual(response.status_code, 200, (bind_host, host, path))
 
-    def test_another_host_name_is_refused_while_bound_to_loopback(self):
-        # A page whose own domain was pointed at 127.0.0.1 sends that domain as the Host, and as
-        # the Origin of a write, so the two match and only the Host check refuses it. Without a
-        # recorded bind address the server's default, 127.0.0.1, applies.
-        for bind_host in (None, "127.0.0.1", "localhost", "::1"):
+    def test_another_host_name_is_refused_whatever_the_bind_address(self):
+        # A page whose own domain was pointed at this machine connects from it, and sends that
+        # domain as the Host and as the Origin of a write, so the two match and only the Host
+        # check refuses it. Without a recorded bind address the server's default, 127.0.0.1,
+        # applies.
+        for bind_host in (None, "127.0.0.1", "localhost", "::1", "0.0.0.0", "192.168.1.5"):
             if bind_host is None:
                 results_server.app.config.pop("BIND_HOST", None)
             else:
                 self._set_bind_host(bind_host)
-            response = self.client.get("/api/v1/schema", base_url="http://rebound.example:5050")
+            self.assertEqual(self._rebound_requests(), (403, 403), bind_host)
+            response = self.client.get("/", base_url="http://rebound.example")
             self.assertEqual(response.status_code, 403, bind_host)
-            self.assertNotIn("sample_ids", response.get_json())
-            write = self.client.put("/api/v1/annotations/chr2-200-209-AAG/note", json={"note_text": "rebound"},
-                                    base_url="http://rebound.example:5050",
-                                    headers={"Origin": "http://rebound.example:5050"})
-            self.assertEqual(write.status_code, 403, bind_host)
-            self.assertNotIn("chr2-200-209-AAG", results_server.app.config["ANNOTATIONS"]["notes"])
+            self.assertIn("labhost.local", response.get_json()["detail"])
 
-    def test_any_host_name_is_answered_when_bound_to_another_address(self):
-        # Other machines reach the server under whatever name or address they know this one by.
+    def test_names_that_only_look_like_this_machine_are_refused(self):
+        for host in ("localhost.rebound.example", "labhost.rebound.example", "127.0.0.1.nip.io",
+                     "rebound.example."):
+            response = self.client.get("/api/v1/schema", base_url=f"http://{host}")
+            self.assertEqual(response.status_code, 403, host)
+        # A Host value that will not parse has no name, which is refused too
+        self.assertEqual(results_server.parse_host_name("[::1"), "")
+        self.assertEqual(results_server.parse_host_name("[::1]:5050"), "::1")
+
+    def test_ip_addresses_and_this_machines_names_are_answered_when_bound_to_another_address(self):
         for bind_host in ("0.0.0.0", "192.168.1.5"):
             self._set_bind_host(bind_host)
-            for host in ("myhost.example:5050", "192.168.1.5:5050", "localhost:5050"):
+            for host in ("192.168.1.5:5050", "10.0.0.7", "[fe80::1]:5050", "localhost:5050", "labhost:5050",
+                         "LabHost.local:5050", "labhost.example.org", "labhost.example.org.:5050"):
                 response = self.client.get("/api/v1/schema", base_url=f"http://{host}")
                 self.assertEqual(response.status_code, 200, (bind_host, host))
             # Writes from another machine are still refused, by restrict_writes
             write = self.client.put("/api/v1/annotations/chr2-200-209-AAG/note", json={"note_text": "remote"},
-                                    base_url="http://myhost.example:5050",
+                                    base_url="http://labhost.local:5050",
                                     environ_overrides={"REMOTE_ADDR": "192.168.1.9"})
             self.assertEqual(write.status_code, 403, bind_host)
             self.assertIn("non-loopback address", write.get_json()["detail"])
+
+    def test_writes_from_other_machines_are_answered_with_allow_remote_writes(self):
+        self._set_bind_host("0.0.0.0")
+        self.addCleanup(results_server.app.config.pop, "ALLOW_REMOTE_WRITES", None)
+        results_server.app.config["ALLOW_REMOTE_WRITES"] = True
+        self.addCleanup(self.client.delete, "/api/v1/annotations/chr2-200-209-AAG/note")
+        write = self.client.put("/api/v1/annotations/chr2-200-209-AAG/note", json={"note_text": "remote"},
+                                base_url="http://labhost.local:5050",
+                                environ_overrides={"REMOTE_ADDR": "192.168.1.9"})
+        self.assertEqual(write.status_code, 200)
+        # A rebinding page is refused all the same
+        results_server.app.config["ANNOTATIONS"]["notes"].pop("chr2-200-209-AAG")
+        self.assertEqual(self._rebound_requests(), (403, 403))
+
+    def test_this_machines_host_names(self):
+        with mock.patch.object(results_server.socket, "gethostname", return_value="LabHost"), \
+                mock.patch.object(results_server.socket, "getfqdn", return_value="labhost.example.org."):
+            self.assertEqual(results_server.find_this_machines_host_names(),
+                             {"labhost", "labhost.local", "labhost.example.org", "labhost.example.org.local"})
+        with mock.patch.object(results_server.socket, "gethostname", return_value="labhost.local"), \
+                mock.patch.object(results_server.socket, "getfqdn", return_value="labhost.local"):
+            self.assertEqual(results_server.find_this_machines_host_names(), {"labhost.local"})
 
     def test_filters_applied_is_the_same_in_the_list_and_the_json_export(self):
         query = ("outlier_type=all&min_pli=0.5&motif_size=2&search=GENE1&reference_region=chr1:100-110"
@@ -1677,6 +1621,146 @@ class RequestCheckTests(MinimalDatabaseTestCase):
         self.assertEqual(self.client.get(f"/api/v1/loci?{query}").get_json()["filters_applied"], expected)
         export = self.client.get(f"/api/v1/export?{query}&format=json")
         self.assertEqual(json.loads(gzip.decompress(export.get_data()))["metadata"]["filters_applied"], expected)
+
+
+MENDELIAN_BINS = ["autosome", "chrX", "chrY"] + [f"motif_{category}" for category in (
+    "1bp", "2bp", "3bp", "4bp", "5bp", "6bp", "7_24bp", "25plusbp")]
+
+
+def _build_db_with_mendelian_violations(path):
+    """Five trios from center ABC and one from XYZ, 1 violation in 100 calls per bin unless noted.
+
+    ABC_1 has 20 autosome violations, above the warning threshold. ABC_2 has no chrX counts and
+    no 1bp violation count, and ABC_3 no autosome total (NULLs).
+    """
+    conn = duckdb_compat.connect(path)
+    conn.execute("CREATE TABLE loci (LocusId TEXT, Motif TEXT, KnownDiseaseLocus TEXT)")
+    column_definitions = ", ".join(f"{name}_violations BIGINT, {name}_total BIGINT" for name in MENDELIAN_BINS)
+    conn.execute(f"CREATE TABLE mendelian_violations (sample_id TEXT, {column_definitions})")
+    overrides = {
+        "ABC_1": {"autosome_violations": 20},
+        "ABC_2": {"chrX_violations": None, "chrX_total": None, "motif_1bp_violations": None},
+        "ABC_3": {"autosome_violations": 5, "autosome_total": None},
+    }
+    for sample_id in ("ABC_1", "ABC_2", "ABC_3", "ABC_4", "ABC_5", "XYZ_1"):
+        values = {column: value for name in MENDELIAN_BINS
+                  for column, value in ((f"{name}_violations", 1), (f"{name}_total", 100))}
+        values.update(overrides.get(sample_id, {}))
+        conn.execute(f"INSERT INTO mendelian_violations VALUES (?, {', '.join('?' * len(values))})",
+                     [sample_id] + list(values.values()))
+    conn.commit()
+    conn.close()
+
+
+class MendelianViolationTests(ServerTestCase):
+    """The startup warnings and the QC2 page read the violation counts the same way, NULLs included."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
+        _build_db_with_mendelian_violations(cls.db_path)
+        cls.configure_server(cls.db_path)
+
+    def test_the_startup_warnings_flag_only_the_sample_above_the_threshold(self):
+        warnings = results_server.app.config["MENDELIAN_WARNINGS"]
+        self.assertEqual(set(warnings), {"ABC_1"})
+        self.assertEqual(warnings["ABC_1"]["autosome_rate"], 0.2)
+        self.assertEqual(warnings["ABC_1"]["motif_rates"]["1bp"], {"rate": 0.01, "violations": 1, "total": 100})
+
+    def test_the_qc2_page_reads_missing_counts_as_zero(self):
+        data = self.client.get("/api/v1/qc2_data").get_json()
+        by_chrom = {(r["sample_id"], r["bin"]): r for r in data["by_chrom"]}
+        self.assertEqual(by_chrom[("ABC_2", "chrX")], {"sample_id": "ABC_2", "bin": "chrX", "fraction": 0,
+                                                       "violations": 0, "total": 0})
+        self.assertEqual(by_chrom[("ABC_3", "autosome")]["fraction"], 0)
+        by_motif = {(r["sample_id"], r["bin"]): r for r in data["by_motif"]}
+        self.assertEqual((by_motif[("ABC_2", "1bp")]["violations"], by_motif[("ABC_2", "1bp")]["fraction"]), (0, 0))
+        self.assertEqual(by_motif[("ABC_4", "7-24bp")]["fraction"], 0.01)
+        self.assertEqual(len(data["by_motif"]), 6 * 8)
+
+    def test_only_centers_with_enough_trios_are_reported(self):
+        data = self.client.get("/api/v1/qc2_data").get_json()
+        by_center_chrom = {(r["center"], r["bin"]): r for r in data["by_center_chrom"]}
+        self.assertEqual({center for center, _ in by_center_chrom}, {"ABC"})
+        self.assertEqual(by_center_chrom[("ABC", "autosome")],
+                         {"center": "ABC", "bin": "autosome", "fraction": 28 / 400, "violations": 28, "total": 400,
+                          "trios": 5})
+        self.assertEqual(by_center_chrom[("ABC", "chrX")]["total"], 400)
+        self.assertEqual(len(data["by_center_motif"]), 8)
+
+    def test_the_qc2_page_gets_the_trio_minimum_it_names(self):
+        render_arguments = {}
+
+        class _RecordingTemplate:
+            def render(self, **kwargs):
+                render_arguments.update(kwargs)
+                return ""
+
+        original_get_template = results_server.jinja2_env.get_template
+        results_server.jinja2_env.get_template = lambda name: _RecordingTemplate()
+        self.addCleanup(setattr, results_server.jinja2_env, "get_template", original_get_template)
+        self.assertEqual(self.client.get("/qc2").status_code, 200)
+        self.assertEqual(render_arguments["min_trios_per_center"], results_server.MIN_TRIOS_PER_CENTER)
+
+
+def _build_db_for_min_expansion(path):
+    """Loci whose second affected allele, per sample and per family, sits just above the unaffected one.
+
+    A: reference 5, largest affected 6, second 5, unaffected 4, so it passes min_expansion=1 and
+       require_above_unaffected=second on their own and together.
+    B: the second affected allele ties the unaffected one.
+    C: the largest affected allele equals the reference.
+    """
+    conn = duckdb_compat.connect(path)
+    conn.execute("""CREATE TABLE loci (
+        LocusId TEXT, Chrom TEXT, Start0Based INTEGER, End1Based INTEGER, Motif TEXT, MotifSize INTEGER,
+        OutlierSampleIds_AllAlleles TEXT, NumRepeatsInReference INTEGER,
+        FirstAffectedAlleleSize_AllAlleles INTEGER, SecondAffectedAlleleSize_AllAlleles INTEGER,
+        SecondAffectedAlleleSize_AllAlleles_ByFamily INTEGER, FirstUnaffectedAlleleSize_AllAlleles INTEGER)""")
+    conn.executemany("INSERT INTO loci VALUES (?, 'chr1', ?, ?, 'AT', 2, '1x:sampleA', ?, ?, ?, ?, ?)", [
+        ("A", 100, 110, 5, 6, 5, 5, 4),
+        ("B", 200, 210, 5, 6, 4, 4, 4),
+        ("C", 300, 310, 12, 12, 11, 11, 3),
+    ])
+    conn.commit()
+    conn.close()
+
+
+class MinExpansionTests(ServerTestCase):
+    """min_expansion is a margin above the reference allele only, not above the unaffected one."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
+        _build_db_for_min_expansion(cls.db_path)
+        cls.configure_server(cls.db_path)
+
+    def _loci(self, query):
+        response = self.client.get(f"/api/v1/loci?outlier_type=all&{query}")
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return {r["LocusId"] for r in response.get_json()["results"]}
+
+    def test_each_filter_on_its_own(self):
+        self.assertEqual(self._loci("min_expansion=1"), {"A", "B"})
+        self.assertEqual(self._loci("require_above_unaffected=second"), {"A", "C"})
+        self.assertEqual(self._loci("require_families_above_unaffected=second"), {"A", "C"})
+
+    def test_combined_filters_keep_the_loci_that_pass_both(self):
+        for unaffected_filter in ("require_above_unaffected", "require_families_above_unaffected"):
+            for min_expansion in (0, 1):
+                query = f"{unaffected_filter}=second&min_expansion={min_expansion}"
+                self.assertEqual(self._loci(query),
+                                 self._loci(f"{unaffected_filter}=second") & self._loci(f"min_expansion={min_expansion}"),
+                                 query)
+            self.assertEqual(self._loci(f"{unaffected_filter}=second&min_expansion=1"), {"A"})
+
+    def test_a_missing_unaffected_column_matches_nothing(self):
+        saved = results_server.app.config["DB_COLUMNS_SET"]
+        self.addCleanup(results_server.app.config.__setitem__, "DB_COLUMNS_SET", saved)
+        results_server.app.config["DB_COLUMNS_SET"] = saved - {"FirstUnaffectedAlleleSize_AllAlleles"}
+        self.assertEqual(self._loci("require_families_above_unaffected=second"), set())
 
 
 class SwimPlotFilterTests(MinimalDatabaseTestCase):
@@ -1773,28 +1857,24 @@ def _build_db_with_population_percentiles(path, population_gate_cohorts):
     conn.close()
 
 
-class ExportPopulationGateTests(unittest.TestCase):
+class ExportPopulationGateTests(ServerTestCase):
     """The exports' outlier lists and read-visualization thresholds use the build's population gate."""
 
-    def setUp(self):
-        self._saved_config = dict(results_server.app.config)
-        self.addCleanup(results_server.app.config.update, self._saved_config)
-        self.addCleanup(results_server.app.config.clear)
-        self.tmpdir = tempfile.mkdtemp()
-        self.sample_table = os.path.join(self.tmpdir, "samples.tsv")
-        with open(self.sample_table, "w") as output_file:
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.sample_table = os.path.join(cls.tmpdir, "samples.tsv")
+        with open(cls.sample_table, "w") as output_file:
             output_file.write("sample_id\taffected_status\tanalysis_status\nsampleA\taffected\tunsolved\n")
 
     def _exports(self, population_gate_cohorts):
         """Return the JSON export's locus and the ExpansionHunter export's entry under a gate."""
         db_path = os.path.join(self.tmpdir, f"results_{len(population_gate_cohorts or ())}.duckdb")
         _build_db_with_population_percentiles(db_path, population_gate_cohorts)
-        results_server.configure_app(db_path, sample_table=self.sample_table,
-                                     annotations_db=os.path.join(self.tmpdir, "annotations.duckdb"))
-        client = results_server.app.test_client()
-        json_export = client.get("/api/v1/export?outlier_type=all&format=json")
+        self.configure_server(db_path, sample_table=self.sample_table)
+        json_export = self.client.get("/api/v1/export?outlier_type=all&format=json")
         self.assertEqual(json_export.status_code, 200)
-        expansion_hunter_export = client.get("/api/v1/export?outlier_type=all&format=expansion_hunter")
+        expansion_hunter_export = self.client.get("/api/v1/export?outlier_type=all&format=expansion_hunter")
         self.assertEqual(expansion_hunter_export.status_code, 200)
         return (json.loads(gzip.decompress(json_export.get_data()))["loci"][0],
                 json.loads(expansion_hunter_export.get_data())[0])
@@ -1812,12 +1892,65 @@ class ExportPopulationGateTests(unittest.TestCase):
         self.assertNotIn("PlotReadVisualization", catalog_entry)
 
 
-class KnownDiseaseMatchTests(unittest.TestCase):
+def _build_db_with_many_loci(path, num_loci):
+    """num_loci loci, each with an affected outlier above an unaffected one and a phenotype score."""
+    conn = duckdb_compat.connect(path)
+    conn.execute("""CREATE TABLE loci (
+        LocusId TEXT, Chrom TEXT, Start0Based INTEGER, End1Based INTEGER, Motif TEXT, MotifSize INTEGER,
+        OutlierSampleIds_AllAlleles TEXT, OutlierSampleIds_ShortAlleles TEXT,
+        NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles INTEGER)""")
+    locus_ids = [f"chr1-{index * 100}-{index * 100 + 10}-AT" for index in range(num_loci)]
+    conn.executemany("INSERT INTO loci VALUES (?, 'chr1', ?, ?, 'AT', 2, '20x:sampleA,10x:sampleB', '', 1)",
+                     [(locus_id, index * 100, index * 100 + 10) for index, locus_id in enumerate(locus_ids)])
+    result_database.write_phenotype_tables(
+        conn,
+        [{"locus_id": locus_id, "sample_id": "sampleA", "outlier_type": "AllAlleles", "allele_size": 20,
+          "gene_symbol": "GENE1", "gene_phenotype_similarity": 0.5, "gene_phenotype_overlap_count": 1,
+          "n_matching_diseases": 0, "best_matching_disease": None, "best_disease_inheritance": None,
+          "pairwise_similarity_to_next": None, "pairwise_shared_count_raw": None,
+          "pairwise_shared_count_ic": None, "next_sample_id": None} for locus_id in locus_ids],
+        [],
+    )
+    conn.commit()
+    conn.close()
+
+
+class LargeExpansionHunterExportTests(ServerTestCase):
+    """Every locus of an ExpansionHunter export is enriched, however many loci it has."""
+
+    NUM_LOCI = 250
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
+        _build_db_with_many_loci(cls.db_path, cls.NUM_LOCI)
+        sample_table = os.path.join(cls.tmpdir, "samples.tsv")
+        with open(sample_table, "w") as output_file:
+            output_file.write("sample_id\taffected_status\nsampleA\taffected\nsampleB\tunaffected\n")
+        cls.configure_server(cls.db_path, sample_table=sample_table)
+
+    def test_every_locus_carries_its_thresholds_and_samples(self):
+        recorded_queries = _record_queries(self)
+        response = self.client.get("/api/v1/export?outlier_type=all&format=expansion_hunter")
+        self.assertEqual(response.status_code, 200)
+        catalog = json.loads(response.get_data())
+        self.assertEqual(len(catalog), self.NUM_LOCI)
+        for entry in catalog:
+            self.assertEqual(entry["PlotReadVisualization"], [{"If": "LongAllele", "Is": ">=", "Threshold": 20}],
+                             entry["LocusId"])
+            self.assertEqual([(s["Sample ID"], s["Gene-Pheno Sim"]) for s in entry["Samples"]["AllAlleleOutliers"]],
+                             [("sampleA", 0.5), ("sampleB", None)], entry["LocusId"])
+        # The scores are loaded in one query, not one per locus
+        self.assertEqual(len([sql for sql in recorded_queries if "per_outlier_phenotype_scores" in sql]), 1)
+
+
+class KnownDiseaseMatchTests(ServerTestCase):
     """The locus-detail page and the pathogenic-threshold filter take the same match and minimum."""
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
+        super().setUpClass()
         catalog_path = os.path.join(cls.tmpdir, "catalog.json")
         with open(catalog_path, "w") as output_file:
             json.dump([
@@ -1862,6 +1995,28 @@ class KnownDiseaseMatchTests(unittest.TestCase):
         # [100, 110) against [100, 125) has a Jaccard index of 0.4
         self.assertIsNone(self._detail("chr1", 100, 125, "AT"))
         self.assertIsNone(self._pathogenic_min("chr1", 100, 125, "AT"))
+
+    def test_a_null_pathogenic_motifs_list_still_matches_by_repeat_unit(self):
+        tree = intervaltree.IntervalTree()
+        tree.addi(100, 110, data={
+            "RepeatUnit": "AT",
+            "PathogenicMotifs": None,  # an explicit null in the catalog JSON
+            "LocusId": "DISEASE_AT",
+            "Diseases": [{"Name": "DiseaseX"}],
+        })
+        lookups = {"locus": {}, "disease_trees": {"1": tree}, "strchive_trees": {}}
+        result = results_server.compute_known_disease_info(
+            {"LocusId": "q", "Chrom": "chr1", "Start0Based": 100, "End1Based": 110, "Motif": "AT"}, lookups)
+        self.assertEqual(result["locus_id"], "DISEASE_AT")
+
+    def test_the_server_matches_through_the_builds_function(self):
+        # One definition, so the detail page and the filter cannot drift from the build's
+        # KnownDiseaseLocus
+        self.assertIs(results_server.find_matching_disease_locus, locus_annotations.find_matching_disease_locus)
+        self.assertEqual(locus_annotations.matches_disease_locus("chr9-100-110-AAGGG", self.disease_trees,
+                                                                 self.strchive_trees), "TEST_PATHOGENIC")
+        self.assertEqual(locus_annotations.matches_disease_locus("chr3-300-310-CAG", self.disease_trees,
+                                                                 self.strchive_trees), "NO_MIN")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ CLI, from the TRails directory (the TRExplorer step needs the packages in .venv/
 """
 
 import argparse
+import contextlib
 import gzip
 import json
 import os
@@ -21,11 +22,13 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # reference_data/ sits in the TRails directory, one level above this trails/ code directory
 DEFAULT_REFERENCE_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "reference_data")
 
-# Pinned public sources: bump these versions deliberately. Every URL below except genelookup's
-# resolves to an immutable ref (a release tag or a commit sha), so that two installs made at
-# different times build the same database from the same cohort; a "main" URL would silently change
-# the annotations. genelookup's gene table is not versioned (see below), so it is the one input
-# that can differ between two installs.
+# Pinned public sources: bump these versions deliberately. The HPO, str-analysis and STRchive URLs
+# below resolve to an immutable ref (a release tag or a commit sha), so two installs made at
+# different times get the same files; a "main" URL would silently change the annotations.
+# TRExplorer's table is pinned only by its release directory (v2.1): the file there can be replaced
+# in place, and the bucket keeps no older copy to pin to, so an install made after a re-upload gets
+# the new file while an existing install keeps its own until --force (TRAILS_FORCE=1). genelookup's
+# gene table is not versioned at all (see below). Those two inputs can differ between two installs.
 HPO_RELEASE = "v2025-05-06"   # Human Phenotype Ontology annotation release tag
 STR_ANALYSIS_COMMIT = "15c642927de66703dcaf5ec92fb08ee8249dc745"   # broadinstitute/str-analysis
 STRCHIVE_COMMIT = "d7961b2c3bbc13cbcb256c19ddbf8779f7e76ca6"       # dashnowlab/STRchive
@@ -53,14 +56,30 @@ GENELOOKUP_GENE_TABLE_SQL = (
 GENELOOKUP_GENE_TABLE_NAME = "genelookup_gene_table.tsv.gz"
 
 
+@contextlib.contextmanager
+def _removed_on_failure(path):
+    """Remove path if the block raises anything, Ctrl-C included, then re-raise.
+
+    A partial download would otherwise stay behind, and TRExplorer's table alone is about 900 MB,
+    which matters most when the download failed because the disk filled up.
+    """
+    try:
+        yield
+    except BaseException:
+        if os.path.exists(path):
+            os.remove(path)
+        raise
+
+
 def _download(url, dest):
     """Download url to dest atomically (write a .tmp file, then rename)."""
     tmp = dest + ".tmp"
-    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "TRails-setup"})) as response, \
-            open(tmp, "wb") as out:
-        for chunk in iter(lambda: response.read(1 << 20), b""):
-            out.write(chunk)
-    os.replace(tmp, dest)
+    with _removed_on_failure(tmp):
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "TRails-setup"})) as response, \
+                open(tmp, "wb") as out:
+            for chunk in iter(lambda: response.read(1 << 20), b""):
+                out.write(chunk)
+        os.replace(tmp, dest)
 
 
 def _download_trexplorer_annotations(source, dest):
@@ -100,30 +119,33 @@ def _export_genelookup_gene_table(sql, dest):
     if result.get("status") != "success":
         raise RuntimeError(f"genelookup export failed: {result.get('error', result)}")
     tmp = dest + ".tmp"
-    with gzip.open(tmp, "wt") as out:
-        for file_index, url in enumerate(result["public_urls"]):
-            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "TRails-setup"})) as part:
-                lines = gzip.decompress(part.read()).decode().splitlines(keepends=True)
-            out.writelines(lines if file_index == 0 else lines[1:])
-    os.replace(tmp, dest)
+    with _removed_on_failure(tmp):
+        with gzip.open(tmp, "wt") as out:
+            for file_index, url in enumerate(result["public_urls"]):
+                with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "TRails-setup"})) as part:
+                    lines = gzip.decompress(part.read()).decode().splitlines(keepends=True)
+                out.writelines(lines if file_index == 0 else lines[1:])
+        os.replace(tmp, dest)
 
 
-# (local filename, source, function that fetches source into the file): one class-A file per
-# entry. The source is what the reference-versions manifest below records.
+# (local filename, source, function that fetches source into the file, the trails.py option that
+# takes a local copy of the file instead or None): one class-A file per entry. The source is what
+# the reference-versions manifest below records. TRExplorer's database has no trails.py option:
+# trails.py reads it only from the reference-data directory.
 REFERENCE_FILES = [
     ("genes_to_phenotype.txt",
      f"https://github.com/obophenotype/human-phenotype-ontology/releases/download/{HPO_RELEASE}/genes_to_phenotype.txt",
-     _download),
+     _download, "--genes-to-phenotype"),
     ("variant_catalog_without_offtargets.GRCh38.json",
      f"https://raw.githubusercontent.com/broadinstitute/str-analysis/{STR_ANALYSIS_COMMIT}/str_analysis/variant_catalogs/variant_catalog_without_offtargets.GRCh38.json",
-     _download),
+     _download, "--known-loci-json"),
     ("STRchive-loci.json",
      f"https://raw.githubusercontent.com/dashnowlab/STRchive/{STRCHIVE_COMMIT}/data/STRchive-loci.json",
-     _download),
+     _download, "--strchive-loci-json"),
     (TREXPLORER_ANNOTATIONS_DATABASE_NAME,
      f"{TREXPLORER_ANNOTATIONS_TSV_URL}#database_format={TREXPLORER_ANNOTATIONS_DATABASE_FORMAT_VERSION}",
-     _download_trexplorer_annotations),
-    (GENELOOKUP_GENE_TABLE_NAME, GENELOOKUP_GENE_TABLE_SQL, _export_genelookup_gene_table),
+     _download_trexplorer_annotations, None),
+    (GENELOOKUP_GENE_TABLE_NAME, GENELOOKUP_GENE_TABLE_SQL, _export_genelookup_gene_table, "--gene-table"),
 ]
 
 
@@ -158,7 +180,7 @@ def fetch_reference_data(dest_dir=DEFAULT_REFERENCE_DIR, remote=False, force=Fal
     os.makedirs(dest_dir, exist_ok=True)
     cached_urls = _read_cache_manifest(dest_dir)
     paths = {}
-    for name, source, fetch in REFERENCE_FILES:
+    for name, source, fetch, trails_option in REFERENCE_FILES:
         dest = os.path.join(dest_dir, name)
         if remote:
             print(f"  [remote] {name} -> {source}")
@@ -191,9 +213,11 @@ def fetch_reference_data(dest_dir=DEFAULT_REFERENCE_DIR, remote=False, force=Fal
                           f"currently pinned version.")
                     paths[name] = dest
                 else:
+                    local_copy_advice = (f"Pass a local copy with trails.py {trails_option}, or re-run "
+                                         if trails_option else "Re-run ")
                     print(f"  [WARN] could not fetch {name} ({type(e).__name__}: {e}); "
-                          f"continuing without it. Pass a local copy on the trails.py "
-                          f"command line, or re-run trails_setup.py later to retry.")
+                          f"continuing without it. {local_copy_advice}trails_setup.py or "
+                          f"install.sh later to retry.")
     if not remote:
         try:
             with open(os.path.join(dest_dir, CACHE_MANIFEST_NAME), "w") as f:

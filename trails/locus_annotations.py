@@ -12,10 +12,8 @@ after the allele histograms have been built:
 
 Design choices:
   * Motif primitives come from ``motif_utilities``.
-  * No network access by default. ``load_known_disease_loci`` reads the cached
-    class-A catalog JSON, and only builds STRchive interval trees when handed a
-    cached STRchive-loci JSON path (``fetch_strchive`` triggers the optional
-    network fetch, kept off by default).
+  * No network access. ``load_known_disease_loci`` reads the cached class-A
+    catalog JSON and, when handed one, a cached STRchive-loci JSON path.
   * The internal representation is a list of dicts (one dict per locus); these
     functions mutate each dict in place to add new columns.
 
@@ -25,6 +23,7 @@ arguments and, for the ``add_*`` helpers, mutate the passed-in records).
 
 import collections
 import json
+import re
 
 import intervaltree
 
@@ -36,14 +35,8 @@ import intervaltree
 KnownDiseaseLoci = collections.namedtuple(
     "KnownDiseaseLoci", ["interval_trees", "strchive_trees", "locus_lookup"])
 
+from analysis_columns import blank_to_none
 from motif_utilities import COMPLEMENT, compute_canonical_motif
-
-
-# STRchive raw-data URL, used only when the optional network fetch is requested.
-STRCHIVE_URL = (
-    "https://raw.githubusercontent.com/dashnowlab/STRchive/"
-    "refs/heads/main/data/STRchive-loci.json"
-)
 
 
 # Gene-region prioritization rank (lower number = more important / more likely
@@ -124,26 +117,6 @@ def motifs_match(motif1, motif2):
     return len(motif1) == len(motif2)
 
 
-def fetch_strchive_loci():
-    """Fetch STRchive loci over the network and build chrom -> IntervalTree.
-
-    This performs a live HTTP request and is therefore opt-in only (the build
-    pipeline keeps it off by default for hermetic, reproducible runs). The
-    ``requests`` import is local so the module has no hard network dependency.
-
-    Returns:
-        A dict mapping chromosome (without ``chr`` prefix) to an
-        ``intervaltree.IntervalTree`` whose intervals carry the locus dict in
-        their ``.data`` attribute.
-    """
-    import requests
-
-    print(f"Fetching STRchive loci from {STRCHIVE_URL}")
-    response = requests.get(STRCHIVE_URL)
-    response.raise_for_status()
-    return _build_strchive_trees(response.json())
-
-
 def _build_strchive_trees(loci):
     """Build chrom -> IntervalTree from a list of STRchive locus dicts.
 
@@ -174,12 +147,6 @@ def _build_strchive_trees(loci):
     return dict(interval_trees)
 
 
-# Lower-cased, stripped cell values that mean "nothing was recorded" in a sample-metadata
-# column (affected_status, analysis_status, sex, maternal_id, ...). input_tables and
-# mendelian_qc read their blanks from here too.
-BLANK_STATUS_VALUES = {"", "nan", "none", "na", "n/a", "null"}
-
-
 def normalize_affected_status_for_logic(value):
     """Normalize an affected-status cell so comparisons don't depend on its spelling.
 
@@ -188,24 +155,19 @@ def normalize_affected_status_for_logic(value):
 
     Args:
         value: An affected-status cell, which may be None, NaN or any of the blank spellings in
-            BLANK_STATUS_VALUES.
+            analysis_columns.BLANK_STATUS_VALUES.
 
     Returns:
-        None for a blank value, "affected" for "possibly affected", and the lower-cased stripped
-        value otherwise.
+        None for a blank value (``blank_to_none``), "affected" for "possibly affected", and the
+        lower-cased stripped value otherwise.
     """
-    if value is None:
-        return None
-    if isinstance(value, float) and value != value:  # NaN
+    if blank_to_none(value) is None:
         return None
     normalized = str(value).strip().lower()
-    if normalized in BLANK_STATUS_VALUES:
-        return None
     return "affected" if normalized == "possibly affected" else normalized
 
 
-def load_known_disease_loci(filepath=None, fetch_strchive=False, strchive_filepath=None,
-                            build_locus_lookup=False):
+def load_known_disease_loci(filepath=None, strchive_filepath=None, build_locus_lookup=False):
     """Load known disease loci into chrom -> IntervalTree(s) for matching.
 
     Reads the cached class-A variant catalog JSON (e.g.
@@ -217,19 +179,14 @@ def load_known_disease_loci(filepath=None, fetch_strchive=False, strchive_filepa
     ``4-3074876-3074933-CAG``), so both are used as they are. Each interval carries
     its full locus dict in ``.data``.
 
-    The optional STRchive trees are built only when an explicit cached
-    ``strchive_filepath`` is given, or when ``fetch_strchive`` is True (which
-    triggers a live network fetch). Both default off, so the build does no
-    network access by default.
+    The optional STRchive trees are built only when a cached
+    ``strchive_filepath`` is given.
 
     Args:
         filepath: Path to the variant catalog JSON file, or None to load only
             the STRchive fallback (``interval_trees`` is then empty).
-        fetch_strchive: When True, fetch STRchive loci over the network. Kept
-            False by default for hermetic builds.
         strchive_filepath: Optional path to a cached STRchive-loci.json file. If
-            given, STRchive trees are built from it (no network access). Takes
-            precedence over ``fetch_strchive``.
+            given, STRchive trees are built from it.
         build_locus_lookup: When True, also build ``locus_lookup`` (keyed by each
             locus's ``LocusId`` and by a ``"chrom-start0-end1-RepeatUnit"``
             coordinate key) for the serving path's locus-detail lookups. The
@@ -274,8 +231,6 @@ def load_known_disease_loci(filepath=None, fetch_strchive=False, strchive_filepa
     if strchive_filepath is not None:
         with open(strchive_filepath, "rt") as input_file:
             strchive_trees = _build_strchive_trees(json.load(input_file))
-    elif fetch_strchive:
-        strchive_trees = fetch_strchive_loci()
 
     return KnownDiseaseLoci(dict(interval_trees), strchive_trees, locus_lookup)
 
@@ -300,15 +255,65 @@ def strchive_locus_motifs(locus_data):
             + list(locus_data.get("pathogenic_motif_reference_orientation") or []))
 
 
+# A query locus matches a known disease locus only when their intervals' Jaccard index is above this
+KNOWN_DISEASE_LOCUS_MIN_JACCARD = 0.66
+
+
+def find_matching_disease_locus(chrom, start, end, motif, interval_trees, strchive_trees=None):
+    """Return the known disease locus a query locus matches, and the catalog it is from.
+
+    Matching uses TRExplorer-style logic: a query locus matches a disease locus
+    when they overlap, their interval Jaccard is greater than
+    KNOWN_DISEASE_LOCUS_MIN_JACCARD, and at least one of the disease locus's motifs
+    (its ``RepeatUnit`` plus any ``PathogenicMotifs``, or for STRchive
+    ``strchive_locus_motifs``) matches the query motif under ``motifs_match``. The
+    variant catalog is consulted first; the optional STRchive trees are a
+    fallback consulted only when the catalog yields no match. The build
+    (``matches_disease_locus``) and the server's locus-detail page and
+    pathogenic-threshold filter all match through this one function.
+
+    Args:
+        chrom: The query chromosome, with or without a ``chr`` prefix.
+        start: The query start, 0-based.
+        end: The query end, 1-based.
+        motif: The query motif.
+        interval_trees: chrom -> IntervalTree from ``load_known_disease_loci``.
+        strchive_trees: Optional chrom -> IntervalTree STRchive fallback (also
+            from ``load_known_disease_loci``). When falsy, no fallback is used.
+
+    Returns:
+        A ``(locus_data, source)`` tuple: the matched disease locus's record and
+        ``"variant_catalog"`` or ``"STRchive"``. ``(None, None)`` when nothing
+        matches, or when the motif or a coordinate is missing.
+    """
+    if not motif or start is None or end is None:
+        return None, None
+    chrom = chrom.replace("chr", "") if chrom else ""
+
+    for interval in interval_trees.get(chrom, intervaltree.IntervalTree()).overlap(start, end):
+        if compute_jaccard(start, end, interval.begin, interval.end) <= KNOWN_DISEASE_LOCUS_MIN_JACCARD:
+            continue
+        locus_data = interval.data
+        for disease_motif in [locus_data["RepeatUnit"]] + (locus_data.get("PathogenicMotifs") or []):
+            if motifs_match(motif, disease_motif):
+                return locus_data, "variant_catalog"
+
+    if strchive_trees:
+        for interval in strchive_trees.get(chrom, intervaltree.IntervalTree()).overlap(start, end):
+            if compute_jaccard(start, end, interval.begin, interval.end) <= KNOWN_DISEASE_LOCUS_MIN_JACCARD:
+                continue
+            locus_data = interval.data
+            for strchive_motif in strchive_locus_motifs(locus_data):
+                if motifs_match(motif, strchive_motif):
+                    return locus_data, "STRchive"
+
+    return None, None
+
+
 def matches_disease_locus(locus_id, interval_trees, strchive_trees=None):
     """Return the disease LocusId matched by a query locus, or None.
 
-    Matching uses TRExplorer-style logic: a query locus matches a disease locus
-    when they overlap, their interval Jaccard is greater than 0.66, and at least
-    one of the disease locus's motifs (its ``RepeatUnit`` plus any
-    ``PathogenicMotifs``) matches the query motif under ``motifs_match``. The
-    variant catalog is consulted first; the optional STRchive trees are a
-    fallback consulted only when the catalog yields no match.
+    The match is ``find_matching_disease_locus``'s.
 
     Args:
         locus_id: A ``"chrom-start-end-motif"`` string. ``chrom`` may carry a
@@ -322,28 +327,13 @@ def matches_disease_locus(locus_id, interval_trees, strchive_trees=None):
         STRchive, its ``locus_id``/``id``), or None if nothing matches.
     """
     chrom, start, end, motif = locus_id.split("-")
-    start = int(start)
-    end = int(end)
-    chrom = chrom.replace("chr", "")
-
-    for interval in interval_trees.get(chrom, intervaltree.IntervalTree()).overlap(start, end):
-        if compute_jaccard(start, end, interval.begin, interval.end) <= 0.66:
-            continue
-        locus_data = interval.data
-        for disease_motif in [locus_data["RepeatUnit"]] + (locus_data.get("PathogenicMotifs") or []):
-            if motifs_match(motif, disease_motif):
-                return locus_data["LocusId"]
-
-    if strchive_trees:
-        for interval in strchive_trees.get(chrom, intervaltree.IntervalTree()).overlap(start, end):
-            if compute_jaccard(start, end, interval.begin, interval.end) <= 0.66:
-                continue
-            locus_data = interval.data
-            for strchive_motif in strchive_locus_motifs(locus_data):
-                if motifs_match(motif, strchive_motif):
-                    return locus_data.get("locus_id", locus_data.get("id"))
-
-    return None
+    locus_data, source = find_matching_disease_locus(
+        chrom, int(start), int(end), motif, interval_trees, strchive_trees)
+    if locus_data is None:
+        return None
+    if source == "variant_catalog":
+        return locus_data["LocusId"]
+    return locus_data.get("locus_id", locus_data.get("id"))
 
 
 def collect_known_disease_canonical_motifs(interval_trees, strchive_trees=None):
@@ -600,15 +590,53 @@ def compute_is_known_motif(canonical_motif, known_canonical_motifs):
     return 1 if canonical_motif in known_canonical_motifs else 0
 
 
+# The names in a gene table's sources column that are curated evidence of a Mendelian
+# gene-disease association. genelookup's table also lists genes known only from GWAS, ClinVar,
+# dbNSFP, the Intolerome or gene constraint (pLI, LOEUF); none of those alone makes a gene a
+# Mendelian disease gene.
+MENDELIAN_DISEASE_GENE_SOURCES = frozenset(
+    ["OMIM", "ClinGen", "GenCC", "PanelAppUK", "PanelAppAU", "Decipher"])
+
+
+def _gene_table_source_names(sources):
+    """Return the source names a gene table's sources value lists.
+
+    Args:
+        sources: A value like ``"3: OMIM, GWAS, pLI_v4:1.0"``: an optional count of sources,
+            then comma-separated names, each optionally followed by ``:value``.
+
+    Returns:
+        The set of names, e.g. ``{"OMIM", "GWAS", "pLI_v4"}``.
+    """
+    return {name.split(":")[0].strip() for name in re.sub(r"^\s*\d+\s*:", "", sources).split(",")}
+
+
 def is_in_mendelian_gene(gene_id, gene_lookup):
-    """Return 1 if a gene_id is in the Mendelian gene-disease table, else 0.
+    """Return 1 if a gene_id is a Mendelian disease gene according to the gene table, else 0.
+
+    A gene counts when its row gives an inheritance mode, or its sources name a curated
+    Mendelian gene-disease source (MENDELIAN_DISEASE_GENE_SOURCES). A gene table with neither
+    an ``inheritance`` nor a ``sources`` column (one passed with --gene-table) is taken to list
+    disease genes only, so every gene in it counts.
 
     Args:
         gene_id: The locus's gene id, or None when the locus has no gene
             annotation.
-        gene_lookup: A dict keyed by gene id (the Mendelian gene-disease table).
+        gene_lookup: A dict keyed by gene id, as ``input_tables.read_gene_table`` returns it:
+            a row has an ``inheritance`` or ``sources`` key only when the table has that
+            column, and a blank cell holds None or NaN.
 
     Returns:
-        1 if ``gene_id`` is a non-None key of ``gene_lookup``, else 0.
+        1 if ``gene_id`` is a key of ``gene_lookup`` whose row passes the rule above, else 0.
     """
-    return 1 if gene_id is not None and gene_id in gene_lookup else 0
+    gene_row = gene_lookup.get(gene_id) if gene_id is not None else None
+    if gene_row is None:
+        return 0
+    if "inheritance" not in gene_row and "sources" not in gene_row:
+        return 1
+    if blank_to_none(gene_row.get("inheritance")) is not None:
+        return 1
+    sources = blank_to_none(gene_row.get("sources"))
+    if sources is None:
+        return 0
+    return 1 if _gene_table_source_names(str(sources)) & MENDELIAN_DISEASE_GENE_SOURCES else 0

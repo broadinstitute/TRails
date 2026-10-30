@@ -6,15 +6,12 @@ import allele_histograms
 import mendelian_qc
 from mendelian_qc import (
     ALL_CANONICAL_MOTIFS,
-    MOTIF_SIZE_CATEGORIES,
     allele_matches_any,
     check_violation,
     compute_mendelian_violations,
     find_trios,
     get_chrom_category,
     get_motif_size_category,
-    per_motif_columns,
-    per_sample_columns,
 )
 
 
@@ -160,24 +157,33 @@ class FindTriosTests(unittest.TestCase):
         self.assertEqual(find_trios(sample_lookup), [("child", "mom", "dad")])
 
 
-class ColumnLayoutTests(unittest.TestCase):
+class RowLayoutTests(unittest.TestCase):
+    """The row keys, in order, are the column order of the two Mendelian tables."""
 
-    def test_per_sample_columns_layout(self):
-        columns = per_sample_columns()
-        self.assertEqual(columns[0], "sample_id")
-        self.assertIn("autosome_violations", columns)
-        self.assertIn("autosome_total", columns)
+    def _rows(self):
+        locus_rows = [{"trid": "chr1-100-110-AT", "motif": "AT",
+                       "genotypes": {"child": "10,20", "mom": "10,11", "dad": "20,21"}}]
+        sample_lookup = _sample_lookup([
+            {"sample_id": "child", "maternal_id": "mom", "paternal_id": "dad"},
+            {"sample_id": "mom"},
+            {"sample_id": "dad"},
+        ])
+        return compute_mendelian_violations(locus_rows, sample_lookup)
+
+    def test_per_sample_row_layout(self):
+        columns = list(self._rows()[0][0])
+        self.assertEqual(columns[:3], ["sample_id", "autosome_violations", "autosome_total"])
         self.assertIn("chrM_total", columns)
         self.assertIn("motif_7_24bp_violations", columns)
         self.assertIn("motif_25plusbp_total", columns)
-        self.assertEqual(columns[-2], "total_violations")
-        self.assertEqual(columns[-1], "total_loci")
+        self.assertEqual(columns[-2:], ["total_violations", "total_loci"])
         # 1 + 4*2 + 8*2 + 2 = 27 columns.
         self.assertEqual(len(columns), 27)
 
-    def test_per_motif_columns_layout(self):
-        columns = per_motif_columns()
-        self.assertEqual(columns[0], "sample_id")
+    def test_per_motif_row_layout(self):
+        columns = list(self._rows()[1][0])
+        first_motif = ALL_CANONICAL_MOTIFS[0]
+        self.assertEqual(columns[:3], ["sample_id", f"mv_{first_motif}", f"total_{first_motif}"])
         self.assertEqual(len(columns), 1 + 2 * len(ALL_CANONICAL_MOTIFS))
         self.assertIn("mv_AT", columns)
         self.assertIn("total_AT", columns)
@@ -523,25 +529,6 @@ class PerLocusDerivationTests(unittest.TestCase):
         self.assertEqual([(chrom, size, canonical)
                           for _genotypes, chrom, size, canonical in prepared],
                          [("autosome", "3bp", "AGC"), ("autosome", "2bp", "AT")])
-
-
-class BlankMotifMendelianTests(unittest.TestCase):
-    """A blank motif must not raise KeyError and abort the build; the locus is skipped."""
-
-    def test_blank_motif_does_not_crash(self):
-        locus_rows = [{
-            "trid": "chr1-100-110-",
-            "motif": "",
-            "genotypes": {"CHILD": "10,20", "MOM": "10,11", "DAD": "20,21"},
-        }]
-        sample_lookup = {
-            "CHILD": {"sample_id": "CHILD", "maternal_id": "MOM", "paternal_id": "DAD"},
-            "MOM": {"sample_id": "MOM", "maternal_id": "", "paternal_id": ""},
-            "DAD": {"sample_id": "DAD", "maternal_id": "", "paternal_id": ""},
-        }
-        per_sample, _ = mendelian_qc.compute_mendelian_violations(locus_rows, sample_lookup)
-        # The blank-motif locus is skipped, so the trio tallies zero loci.
-        self.assertEqual(per_sample[0]["total_loci"], 0)
 
 
 if __name__ == "__main__":

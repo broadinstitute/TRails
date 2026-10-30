@@ -42,7 +42,7 @@
 
             <!-- Section 3: By Sequencing Center (Motif) -->
             <div id="section-center-motif" class="qc-section" style="display: none;">
-                <div class="qc-section-title">Mendelian violation fraction by sequencing center (grouped by motif size) — centers with ≥5 trios</div>
+                <div class="qc-section-title">Mendelian violation fraction by sequencing center (grouped by motif size) — centers with ≥{{ min_trios_per_center }} trios</div>
                 <div class="qc-charts-row" id="center-motif-charts-row">
                     <!-- Charts will be inserted here -->
                 </div>
@@ -50,7 +50,7 @@
 
             <!-- Section 4: By Sequencing Center (Chromosome) -->
             <div id="section-center-chrom" class="qc-section" style="display: none;">
-                <div class="qc-section-title">Mendelian violation fraction by sequencing center (grouped by chromosome) — centers with ≥5 trios</div>
+                <div class="qc-section-title">Mendelian violation fraction by sequencing center (grouped by chromosome) — centers with ≥{{ min_trios_per_center }} trios</div>
                 <div class="qc-charts-row" id="center-chrom-charts-row">
                     <!-- Charts will be inserted here -->
                 </div>
@@ -88,126 +88,72 @@ function formatFractionTick(value) {
     return (value * 100).toFixed(1) + '%';
 }
 
-// Create a single bin chart (box plot with scatter overlay): one dot per trio at its violation fraction
-function createSingleBinChart(canvasId, binData, yMax) {
-    const points = binData.map(item => ({
-        y: item.fraction,
-        sample_id: item.sample_id,
-        violations: item.violations,
-        total: item.total
-    }));
-    return createSingleBinBoxPlotChart(canvasId, points, {
+// A Mendelian violation fraction as the tables and tooltips show it
+function formatFractionAsPercent(fraction) {
+    return (fraction * 100).toFixed(2) + '%';
+}
+
+// What the per-trio and per-center sections differ in: the dots (dotOptions, passed on to
+// createSingleBinBoxPlotChart), and the table under each chart, which lists the bin's rows with
+// the highest fractions, at most maxTableRows of them.
+const TRIO_SECTION = {
+    dotOptions: {
         datasetLabel: 'Samples',
         backgroundColor: 'rgba(33, 133, 208, 0.5)',
         borderColor: 'rgba(33, 133, 208, 0.8)',
         pointRadius: 3,
         pointHoverRadius: 5,
-        yAxisTitle: '% MV',
-        yAxisRange: { min: 0, max: yMax },
-        yTickLabel: formatFractionTick,
         tooltipLines: point => [
             'Sample: ' + (point.sample_id || ''),
             'Violations: ' + point.violations + ' / ' + point.total,
-            '% MV: ' + (point.y * 100).toFixed(2) + '%'
+            '% MV: ' + formatFractionAsPercent(point.y)
         ],
-    });
-}
+    },
+    tableTitle: 'Top 20 samples',
+    maxTableRows: 20,
+    tableHeaderHtml: '<tr><th>Proband ID</th><th>% MV</th></tr>',
+    tableRowHtml: item => `<td title="${escapeHtml(item.sample_id)}">${renderMendelianWarning(item.sample_id)}${escapeHtml(item.sample_id)}</td><td>${formatFractionAsPercent(item.fraction)}</td>`,
+};
 
-// Create all charts for a section (per-sample data)
-function createChartsForSection(containerId, data, bins) {
-    const container = document.getElementById(containerId);
-    container.innerHTML = '';  // Clear any existing content
-
-    // Group data by bin
-    const binData = {};
-    bins.forEach(bin => { binData[bin] = []; });
-    // A bin with total === 0 had no informative loci for that trio. The API reports it as
-    // fraction 0 (violations / total if total > 0 else 0), which is indistinguishable from a
-    // measured 0% violation rate, so drop it rather than plotting a dot and folding it into the
-    // box statistics, percentiles and shared scale below.
-    const measured = data.filter(item => item.total > 0);
-    measured.forEach(item => {
-        if (binData[item.bin] !== undefined) {
-            binData[item.bin].push({
-                sample_id: item.sample_id,
-                fraction: item.fraction,
-                violations: item.violations,
-                total: item.total
-            });
-        }
-    });
-
-    // Compute global max across all bins for shared y-axis (round up to nearest 5%)
-    const allFractions = measured.map(d => d.fraction);
-    const maxFraction = allFractions.length > 0 ? Math.max(...allFractions) : 0;
-    const globalMax = Math.ceil(maxFraction / 0.05) * 0.05 || 0.05;  // Round up to nearest 5%
-
-    // Create a chart for each bin, with a table of its top 20 samples (sorted by fraction descending)
-    bins.forEach((bin, idx) => {
-        const top20 = binData[bin]
-            .slice()
-            .sort((a, b) => b.fraction - a.fraction)
-            .slice(0, 20);
-        const canvasId = appendQCBinCard(container, idx, bin, 'Top 20 samples',
-            '<tr><th>Proband ID</th><th>% MV</th></tr>',
-            top20.map(item => {
-                const pct = (item.fraction * 100).toFixed(2) + '%';
-                return `<td title="${escapeHtml(item.sample_id)}">${renderMendelianWarning(item.sample_id)}${escapeHtml(item.sample_id)}</td><td>${pct}</td>`;
-            }));
-
-        // Create the chart after adding to DOM
-        createSingleBinChart(canvasId, binData[bin], globalMax);
-    });
-}
-
-// Create a single bin chart for center-aggregated data: one larger, purple dot per center
-function createCenterBinChart(canvasId, binData, yMax) {
-    const points = binData.map(item => ({
-        y: item.fraction,
-        center: item.center,
-        violations: item.violations,
-        total: item.total,
-        trios: item.trios
-    }));
-    return createSingleBinBoxPlotChart(canvasId, points, {
+// One larger, purple dot per center
+const CENTER_SECTION = {
+    dotOptions: {
         datasetLabel: 'Centers',
         backgroundColor: 'rgba(156, 39, 176, 0.6)',
         borderColor: 'rgba(156, 39, 176, 0.9)',
         pointRadius: 6,
         pointHoverRadius: 8,
-        yAxisTitle: '% MV',
-        yAxisRange: { min: 0, max: yMax },
-        yTickLabel: formatFractionTick,
         tooltipLines: point => [
             'Center: ' + (point.center || ''),
             'Trios: ' + point.trios,
             'Violations: ' + point.violations.toLocaleString() + ' / ' + point.total.toLocaleString(),
-            '% MV: ' + (point.y * 100).toFixed(2) + '%'
+            '% MV: ' + formatFractionAsPercent(point.y)
         ],
-    });
-}
+    },
+    tableTitle: 'All centers',
+    maxTableRows: Infinity,
+    tableHeaderHtml: '<tr><th>Center</th><th>Trios</th><th>% MV</th></tr>',
+    tableRowHtml: item => `<td>${escapeHtml(item.center)}</td><td>${item.trios}</td><td>${formatFractionAsPercent(item.fraction)}</td>`,
+};
 
-// Create all charts for center-aggregated data
-function createCenterChartsForSection(containerId, data, bins) {
+// Create all charts for a section: one box plot per bin, with one dot per row (a trio, or a center
+// for the center-aggregated sections) at its violation fraction, all on a shared y-axis scale.
+// `section` is TRIO_SECTION or CENTER_SECTION.
+function createChartsForSection(containerId, data, bins, section) {
     const container = document.getElementById(containerId);
-    container.innerHTML = '';
+    container.innerHTML = '';  // Clear any existing content
+
+    // A bin with total === 0 had no informative loci for that trio (or center). The API reports
+    // it as fraction 0 (violations / total if total > 0 else 0), which is indistinguishable from
+    // a measured 0% violation rate, so drop it rather than plotting a dot and folding it into the
+    // box statistics, percentiles and shared scale below.
+    const measured = data.filter(item => item.total > 0);
 
     // Group data by bin
     const binData = {};
     bins.forEach(bin => { binData[bin] = []; });
-    // Same zero-denominator exclusion as createChartsForSection: a center with no informative
-    // loci in a bin is not a measured 0%.
-    const measured = data.filter(item => item.total > 0);
     measured.forEach(item => {
-        if (binData[item.bin] !== undefined) {
-            binData[item.bin].push({
-                center: item.center,
-                fraction: item.fraction,
-                violations: item.violations,
-                total: item.total,
-                trios: item.trios
-            });
-        }
+        if (binData[item.bin] !== undefined) binData[item.bin].push(item);
     });
 
     // Compute global max across all bins for shared y-axis (round up to nearest 5%)
@@ -215,20 +161,22 @@ function createCenterChartsForSection(containerId, data, bins) {
     const maxFraction = allFractions.length > 0 ? Math.max(...allFractions) : 0;
     const globalMax = Math.ceil(maxFraction / 0.05) * 0.05 || 0.05;  // Round up to nearest 5%
 
-    // Create a chart for each bin, with a table of all its centers (sorted by fraction descending)
+    // Create a chart for each bin, with its table (sorted by fraction descending)
     bins.forEach((bin, idx) => {
-        const sortedData = binData[bin]
+        const tableRows = binData[bin]
             .slice()
-            .sort((a, b) => b.fraction - a.fraction);
-        const canvasId = appendQCBinCard(container, idx, bin, 'All centers',
-            '<tr><th>Center</th><th>Trios</th><th>% MV</th></tr>',
-            sortedData.map(item => {
-                const pct = (item.fraction * 100).toFixed(2) + '%';
-                return `<td>${escapeHtml(item.center)}</td><td>${item.trios}</td><td>${pct}</td>`;
-            }));
+            .sort((a, b) => b.fraction - a.fraction)
+            .slice(0, section.maxTableRows);
+        const canvasId = appendQCBinCard(container, idx, bin, section.tableTitle,
+            section.tableHeaderHtml, tableRows.map(section.tableRowHtml));
 
         // Create the chart after adding to DOM
-        createCenterBinChart(canvasId, binData[bin], globalMax);
+        const points = binData[bin].map(item => Object.assign({ y: item.fraction }, item));
+        createSingleBinBoxPlotChart(canvasId, points, Object.assign({
+            yAxisTitle: '% MV',
+            yAxisRange: { min: 0, max: globalMax },
+            yTickLabel: formatFractionTick,
+        }, section.dotOptions));
     });
 }
 
@@ -250,12 +198,12 @@ async function loadQC2Data() {
         document.getElementById('section-center-chrom').style.display = 'block';
 
         // Create per-sample charts
-        createChartsForSection('motif-charts-row', data.by_motif || [], MOTIF_BINS);
-        createChartsForSection('chrom-charts-row', data.by_chrom || [], CHROM_BINS);
+        createChartsForSection('motif-charts-row', data.by_motif || [], MOTIF_BINS, TRIO_SECTION);
+        createChartsForSection('chrom-charts-row', data.by_chrom || [], CHROM_BINS, TRIO_SECTION);
 
         // Create center-aggregated charts
-        createCenterChartsForSection('center-motif-charts-row', data.by_center_motif || [], MOTIF_BINS);
-        createCenterChartsForSection('center-chrom-charts-row', data.by_center_chrom || [], CHROM_BINS);
+        createChartsForSection('center-motif-charts-row', data.by_center_motif || [], MOTIF_BINS, CENTER_SECTION);
+        createChartsForSection('center-chrom-charts-row', data.by_center_chrom || [], CHROM_BINS, CENTER_SECTION);
 
     } catch (err) {
         console.error('QC2 load error:', err);

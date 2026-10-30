@@ -28,7 +28,7 @@ without mutating shared module state.
 """
 
 from allele_histograms import parse_genotype
-from locus_annotations import BLANK_STATUS_VALUES
+from analysis_columns import blank_to_none
 from motif_utilities import compute_canonical_motif, generate_all_canonical_motifs
 
 
@@ -180,27 +180,14 @@ def find_trios(sample_lookup):
     """
     trios = []
     for sample_id, row in sample_lookup.items():
-        maternal_id = _blank_to_empty(row.get("maternal_id"))
-        paternal_id = _blank_to_empty(row.get("paternal_id"))
-        if not maternal_id or not paternal_id:
+        maternal_id = blank_to_none(row.get("maternal_id"))
+        paternal_id = blank_to_none(row.get("paternal_id"))
+        if maternal_id is None or paternal_id is None:
             continue
+        maternal_id, paternal_id = str(maternal_id).strip(), str(paternal_id).strip()
         if maternal_id in sample_lookup and paternal_id in sample_lookup:
             trios.append((sample_id, maternal_id, paternal_id))
     return trios
-
-
-def _blank_to_empty(value):
-    """Return a stripped string for ``value``.
-
-    None and the BLANK_STATUS_VALUES spellings (which include a NaN's ``"nan"``)
-    become ``""``.
-    """
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if text.lower() in BLANK_STATUS_VALUES:
-        return ""
-    return text
 
 
 def _new_trio_stats():
@@ -232,19 +219,14 @@ def _keep_genotyped_trios(trios, locus_rows):
     Args:
         trios: List of ``(child_id, mother_id, father_id)`` tuples.
         locus_rows: The in-memory matrix rows, each with a ``genotypes`` dict.
+            ``input_tables.read_repeat_copy_numbers`` keys every row's dict by all
+            of the matrix's sample columns, so the first row names them all.
 
     Returns:
         A list of the trios all three of whose members appear as genotype
         columns, in the input order.
     """
-    pending = set(sample_id for trio in trios for sample_id in trio)
-    genotyped = set()
-    for locus_row in locus_rows:
-        if not pending:
-            break
-        for sample_id in [s for s in pending if s in locus_row["genotypes"]]:
-            pending.discard(sample_id)
-            genotyped.add(sample_id)
+    genotyped = set(locus_rows[0]["genotypes"]) if locus_rows else set()
 
     kept = []
     for trio in trios:
@@ -403,46 +385,56 @@ def _tally(stats, per_motif_stats, chrom_category, motif_size_category, canonica
             per_motif_stats[canonical_motif]["violations"] += 1
 
 
-def per_sample_columns():
-    """Return the ordered column names of the per-sample Mendelian-violation table.
+def _per_sample_row(child_id, stats):
+    """Return one trio child's row of the per-sample Mendelian-violation table.
 
-    The layout is ``sample_id``, then
-    ``{cat}_violations`` / ``{cat}_total`` for each of autosome, chrX, chrY,
-    chrM, then ``motif_{safecat}_violations`` / ``motif_{safecat}_total`` for
-    each motif-size category (with ``-`` -> ``_`` and ``+`` -> ``plus`` so
+    The keys, in column order, are ``sample_id``, then ``{cat}_violations`` /
+    ``{cat}_total`` for each of autosome, chrX, chrY, chrM, then
+    ``motif_{safecat}_violations`` / ``motif_{safecat}_total`` for each
+    motif-size category (with ``-`` -> ``_`` and ``+`` -> ``plus`` so
     ``7-24bp`` -> ``7_24bp`` and ``25+bp`` -> ``25plusbp``), then
-    ``total_violations`` and ``total_loci``.
+    ``total_violations`` and ``total_loci``. result_database.write_mendelian_tables
+    takes the table's column order from these keys.
+
+    Args:
+        child_id: The trio child's sample id.
+        stats: The by-chromosome / by-motif-size accumulator ``_process_trio`` returns.
 
     Returns:
-        A list of column-name strings.
+        dict: The row, keyed in column order.
     """
-    columns = ["sample_id"]
-    for chrom_category in ["autosome", "chrX", "chrY", "chrM"]:
-        columns.append(f"{chrom_category}_violations")
-        columns.append(f"{chrom_category}_total")
-    for motif_size_category in MOTIF_SIZE_CATEGORIES:
+    row = {"sample_id": child_id}
+    for chrom_category, counts in stats["by_chrom"].items():
+        row[f"{chrom_category}_violations"] = counts["violations"]
+        row[f"{chrom_category}_total"] = counts["total"]
+    for motif_size_category, counts in stats["by_motif_size"].items():
         safe_category = motif_size_category.replace("-", "_").replace("+", "plus")
-        columns.append(f"motif_{safe_category}_violations")
-        columns.append(f"motif_{safe_category}_total")
-    columns.append("total_violations")
-    columns.append("total_loci")
-    return columns
+        row[f"motif_{safe_category}_violations"] = counts["violations"]
+        row[f"motif_{safe_category}_total"] = counts["total"]
+    row["total_violations"] = sum(counts["violations"] for counts in stats["by_chrom"].values())
+    row["total_loci"] = sum(counts["total"] for counts in stats["by_chrom"].values())
+    return row
 
 
-def per_motif_columns():
-    """Return the ordered column names of the per-motif Mendelian-violation table.
+def _per_motif_row(child_id, per_motif_stats):
+    """Return one trio child's row of the per-motif Mendelian-violation table.
 
-    The layout is ``sample_id``, then ``mv_{motif}`` / ``total_{motif}`` for each
-    canonical 1-6bp motif (in sorted order).
+    The keys, in column order, are ``sample_id``, then ``mv_{motif}`` /
+    ``total_{motif}`` for each canonical 1-6bp motif in ALL_CANONICAL_MOTIFS
+    (sorted) order.
+
+    Args:
+        child_id: The trio child's sample id.
+        per_motif_stats: The canonical motif -> counts mapping ``_process_trio`` returns.
 
     Returns:
-        A list of column-name strings.
+        dict: The row, keyed in column order.
     """
-    columns = ["sample_id"]
+    row = {"sample_id": child_id}
     for motif in ALL_CANONICAL_MOTIFS:
-        columns.append(f"mv_{motif}")
-        columns.append(f"total_{motif}")
-    return columns
+        row[f"mv_{motif}"] = per_motif_stats[motif]["violations"]
+        row[f"total_{motif}"] = per_motif_stats[motif]["total"]
+    return row
 
 
 def compute_mendelian_violations(locus_rows, sample_lookup, threshold=2):
@@ -471,18 +463,12 @@ def compute_mendelian_violations(locus_rows, sample_lookup, threshold=2):
 
     Returns:
         A tuple ``(per_sample_rows, per_motif_rows)`` of two lists of dicts, one
-        dict per trio child, keyed by the column names from
-        ``per_sample_columns`` and ``per_motif_columns`` respectively. Both lists
-        are empty when there are no trios.
+        dict per trio child, laid out by ``_per_sample_row`` and ``_per_motif_row``
+        respectively. Both lists are empty when there are no trios.
     """
     trios = _keep_genotyped_trios(find_trios(sample_lookup), locus_rows)
     if not trios:
         return [], []
-
-    # The column names come from the two helpers rather than being rebuilt here, so the schema has
-    # one definition. The value lists below walk the same categories in the same order.
-    per_sample_column_names = per_sample_columns()
-    per_motif_column_names = per_motif_columns()
 
     # Derived once here rather than per trio: none of these values depends on the trio.
     prepared_loci = _prepare_loci(locus_rows)
@@ -492,34 +478,7 @@ def compute_mendelian_violations(locus_rows, sample_lookup, threshold=2):
     for child_id, mother_id, father_id in trios:
         stats, per_motif_stats = _process_trio(
             child_id, mother_id, father_id, prepared_loci, threshold)
-
-        per_sample_values = [child_id]
-        total_violations = 0
-        total_loci = 0
-        for chrom_category in ["autosome", "chrX", "chrY", "chrM"]:
-            per_sample_values.append(stats["by_chrom"][chrom_category]["violations"])
-            per_sample_values.append(stats["by_chrom"][chrom_category]["total"])
-            total_violations += stats["by_chrom"][chrom_category]["violations"]
-            total_loci += stats["by_chrom"][chrom_category]["total"]
-        for motif_size_category in MOTIF_SIZE_CATEGORIES:
-            per_sample_values.append(stats["by_motif_size"][motif_size_category]["violations"])
-            per_sample_values.append(stats["by_motif_size"][motif_size_category]["total"])
-        per_sample_values.append(total_violations)
-        per_sample_values.append(total_loci)
-
-        per_motif_values = [child_id]
-        for motif in ALL_CANONICAL_MOTIFS:
-            per_motif_values.append(per_motif_stats[motif]["violations"])
-            per_motif_values.append(per_motif_stats[motif]["total"])
-
-        if (len(per_sample_values) != len(per_sample_column_names)
-                or len(per_motif_values) != len(per_motif_column_names)):
-            raise AssertionError(
-                "Mendelian row values and column names have drifted: "
-                f"{len(per_sample_values)} vs {len(per_sample_column_names)} per-sample, "
-                f"{len(per_motif_values)} vs {len(per_motif_column_names)} per-motif")
-
-        per_sample_rows.append(dict(zip(per_sample_column_names, per_sample_values)))
-        per_motif_rows.append(dict(zip(per_motif_column_names, per_motif_values)))
+        per_sample_rows.append(_per_sample_row(child_id, stats))
+        per_motif_rows.append(_per_motif_row(child_id, per_motif_stats))
 
     return per_sample_rows, per_motif_rows

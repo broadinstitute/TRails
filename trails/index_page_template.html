@@ -449,30 +449,6 @@
     </div>
 </div>
 
-<!-- Edit Note Modal -->
-<div id="edit-note-modal" class="ui small modal">
-    <div class="header">Edit Note</div>
-    <div class="content">
-        <!-- Show existing note info if present -->
-        <div id="existing-note-section" style="display: none; margin-bottom: 12px;">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <span style="color: #888; font-size: 0.9em;">Last updated: <span id="note-updated-at"></span></span>
-                <button id="delete-note-btn" class="ui mini red basic button"><i class="trash icon"></i>Delete Note</button>
-            </div>
-        </div>
-        <div class="ui form">
-            <div class="field">
-                <label>Note</label>
-                <textarea id="note-textarea" rows="4" placeholder="Enter your note..."></textarea>
-            </div>
-        </div>
-    </div>
-    <div class="actions">
-        <div class="ui cancel button">Cancel</div>
-        <div class="ui primary ok button">Save</div>
-    </div>
-</div>
-
 {# Shared QC helpers (escapeHtml, renderMendelianWarning, the box-plot stats and the
    Mendelian-warning popup). Included rather than copied so a fix reaches every page. #}
 {% include "qc_shared_js.html" %}
@@ -483,10 +459,8 @@
 // =========================================================================
 
 $(document).ready(function() {
-    // Initialize all Semantic UI components
+    // Initialize the Semantic UI checkboxes and radios (the dropdowns get their own settings below)
     $('.ui.checkbox').checkbox();
-    $('.ui.radio.checkbox').checkbox();
-    $('.ui.dropdown').dropdown();
 
     // Help-text popups open on click of the (?) icon
     $('.help-popup').popup({ on: 'click' });
@@ -555,36 +529,12 @@ $(document).ready(function() {
     syncSortCheckboxes();
 
     // Mutual exclusion between include/exclude gene region checkboxes.
-    $('#filter-panel input[name^="gene_region_"]').on('change', function() {
-        const region = this.name.replace('gene_region_', '');
-        if ($(this).parent().checkbox('is checked')) {
-            $(`input[name="exclude_gene_region_${region}"]`).parent().checkbox('uncheck');
-        }
-    });
-    $('#filter-panel input[name^="exclude_gene_region_"]').on('change', function() {
-        const region = this.name.replace('exclude_gene_region_', '');
-        if ($(this).parent().checkbox('is checked')) {
-            $(`input[name="gene_region_${region}"]`).parent().checkbox('uncheck');
-        }
-    });
+    linkGeneRegionIncludeAndExcludeCheckboxes('');
 
     // Close error message
     $('#error-message .close').on('click', function() {
         $(this).closest('.ui.message').hide();
     });
-
-    // Update the total loci count for the database being viewed
-    function updateTotalLociCount() {
-        fetch(`${API_BASE_URL}/schema?source=${encodeURIComponent(currentState.source)}`)
-            .then(r => r.json())
-            .then(data => {
-                let counts = `${data.total_loci.toLocaleString()} loci`;
-                if (data.total_samples != null) {
-                    counts += `, ${data.total_samples.toLocaleString()} samples`;
-                }
-                $('#total-loci-label').text(counts);
-            });
-    }
 
     // Initialize tag dropdown
     $('#tag-filter').dropdown({
@@ -597,7 +547,7 @@ $(document).ready(function() {
     // selects the saved tag by value, and a 'set selected' for a value the menu does not contain
     // yet is a silent no-op, so the next Search or Export (both re-read the dropdown through
     // readStateFromUI) would drop the tag.
-    const tagDropdownReady = populateTagDropdown();
+    const tagDropdownReady = refreshTagFilterDropdown($('#tag-filter'));
 
     // Initialize the Group Results By sort dropdown. Choosing a column also picks its natural
     // direction (GROUP_SORT_NATURAL_DIRECTIONS), which the ASC / DESC radios can then override.
@@ -625,7 +575,18 @@ $(document).ready(function() {
         maxResults: 10,
     });
 
-    Promise.all([tagDropdownReady, populateSampleIdDropdown()]).then(() => {
+    // One /api/v1/schema request fills both the sample-ID menu and the loci / samples count
+    const sampleIdDropdownReady = fetchJsonOrNull(`${API_BASE_URL}/schema`, 'Load schema').then(schema => {
+        if (!schema) return;
+        fillSampleIdDropdown($('#sample-id-filter'), schema);
+        let counts = `${schema.total_loci.toLocaleString()} loci`;
+        if (schema.total_samples != null) {
+            counts += `, ${schema.total_samples.toLocaleString()} samples`;
+        }
+        $('#total-loci-label').text(counts);
+    });
+
+    Promise.all([tagDropdownReady, sampleIdDropdownReady]).then(() => {
         // Read URL state and perform initial search after dropdowns are populated
         readStateFromUrl();
         // A server started with --initial-require-above-population (e.g. for a short-read callset) opens a URL
@@ -637,7 +598,6 @@ $(document).ready(function() {
             applyStateToUI();
             replaceStateInUrl();
         }
-        updateTotalLociCount();
         performSearch();
     });
 });
@@ -761,28 +721,28 @@ function readStateFromUrl() {
         }
     }
 
-    // Legacy URLs: the Gene Symbol(s), Gene ID, Locus Id(s) and Reference Region boxes were
-    // merged into one search field, so fold those parameters into it and an old bookmark
-    // still finds its loci with the UI showing what it filtered on. They stay valid API
-    // parameters for anyone calling /api/v1/loci directly. The search box keeps a locus that
-    // matches any of its terms, so a bookmark with several of them keeps a locus that matches any one.
-    // locus_id and gene_symbol were comma-separated lists, so they split. reference_region and
-    // gene_id each held a single value, and a region may itself contain comma thousands
-    // separators ("chr16:11,579,459-11,579,529"), so splitting those would shred the coordinates.
-    const legacyTerms = [
+    // A URL may also carry locus_id, gene_symbol, reference_region or gene_id, the /api/v1/loci
+    // parameters the search box covers (they stay valid for anyone calling the API directly).
+    // Fold them into the search box, so such a URL finds its loci with the UI showing what it
+    // filtered on. The search box keeps a locus that matches any of its terms, so a URL with
+    // several of them keeps a locus that matches any one. locus_id and gene_symbol are
+    // comma-separated lists, so they split. reference_region and gene_id each hold a single
+    // value, and a region may itself contain comma thousands separators
+    // ("chr16:11,579,459-11,579,529"), so splitting those would shred the coordinates.
+    const searchTermsFromLocusParameters = [
         ...['locus_id', 'gene_symbol'].flatMap(name => (params.get(name) || '').split(',')),
         ...['reference_region', 'gene_id'].map(name => params.get(name) || ''),
     ].map(term => term.trim()).filter(Boolean);
-    if (legacyTerms.length) {
-        currentState.search = [currentState.search, ...legacyTerms].filter(Boolean).join(', ');
+    if (searchTermsFromLocusParameters.length) {
+        currentState.search = [currentState.search, ...searchTermsFromLocusParameters].filter(Boolean).join(', ');
     }
 
-    // Normalize the arrival hash in place whenever it is not the canonical one: a legacy hash, or
-    // one with a parameter the page no longer has (e.g. min_pli in a bookmark) or that has no
-    // effect (e.g. group_sort with no grouped view). writeStateToUrl would otherwise push the
-    // canonical URL as a new entry, so Back would land on the old hash, normalize it again, and
-    // push forward again, trapping the user on this page. This does nothing when the hash is
-    // already canonical.
+    // Normalize the arrival hash in place whenever it is not the canonical one: one whose
+    // locus parameters were just folded into the search box, one with a parameter the page does
+    // not use (e.g. min_pli) or one with a parameter that has no effect (e.g. group_sort with no
+    // grouped view). writeStateToUrl would otherwise push the canonical URL as a new entry, so
+    // Back would land on the arrival hash, normalize it again, and push forward again, trapping
+    // the user on this page. This does nothing when the hash is already canonical.
     replaceStateInUrl();
 
     applyStateToUI();
@@ -1049,7 +1009,6 @@ function describeFetchError(error) {
     return (error && error.message) || 'Search failed.';
 }
 
-// Perform Search
 // Sync the column-header sort indicator with the active sort: the header of every field in the
 // multi-key sort list gets it, and a field with no header column (e.g. Pairwise Pheno Similarity)
 // adds none of its own. Header clicks, the Sort By checkboxes and pills, clear-all, and chip
@@ -1449,7 +1408,7 @@ function renderGeneRegionChart(regionCounts) {
                 label: 'Loci count',
                 data: data,
                 backgroundColor: colors,
-                borderColor: colors.map(c => c),
+                borderColor: colors,
                 borderWidth: 1,
                 barThickness: 20
             }]
@@ -1742,7 +1701,7 @@ function renderLocusRow(locus, rowIndex) {
     const popMetric = currentState.population_metric === 'max' ? 'MaxAllele' : '99thPercentile';
     const popPrefixes = currentState.require_above_population === 'short-read' ? ['TenK10K']
         : currentState.require_above_population === 'long-read' ? ['HPRC256', 'AoU1027']
-        : ['HPRC256', 'AoU1027', 'TenK10K'];
+        : POPULATION_COHORTS;
     const popMaxVal = Math.max(
         ...popPrefixes.map(p => locus[`${p}_${popMetric}`]).filter(v => v != null), -Infinity
     );
@@ -1816,13 +1775,8 @@ function renderLocusRow(locus, rowIndex) {
     } else {
         locusIdDisplay = locusIdText;
     }
-    // Tag badges (user tags only)
-    const userTagBadges = (locus.tags || []).map(t => `<span class="badge badge-tag">${escapeHtml(t)}</span>`).join(' ');
-    const noteIcon = locus.has_note ? '<span class="note-indicator" title="Has note"><i class="sticky note outline icon"></i></span>' : '';
-    // Combine badges: user tags + known motif + note icon (all on same row). There are no
-    // system-tag badges: /api/v1/annotations/tags always returns an empty system_tags list.
-    // Wrap user tags + note icon in span.annotation-badges for easy refresh
-    const dynamicBadges = (userTagBadges || noteIcon) ? `<span class="annotation-badges">${userTagBadges}${noteIcon}</span>` : '';
+    // Combine badges: tags + note icon, then known motif and known locus (all on same row)
+    const dynamicBadges = renderAnnotationBadges(locus.tags || [], locus.has_note);
     const badgesRow = (dynamicBadges || knownBadge || knownLocusBadge)
         ? `<div class="cell-sub badges-row">${dynamicBadges}${knownBadge}${knownLocusBadge}</div>`
         : '';
@@ -1927,10 +1881,9 @@ function renderLocusRow(locus, rowIndex) {
         vcCell = `<i class="times circle outline icon" style="color: ${vcReasonColor};" title="${escapeHtml(vcReasonTitle)}"></i>`;
     }
 
-    // UCSC link
-    const ucscUrl = 'https://genome.ucsc.edu/cgi-bin/hgTracks?db=hg38&position='
-        + encodeURIComponent(locus.Chrom + ':' + (locus.Start0Based + 1) + '-' + locus.End1Based);
-    const ucscLink = (locus.Chrom && locus.Start0Based != null && locus.End1Based != null)
+    // UCSC link (buildUcscUrl in header_template.html, shared with the swim plot)
+    const ucscUrl = buildUcscUrl(locus);
+    const ucscLink = ucscUrl
         ? `<a href="${escapeHtml(ucscUrl)}" target="_blank" title="UCSC Genome Browser" style="color: #999; font-size: 0.8em;">UCSC</a>`
         : '';
 
@@ -2082,8 +2035,7 @@ function isAffectedUnsolvedSample(s) {
 }
 
 function renderLocusDetail(detail, outlierType) {
-    const otMap = {all: 'AllAlleles', short: 'ShortAlleles', hemi: 'HemizygousAlleles'};
-    const ot = otMap[outlierType];
+    const ot = OUTLIER_TYPE_MAP[outlierType];
     const samples = (detail.outlier_samples[ot] || []).slice();
     const annotations = detail.annotations || {};
     const popThresholds = annotations.population_thresholds || {};
@@ -2095,20 +2047,16 @@ function renderLocusDetail(detail, outlierType) {
 
     // Threshold values
     const firstUnaffected = locus[`FirstUnaffectedAlleleSize_${ot}`];
-    // [display name, population_thresholds key prefix]. 90thPercentile is absent
-    // for HPRC256/TenK10K (no source data) and renders as "p90=?".
-    const popEntries = [
-        ['HPRC256', 'HPRC256'],
-        ['AoU1027', 'AoU1027'],
-        ['TenK10K', 'TenK10K'],
-    ].map(([name, k]) => ({
+    // Only cohorts with data (max != null) are shown. 90thPercentile is absent for
+    // HPRC256/TenK10K (no source data) and renders as "p90=?".
+    const popEntries = POPULATION_COHORTS.map(name => ({
         name,
-        max:    popThresholds[`${k}_MaxAllele`],
-        p99:    popThresholds[`${k}_99thPercentile`],
-        p90:    popThresholds[`${k}_90thPercentile`],
-        median: popThresholds[`${k}_Median`],
-        mode:   popThresholds[`${k}_Mode`],
-        stdev:  popThresholds[`${k}_Stdev`],
+        max:    popThresholds[`${name}_MaxAllele`],
+        p99:    popThresholds[`${name}_99thPercentile`],
+        p90:    popThresholds[`${name}_90thPercentile`],
+        median: popThresholds[`${name}_Median`],
+        mode:   popThresholds[`${name}_Mode`],
+        stdev:  popThresholds[`${name}_Stdev`],
     })).filter(e => e.max != null);
     const pathogenicMin = knownDisease ? knownDisease.pathogenic_min : null;
 
@@ -2196,20 +2144,14 @@ function renderLocusDetail(detail, outlierType) {
     </div>`;
 
     // Per-sample table
-    const hasPurity = samples.some(s => s.purity != null);
-    const hasMethylation = samples.some(s => s.methylation != null);
     const hasSex = samples.some(s => s.sex);
     let colCount = 7;
     if (hasSex) colCount++;
-    if (hasPurity) colCount++;
-    if (hasMethylation) colCount++;
 
     html += '<table class="sample-subtable"><thead><tr>';
     html += '<th>Allele</th><th>Motif</th>';
     if (hasSex) html += '<th>Sex</th>';
     html += '<th>Sample ID</th><th>Family</th><th>Status</th><th>Analysis</th><th>Phenotype</th>';
-    if (hasPurity) html += '<th>Purity</th>';
-    if (hasMethylation) html += '<th>Methyl</th>';
     html += '</tr></thead><tbody>';
 
     // Build threshold list sorted by value descending so markers appear in the
@@ -2270,8 +2212,6 @@ function renderLocusDetail(detail, outlierType) {
         html += `<td>${escapeHtml(s.affected_status || '')}</td>`;
         html += `<td>${escapeHtml(s.analysis_status || '')}</td>`;
         html += `<td style="white-space: normal; max-width: 400px;">${phenTrunc}</td>`;
-        if (hasPurity) html += `<td>${s.purity != null ? s.purity.toFixed(2) : ''}</td>`;
-        if (hasMethylation) html += `<td>${s.methylation != null ? s.methylation.toFixed(2) : ''}</td>`;
         html += '</tr>';
     }
 
@@ -2622,8 +2562,8 @@ function goToPage(page) {
 }
 
 // =========================================================================
-// Annotation CRUD Functions (the write helpers saveNote, deleteNote, addTag and removeTag are in
-// header_template.html, shared with the swim plot)
+// Annotation CRUD Functions (the note editor openNoteEditor and the write helpers addTag and
+// removeTag are in header_template.html, shared with the swim plot)
 // =========================================================================
 
 // Under a grouped row, highlight that row's sample (or its family's samples) in the locus's detail
@@ -2655,9 +2595,15 @@ async function refreshDetailPanel(locusId) {
     } catch (error) {
         console.error('Refresh detail error:', error);
     }
+}
 
-    // Also refresh the table row's tag/note badges
-    refreshRowAnnotations(locusId);
+// The locus cell's tag badges and note icon, wrapped in span.annotation-badges so
+// refreshRowAnnotations can swap them after an edit; '' when the locus has neither. Shared by
+// renderLocusRow and refreshRowAnnotations, so a repainted row looks like a freshly loaded one.
+function renderAnnotationBadges(tags, hasNote) {
+    const tagBadges = tags.map(t => `<span class="badge badge-tag">${escapeHtml(t)}</span>`).join(' ');
+    const noteIcon = hasNote ? '<span class="note-indicator" title="Has note"><i class="sticky note outline icon"></i></span>' : '';
+    return (tagBadges || noteIcon) ? `<span class="annotation-badges">${tagBadges}${noteIcon}</span>` : '';
 }
 
 async function refreshRowAnnotations(locusId) {
@@ -2670,11 +2616,7 @@ async function refreshRowAnnotations(locusId) {
         const $badgesRow = $locusCell.find('.badges-row');
 
         // Build new tag badges and note icon
-        const tags = ann.tags || [];
-        const hasNote = ann.note != null;
-        const tagBadges = tags.map(t => `<span class="badge badge-tag">${escapeHtml(t)}</span>`).join(' ');
-        const noteIcon = hasNote ? '<span class="note-indicator" title="Has note"><i class="sticky note outline icon"></i></span>' : '';
-        const newContent = (tagBadges || noteIcon) ? `<span class="annotation-badges">${tagBadges}${noteIcon}</span>` : '';
+        const newContent = renderAnnotationBadges(ann.tags || [], ann.note != null);
 
         // Update or create the badges row
         if ($badgesRow.length) {
@@ -2692,153 +2634,20 @@ async function refreshRowAnnotations(locusId) {
     }
 }
 
-// Populate the tag filter dropdown, and the cached tag list the add-tag modal offers, from the API
-async function populateTagDropdown() {
-    try {
-        const response = await fetch(`${API_BASE_URL}/annotations/tags`);
-        if (!response.ok) return;
-        const data = await response.json();
-        window._allTagsList = data.tags || [];
-        const $dropdown = $('#tag-filter');
-        const currentVal = $dropdown.dropdown('get value');
-
-        // Build menu items for div-based dropdown
-        const values = [];
-
-        // Raw, unescaped strings — setupDropdownMenu (qc_shared_js.html) is what makes them
-        // safe to render while keeping data-value equal to the stored tag. Only user tags:
-        // /api/v1/annotations/tags always returns an empty system_tags list.
-        (data.tags || []).forEach(tag => {
-            values.push({ name: tag, value: tag });
-        });
-
-        setupDropdownMenu($dropdown, values);
-        if (currentVal) $dropdown.dropdown('set selected', currentVal);
-    } catch (e) {
-        console.error('Populate tags error:', e);
-    }
+// After a note is saved or deleted: update the row's badges and, if open, its detail panel
+// (refreshDetailPanel does nothing when the panel is closed)
+function refreshAfterNoteChange(locusId) {
+    refreshRowAnnotations(locusId);
+    refreshDetailPanel(locusId);
 }
 
-// Populate sample ID dropdown from schema API
-async function populateSampleIdDropdown() {
-    try {
-        const response = await fetch(`${API_BASE_URL}/schema`);
-        if (!response.ok) return;
-        const data = await response.json();
-        const values = (data.sample_ids || []).map(id => ({ name: id, value: id }));
-        setupDropdownMenu($('#sample-id-filter'), values);
-    } catch (e) {
-        console.error('Populate sample IDs error:', e);
-    }
-}
-
-// Monotonic sequence for the note modal. There is one shared modal, one shared textarea and one
-// shared locus-id, so a slow annotation fetch for an earlier locus must not overwrite them after
-// the user has opened a different locus: only the newest click commits its response.
-let noteModalSeq = 0;
-
-// Click handler for Edit Notes button and note icon
-$(document).on('click', '.add-note-btn, .note-indicator', async function() {
+// Edit Notes button and note icon open the shared note editor (openNoteEditor, header_template.html)
+$(document).on('click', '.add-note-btn, .note-indicator', function() {
     const locusId = $(this).data('locus-id') || $(this).closest('tr.locus-row').data('locus-id');
-    const $modal = $('#edit-note-modal');
-    const $textarea = $('#note-textarea');
-    const $existingSection = $('#existing-note-section');
-    const $updatedAt = $('#note-updated-at');
-    const seq = ++noteModalSeq;
-
-    // Fetch existing note for this locus. The editor must not open until that text is known:
-    // the Save handler replaces the stored note with whatever the textarea holds, so an empty
-    // textarea shown over an existing note destroys it on save.
-    try {
-        const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}`);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        if (seq !== noteModalSeq) return;  // a newer click already owns the modal
-
-        // Store locusId on modal for save handler, together with the text it belongs to.
-        $modal.data('locus-id', locusId);
-        if (data.note && data.note.note_text) {
-            $textarea.val(data.note.note_text);
-            $updatedAt.text(data.note.updated_at || '');
-            $existingSection.show();
-        } else {
-            $textarea.val('');
-            $existingSection.hide();
-        }
-    } catch (e) {
-        if (seq !== noteModalSeq) return;
-        // Deliberately no empty-editor fallback: the locus may well have a note, and saving over
-        // it would replace it with whatever the user typed. Report the failure and stay closed.
-        console.error('Load note error:', e);
-        alert('Failed to load the existing note: ' + e.message + '\n\nThe note was not opened for editing.');
-        return;
-    }
-
-    // Show the modal
-    $modal
-        .modal({
-            onApprove: function() {
-                const noteText = $textarea.val().trim();
-                const currentLocusId = $modal.data('locus-id');
-
-                if (!noteText) {
-                    // If empty, just close (don't save empty note)
-                    return true;
-                }
-
-                // Semantic UI reads this return value synchronously, and an async function hands
-                // it a Promise, which is truthy: the modal would close before the save resolved,
-                // onHidden would clear the textarea, and a failed save would silently discard
-                // what the user typed. Hold the modal open and close it once the save succeeds.
-                saveNote(currentLocusId, noteText).then(function() {
-                    refreshRowAnnotations(currentLocusId);
-                    // Refresh detail panel if open
-                    const $detailRow = $(`tr.locus-row[data-locus-id="${currentLocusId}"]`).next('.locus-detail-row');
-                    if ($detailRow.length) {
-                        refreshDetailPanel(currentLocusId);
-                    }
-                    $modal.modal('hide');
-                }).catch(function(e) {
-                    alert('Failed to save note: ' + e.message);
-                });
-                return false;
-            },
-            onHidden: function() {
-                $textarea.val('');
-                $existingSection.hide();
-            }
-        })
-        .modal('show');
+    openNoteEditor(locusId, refreshAfterNoteChange);
 });
 
-// Delete note button inside the modal
-$(document).on('click', '#delete-note-btn', async function() {
-    const $modal = $('#edit-note-modal');
-    const locusId = $modal.data('locus-id');
-
-    if (!confirm('Delete this note?')) return;
-
-    try {
-        await deleteNote(locusId);
-
-        // Clear the modal UI
-        $('#note-textarea').val('');
-        $('#existing-note-section').hide();
-
-        // Update row badges immediately
-        refreshRowAnnotations(locusId);
-
-        // Refresh detail panel if open
-        const $detailRow = $(`tr.locus-row[data-locus-id="${locusId}"]`).next('.locus-detail-row');
-        if ($detailRow.length) {
-            refreshDetailPanel(locusId);
-        }
-    } catch (e) {
-        alert('Failed to delete note: ' + e.message);
-    }
-});
-
-// Same stale-response guard as the note modal: one shared tag modal, an awaited fetch, so a
+// Same stale-response guard as the note editor (openNoteEditor): one shared tag modal, an awaited fetch, so a
 // slow response for an earlier locus must not repopulate it after a newer locus was opened.
 let tagModalSeq = 0;
 
@@ -2889,10 +2698,10 @@ $(document).on('click', '.add-tag-btn', async function() {
 
                 // Prevent modal from closing - we'll close it manually after async operation
                 addTag(locusId, tag).then(function() {
+                    // The row's badges show the tags; the detail panel does not, so it stays as is
                     refreshRowAnnotations(locusId);
-                    refreshDetailPanel(locusId);
                     // Also refreshes the cached tag list this modal offers
-                    populateTagDropdown();
+                    refreshTagFilterDropdown($('#tag-filter'));
                     resetDropdown();
                     $modal.modal('hide');
                 }).catch(function(e) {
@@ -2965,7 +2774,7 @@ $(document).on('click', '.delete-modal-tag', async function() {
         refreshRowAnnotations(locusId);
 
         // Update tag filter dropdown and the cached tag list (in case tag is now unused)
-        populateTagDropdown();
+        refreshTagFilterDropdown($('#tag-filter'));
 
         // If the tag just removed is the one the results are filtered by, this locus no longer
         // belongs in them. Repainting the badges alone would leave it sitting in a list it no
@@ -2979,7 +2788,6 @@ $(document).on('click', '.delete-modal-tag', async function() {
     }
 });
 
-// Click handler for Known Locus badge popup
 // Lightweight transient toast. Self-contained so it does not depend on the
 // Semantic UI toast module being bundled (it is not on this page).
 function showToast(message, type) {
@@ -2994,6 +2802,7 @@ function showToast(message, type) {
     setTimeout(() => $toast.fadeOut(300, () => $toast.remove()), 3000);
 }
 
+// Click handler for Known Locus badge popup
 $(document).on('click', '.badge-known-locus', async function(e) {
     e.stopPropagation();
     const locusId = $(this).data('locus-id');

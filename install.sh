@@ -189,9 +189,8 @@ echo "Installing Python dependencies..."
 # pyhpo only sharpens phenotype scoring (phenotype_scoring falls back to Jaccard without it), so a
 # failure here must not abort the install the way a required dependency would. Installed by name
 # rather than from a requirements file, so it cannot fail the required set alongside it.
-"$VENV_PYTHON" -m pip install pyhpo requests \
-  || echo "  note: optional packages not installed; phenotype scoring will use Jaccard
-          similarity and the opt-in STRchive fetch will be unavailable"
+"$VENV_PYTHON" -m pip install pyhpo \
+  || echo "  note: optional package pyhpo not installed; phenotype scoring will use Jaccard similarity"
 echo ""
 
 # --- Public (class-A) reference data ------------------------------------------------

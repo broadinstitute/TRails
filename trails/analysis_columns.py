@@ -24,14 +24,18 @@ Two behaviors worth calling out, both load-bearing:
     affecteds (the deliberate "include unknowns alongside affecteds" policy).
 """
 
-import collections
-
 
 # The three outlier types used throughout the analysis.
 OUTLIER_TYPES = ["AllAlleles", "ShortAlleles", "HemizygousAlleles"]
 
 # Outlier-field values that should be treated as "no outlier data".
 MISSING_OUTLIER_STRINGS = {"", "NA", "N/A", "nan", "NaN", "None", "null"}
+
+# Lower-cased, stripped cell values that mean "nothing was recorded" in a sample-metadata
+# column (family_id, sex, affected_status, analysis_status, maternal_id, ...). Defined here,
+# in a module with no third-party imports, so every module that reads sample metadata, and
+# the results server, can share it. Most code tests a value with blank_to_none instead.
+BLANK_STATUS_VALUES = {"", "nan", "none", "na", "n/a", "null"}
 
 # The cohorts whose 99th percentiles gate the NumAffectedUnsolved* counts and the phenotype
 # scores by default (get_population_p99_threshold): the long-read
@@ -61,16 +65,21 @@ def blank_to_none(value):
     """Return None for a missing or blank value, else the value unchanged.
 
     read_sample_metadata reads with keep_default_na=False, so an empty metadata cell
-    arrives as '' rather than None or NaN. This maps all three, and a whitespace-only
-    string, to None, so every table stores a blank metadata field as NULL.
+    arrives as '' and a cell written as NA, N/A, null, ... arrives as that string. This
+    maps None, a float NaN and every BLANK_STATUS_VALUES spelling to None, so every table
+    stores a blank metadata field as NULL, and samples whose family_id cells all say "NA"
+    are not counted as one family.
 
     Args:
         value: A metadata value (a string, None, or a float NaN).
 
     Returns:
-        None for None, a float NaN, or a string that is empty after stripping; otherwise value.
+        None for None, a float NaN, or a string whose stripped, lower-cased form is in
+        BLANK_STATUS_VALUES (which includes the empty string); otherwise value.
     """
-    if is_none_or_nan(value) or (isinstance(value, str) and not value.strip()):
+    if is_none_or_nan(value):
+        return None
+    if isinstance(value, str) and value.strip().lower() in BLANK_STATUS_VALUES:
         return None
     return value
 
@@ -95,13 +104,11 @@ def is_missing_outlier_value(value):
 
 
 def parse_outlier_entries(value, locus_id=None, column=None):
-    """Parse an outlier string into (allele_size, sample_id, purity, methylation) tuples.
+    """Parse an outlier string into (allele_size, sample_id) pairs.
 
-    The outlier string is a comma-separated list of
-    ``"{allele}x:{sample_id}[:{purity}[:{methylation}]]"`` entries. The trailing
-    ``x`` on the allele is stripped before the int conversion. Purity and
-    methylation are optional fourth/third fields; a literal ``"."`` (or an
-    absent field) becomes None.
+    The outlier string is a comma-separated list of ``"{allele}x:{sample_id}"``
+    entries, the format ``allele_histograms.convert_sample_ids_to_string`` writes.
+    The trailing ``x`` on the allele is stripped before the int conversion.
 
     Entries are sorted DESCENDING by allele size, so downstream consumers that
     rely on traversal order (First/Second/Third affected, the above-unaffected
@@ -114,13 +121,13 @@ def parse_outlier_entries(value, locus_id=None, column=None):
         column: Optional column name, used only to enrich error messages.
 
     Returns:
-        A list of ``(allele_size, sample_id, purity, methylation)`` tuples sorted
-        descending by allele_size. ``allele_size`` is an int; ``sample_id`` is a
-        string; ``purity`` and ``methylation`` are strings or None.
+        A list of ``(allele_size, sample_id)`` pairs sorted descending by
+        allele_size. ``allele_size`` is an int; ``sample_id`` is a string.
 
     Raises:
-        ValueError: If an entry has fewer than two ``:``-separated fields, or if
-            the allele field is not an integer (after stripping ``x``).
+        ValueError: If an entry does not have exactly two ``:``-separated fields
+            (a sample_id cannot contain ``:``), or if the allele field is not an
+            integer (after stripping ``x``).
     """
     if is_missing_outlier_value(value):
         return []
@@ -131,25 +138,22 @@ def parse_outlier_entries(value, locus_id=None, column=None):
     entries = []
     for raw_entry in [part for part in value.split(",") if part]:
         fields = raw_entry.split(":")
-        if len(fields) < 2:
+        if len(fields) != 2:
             raise ValueError(
-                f"Malformed outlier entry (expected 'allele:sample_id:...')"
+                f"Malformed outlier entry (expected 'allele:sample_id')"
                 f"{' in ' + column if column else ''}"
                 f"{' for LocusId ' + str(locus_id) if locus_id else ''}: {raw_entry}"
             )
-        sample_id = fields[1]
+        allele_field, sample_id = fields
         try:
-            allele_size = int(fields[0].replace("x", ""))
+            allele_size = int(allele_field.replace("x", ""))
         except ValueError as exception:
             raise ValueError(
                 f"Malformed allele size in outlier entry"
                 f"{' in ' + column if column else ''}"
                 f"{' for LocusId ' + str(locus_id) if locus_id else ''}: {raw_entry}"
             ) from exception
-
-        purity = fields[2] if len(fields) > 2 and fields[2] != "." else None
-        methylation = fields[3] if len(fields) > 3 and fields[3] != "." else None
-        entries.append((allele_size, sample_id, purity, methylation))
+        entries.append((allele_size, sample_id))
 
     entries.sort(key=lambda entry: entry[0], reverse=True)
     return entries
@@ -274,13 +278,12 @@ def find_affected_unsolved_samples_above_unaffected(row, affected_lookup, analys
                                                     population_gate_cohorts=POPULATION_P99_GATE_COHORTS):
     """Find the affected/unsolved samples above any unaffected/solved sample, per outlier type.
 
-    For each outlier type, walking the entries largest-allele-first:
-      1. Collect affected/unsolved sample ids per allele size, in the order the
-         entries list them, stopping at the FIRST unaffected/solved sample.
-      2. Keep the affected sample ids over allele sizes from largest to smallest,
-         stopping when an allele has an unaffected/solved sample (a tie is NOT
-         "above") OR when the allele size is <= the population p99 threshold. A
-         sample whose two alleles both pass keeps its larger one, so it counts once.
+    For each outlier type, the entries are walked largest-allele-first, keeping each
+    affected/unsolved sample at the first (largest) allele it appears with, so a
+    sample whose two alleles both pass counts once. The walk stops at the first
+    allele size <= the population p99 threshold, or at the FIRST unaffected/solved
+    sample, whose allele size is then dropped too: an affected sample tied with it
+    is not "above" it.
 
     These are the samples NumAffectedUnsolvedSamplesAboveUnaffected counts, and their
     families are the ones NumAffectedUnsolvedFamiliesAboveUnaffected counts (see
@@ -312,29 +315,17 @@ def find_affected_unsolved_samples_above_unaffected(row, affected_lookup, analys
         if is_missing_outlier_value(row.get(f"OutlierSampleIds_{outlier_type}")):
             continue
 
-        # The inner dicts are ordered sets (values unused), so samples that share an allele
-        # size keep the entries' order and the result does not depend on set iteration order.
-        allele_size_to_affected_unsolved_samples = collections.defaultdict(dict)
-        allele_size_to_unaffected_or_solved_sample_count = collections.Counter()
-
-        for allele_size, outlier_sample_id, _, _ in parsed_by_type[outlier_type]:
+        sample_to_allele_size = {}
+        for allele_size, outlier_sample_id in parsed_by_type[outlier_type]:
+            if population_p99_threshold is not None and allele_size <= population_p99_threshold:
+                break
             if is_unaffected_or_solved_status(
                 affected_lookup.get(outlier_sample_id), analysis_lookup.get(outlier_sample_id),
             ):
-                allele_size_to_unaffected_or_solved_sample_count[allele_size] += 1
+                sample_to_allele_size = {sample_id: size for sample_id, size in sample_to_allele_size.items()
+                                         if size != allele_size}
                 break
-            allele_size_to_affected_unsolved_samples[allele_size][outlier_sample_id] = None
-
-        sample_to_allele_size = {}
-        for allele_size, sample_ids in sorted(
-            allele_size_to_affected_unsolved_samples.items(), reverse=True
-        ):
-            if allele_size_to_unaffected_or_solved_sample_count[allele_size] > 0:
-                break
-            if population_p99_threshold is not None and allele_size <= population_p99_threshold:
-                break
-            for sample_id in sample_ids:
-                sample_to_allele_size.setdefault(sample_id, allele_size)
+            sample_to_allele_size.setdefault(outlier_sample_id, allele_size)
 
         samples_for_each_outlier_type[outlier_type_index] = sample_to_allele_size
 
@@ -413,12 +404,12 @@ def collect_samples_single_pass(outlier_entries, sample_lookup, affected_lookup,
     ``parse_outlier_entries`` returns them), so the first affected sample carries
     the largest affected allele. Two dedup modes are computed simultaneously:
     by sample_id (dedup on sample_id) and by family_id (dedup on family_id,
-    skipping entries with a missing family_id). For each mode the first 3 affected
-    and first 2 unaffected samples are kept.
+    skipping entries without one, as ``get_family_id`` decides). For each mode the
+    first 3 affected and first 2 unaffected samples are kept.
 
     Args:
-        outlier_entries: A list of ``(allele_size, sample_id, purity, methylation)``
-            tuples sorted descending by allele size.
+        outlier_entries: A list of ``(allele_size, sample_id)`` pairs sorted
+            descending by allele size.
         sample_lookup: Mapping of sample_id -> sample row dict (carries family_id
             and phenotype_description). A sample id absent here is still ranked
             (treated as Unknown); it is only left out of the family-level ranking,
@@ -429,7 +420,8 @@ def collect_samples_single_pass(outlier_entries, sample_lookup, affected_lookup,
     Returns:
         dict: ``{"sample_id": {"affected": [...], "unaffected": [...]},
         "family_id": {"affected": [...], "unaffected": [...]}}`` where each item
-        is a dict with keys allele_size, sample_id, family_id, phenotype.
+        is a dict with keys allele_size, sample_id, family_id, phenotype. family_id
+        and phenotype are None when blank (``get_family_id``, ``blank_to_none``).
     """
     results = {
         "sample_id": {"affected": [], "unaffected": []},
@@ -438,17 +430,15 @@ def collect_samples_single_pass(outlier_entries, sample_lookup, affected_lookup,
     seen_sample_ids = {"affected": set(), "unaffected": set()}
     seen_family_ids = {"affected": set(), "unaffected": set()}
 
-    for allele_size, sample_id, _, _ in outlier_entries:
+    for allele_size, sample_id in outlier_entries:
         # A matrix sample with no metadata row is kept (treated as Unknown), not
         # dropped: build_database admits such samples, the affected/unaffected
         # counters already count them, and the affected_lookup/analysis_lookup
         # gates below default to "" (-> affected). Only the family-level ranking
         # is skipped for them, since they have no family_id.
         sample_row = sample_lookup.get(sample_id) or {}
-        family_id = sample_row.get("family_id")
-        phenotype = sample_row.get("phenotype_description")
-        if is_none_or_nan(phenotype):
-            phenotype = ""
+        family_id = get_family_id(sample_id, sample_lookup)
+        phenotype = blank_to_none(sample_row.get("phenotype_description"))
 
         category = "unaffected" if is_unaffected_or_solved_status(
             affected_lookup.get(sample_id), analysis_lookup.get(sample_id),
@@ -467,7 +457,7 @@ def collect_samples_single_pass(outlier_entries, sample_lookup, affected_lookup,
             if len(results["sample_id"][category]) < max_needed:
                 results["sample_id"][category].append(entry)
 
-        if family_id and not is_none_or_nan(family_id):
+        if family_id is not None:
             if family_id not in seen_family_ids[category]:
                 seen_family_ids[category].add(family_id)
                 if len(results["family_id"][category]) < max_needed:
@@ -609,7 +599,8 @@ def add_gene_columns(records, gene_lookup):
     For each record, looks up its ``gene_id`` in ``gene_lookup``:
       * ``pLI`` = max of the gene's pLI_v2 and pLI_v4 (whichever are present),
         or None.
-      * ``inheritance`` = the gene's inheritance mode, or None.
+      * ``inheritance`` = the gene's inheritance mode, or None. It always equals
+        ``GeneTableInheritance``.
 
     Both columns are set to None when there is no gene_lookup, when the record's
     gene_id is missing, or when the gene_id is not in the lookup — so analysis
@@ -629,33 +620,28 @@ def add_gene_columns(records, gene_lookup):
 
         if gene_row is None:
             record["pLI"] = None
-            record["inheritance"] = None
             for column in GENE_TABLE_COLUMN_BY_SOURCE_FIELD.values():
                 record[column] = None
-            continue
-
-        pli_v2 = gene_row.get("pLI_v2")
-        pli_v4 = gene_row.get("pLI_v4")
-        if not is_none_or_nan(pli_v4) and not is_none_or_nan(pli_v2):
-            record["pLI"] = max(float(pli_v4), float(pli_v2))
-        elif not is_none_or_nan(pli_v4):
-            record["pLI"] = float(pli_v4)
-        elif not is_none_or_nan(pli_v2):
-            record["pLI"] = float(pli_v2)
         else:
-            record["pLI"] = None
+            pli_v2 = gene_row.get("pLI_v2")
+            pli_v4 = gene_row.get("pLI_v4")
+            if not is_none_or_nan(pli_v4) and not is_none_or_nan(pli_v2):
+                record["pLI"] = max(float(pli_v4), float(pli_v2))
+            elif not is_none_or_nan(pli_v4):
+                record["pLI"] = float(pli_v4)
+            elif not is_none_or_nan(pli_v2):
+                record["pLI"] = float(pli_v2)
+            else:
+                record["pLI"] = None
 
-        # read_gene_table does not pass keep_default_na=False, so a blank cell arrives as a float
-        # NaN. Normalize it the same way pLI above and the GeneTable* columns below do, otherwise
-        # a NaN reaches the loci table in a column everything else treats as string-or-None.
-        inheritance = gene_row.get("inheritance")
-        record["inheritance"] = None if is_none_or_nan(inheritance) else inheritance
+            # Populate the 10 GeneTable* output columns from the gene row so they exist in the
+            # loci table (the server filters/selects them directly). read_gene_table does not
+            # pass keep_default_na=False, so a blank cell arrives as a float NaN; store it as None.
+            for source_field, column in GENE_TABLE_COLUMN_BY_SOURCE_FIELD.items():
+                value = gene_row.get(source_field)
+                record[column] = None if is_none_or_nan(value) else value
 
-        # Populate the 10 GeneTable* output columns from the gene row so they
-        # exist in the loci table (the server filters/selects them directly).
-        for source_field, column in GENE_TABLE_COLUMN_BY_SOURCE_FIELD.items():
-            value = gene_row.get(source_field)
-            record[column] = None if is_none_or_nan(value) else value
+        record["inheritance"] = record["GeneTableInheritance"]
 
     return records
 

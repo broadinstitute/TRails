@@ -47,14 +47,18 @@ virtual environment needs the `python3-venv` package.
 
 ## Quickstart
 
-One command takes your two tables and starts the server:
+One command takes your two tables and starts the server. From the directory you ran the
+installer in (it puts TRails in `./TRails`, and prints this command with the full path when it
+finishes):
 
 ```bash
-python3 trails.py \
+python3 TRails/trails.py \
     --repeat-copy-numbers-tsv  your_cohort.tsv.gz \
     --sample-metadata-tsv      your_samples.tsv.gz \
     [--phenotypes-table        your_phenotypes.tsv.gz]
 ```
+
+From inside `TRails/` (or a checkout), the command is `python3 trails.py` with the same options.
 
 It: (1) runs itself with the Python of TRails' virtual environment, installing any missing
 dependencies there, (2) downloads any missing public reference data, (3) builds the local
@@ -77,10 +81,13 @@ starts with when it is opened with no saved filters, e.g. `all` for a short-read
 ## Inputs
 
 TRails reads **two** tables you supply (a third is optional). **Only a handful of columns are
-required — almost everything is optional, and any missing optional column simply disables the
-feature that depends on it rather than causing an error.** Everything else (population
-statistics, gene annotations, the gene-disease table, known disease loci) is downloaded for
-you; see [Reference data](#reference-data-downloaded-for-you). Full schemas and the generated
+required, and a missing optional column never causes an error.** Most missing columns just turn
+off the feature that depends on them. The exception is a sample's `affected_status` and
+`analysis_status`: a sample that is not marked unaffected or solved is still a candidate, so with
+these columns missing every sample counts as affected and unsolved (see the sample metadata
+table below). Everything else (population statistics, gene annotations, the gene-disease table,
+known disease loci) is downloaded for you; see
+[Reference data](#reference-data-downloaded-for-you). Full schemas and the generated
 database tables are documented in [docs/INPUT_FORMATS.md](docs/INPUT_FORMATS.md).
 
 ### 1. Repeat copy numbers TSV — `--repeat-copy-numbers-tsv`  *(required)*
@@ -129,8 +136,8 @@ PMGRC-1-2-1    Unaffected        Unaffected        FAM1                         
 | Column | Required? | Enables / notes |
 |--------|-----------|-----------------|
 | `sample_id` | **required** | joins to the sample columns of the repeat-copy-numbers TSV; may not contain `:` or `,`, which are the delimiters of the packed outlier-sample strings (either character aborts the build) |
-| `affected_status` | optional | affected-vs-unaffected outlier comparison + affected-unsolved prioritization. Values: `Affected`, `Possibly Affected` (treated as `Affected`), `Unaffected`, `Unknown`. Absent → treated as unknown |
-| `analysis_status` | optional | solved/unsolved filtering + counts. Values: `Solved`, `Unsolved`, `Unknown`, … Absent → unknown |
+| `affected_status` | optional | affected-vs-unaffected outlier comparison + affected-unsolved prioritization. Values: `Affected`, `Possibly Affected` (treated as `Affected`), `Unaffected`, `Unknown`. A sample counts as affected and unsolved unless its `affected_status` is `Unaffected` or its `analysis_status` is `Solved`, `Probably Solved` or `Unaffected`, so a blank, absent or `Unknown` value counts as affected |
+| `analysis_status` | optional | solved/unsolved filtering + counts. Values: `Solved`, `Unsolved`, `Unknown`, … A blank, absent or `Unknown` value counts as unsolved |
 | `family_id` | optional | distinct-family outlier counts; pairs with the parent ids for trio QC |
 | `maternal_id`, `paternal_id` | optional | Mendelian-violation QC (needs trios) |
 | `sex` | optional | displayed only: shown in the sample tables (the swim plot shows it for chrX/chrY loci). Nothing filters or computes on it. Values: `Male`, `Female`, `Unknown` |
@@ -165,7 +172,7 @@ download that fails (e.g. offline) only leaves the columns that depend on it emp
 | Data | Source | Used for |
 |------|--------|----------|
 | Population statistics, gene region, variation clusters | [TRExplorer](https://trexplorer.broadinstitute.org) repeat catalog v2.1, hg38 | population filters, Δpop, σ percentile, the #Aff / #Fam population gate, gene-region filters |
-| Gene-disease table | [genelookup](https://genelookup.broadinstitute.org), without OMIM's licensed columns | gene symbol, inheritance, pLI, disease phenotype summary, gene-level phenotype scoring. Refreshed only with `TRAILS_FORCE=1`; override with `--gene-table` |
+| Gene-disease table | [genelookup](https://genelookup.broadinstitute.org), without OMIM's licensed columns | gene symbol, inheritance, pLI, disease phenotype summary, gene-level phenotype scoring, and the "Mendelian disease genes only" filter (genes with an inheritance mode or a curated disease source: OMIM, ClinGen, GenCC, PanelApp, Decipher). Refreshed only with `TRAILS_FORCE=1`; override with `--gene-table` |
 | HPO `genes_to_phenotype.txt` | Human Phenotype Ontology release v2025-05-06 | phenotype scoring |
 | Known disease loci | [str-analysis](https://github.com/broadinstitute/str-analysis) variant catalog and [STRchive](https://github.com/dashnowlab/STRchive) | known-disease-locus flags, pathogenic thresholds |
 
@@ -178,18 +185,18 @@ download that fails (e.g. offline) only leaves the columns that depend on it emp
   `.venv/` by `install.sh` and by `trails.py` on first run. If any of them is still missing
   after the install, the run stops with an error.
   - `flask` — the local web server
-  - `pandas`, `numpy` — the analysis pipeline
+  - `pandas`: the analysis pipeline
+  - `numpy`: the results server's sample-QC percentiles
   - `intervaltree` — interval overlap lookups
   - `duckdb` (>= 1.3), the result-database engine (only `trails/duckdb_compat.py` imports it)
-- **Optional Python packages**: **not** in `requirements.txt`. `install.sh` and `trails.py`
-  install them separately, by name, and a failure here is only a printed note, never an error:
-  - `pyhpo` — HPO term similarity (phenotype scoring falls back to Jaccard without it)
-  - `requests` — only for the opt-in STRchive network fetch (the reference-data download uses
-    the standard library)
+- **Optional Python package**: `pyhpo`, for HPO term similarity (phenotype scoring falls back
+  to Jaccard without it). It is **not** in `requirements.txt`: `install.sh` and `trails.py`
+  install it separately, by name, and a failure there is only a printed note, never an error.
 
   `trails.py` attempts the optional install once and then writes a
-  `.trails_optional_deps_attempted` marker file in the TRails directory, so a package that will
-  not build on your machine does not make every later run re-try it. Delete that file to retry.
+  `.trails_optional_deps_attempted` marker file inside `.venv/`, so a package that will not build
+  on your machine does not make every later run re-try it. Delete that file to retry. Recreating
+  `.venv/` removes it too, so a new environment gets one fresh attempt.
 
   TRails is otherwise self-contained — it has no other third-party runtime dependency (the
   motif and locus-id utilities are built in, not pulled from an external package).
@@ -200,7 +207,7 @@ install manually, do what they do, from the TRails directory (the last line is o
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m pip install pyhpo requests
+.venv/bin/python -m pip install pyhpo
 ```
 
 ## Code layout and tests

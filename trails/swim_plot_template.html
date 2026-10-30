@@ -300,8 +300,6 @@
     <div class="header" id="dot-detail-header"></div>
     <div class="scrolling content" id="dot-detail-content"></div>
     <div class="actions">
-        <button class="ui basic button disabled swim-edit-note-btn" style="float: left;" disabled><i class="edit icon"></i>Edit Note</button>
-        <button class="ui basic button swim-add-tag-btn" style="float: left; margin-left: 6px;"><i class="tag icon"></i>Add Tag</button>
         <div class="ui cancel button">Close</div>
     </div>
 </div>
@@ -546,7 +544,9 @@ function renderSwimChart(data) {
         }
         points.push({
             x: xVal,
-            y: categoryToY(item.motif_category) + (Math.random() - 0.5) * 0.6,
+            // Spread within the motif-size row by a fixed offset per locus and sample
+            // (jitterFromKey, qc_shared_js.html), so a redraw leaves every dot in place
+            y: categoryToY(item.motif_category) + jitterFromKey(`${item.LocusId}\t${item.sample_id}`, 0.6),
             _index: idx
         });
         plottedItems.push(item);
@@ -554,8 +554,8 @@ function renderSwimChart(data) {
         bgColors.push(colors.bg);
         borderColors.push(colors.border);
         // Determine point style: triangle for a "true"/"candidate" tag, rect for intergenic, circle
-        // otherwise. Not Chart.js's 'star': it is drawn from line segments only, so with this
-        // dataset's 0.5px border the points meant to stand out showed as faint hairline asterisks.
+        // otherwise. A filled triangle rather than Chart.js's 'star', which is drawn from line
+        // segments only and would be a faint hairline asterisk with this dataset's 0.5px border.
         // A tag counts only as a whole (ignoring case and surrounding spaces), so 'not a candidate'
         // or 'untrue' does not.
         let style = 'circle';
@@ -729,26 +729,12 @@ function updateSwimLegend(data) {
     $('#swim-legend').show();
 }
 
-// The footer's Edit Note button takes the note's current text out of the rendered modal
-// content, so it is only safe to click once that content is on the page. showDotDetail turns it
-// off before the fetches below start and leaves it off if they fail, so the editor can never open
-// empty over a stored note and overwrite it on save. The inline Add/Edit Note buttons need no
-// such flag: they are part of the rendered content, so they do not exist while it is loading.
-let swimDetailLoaded = false;
-
-function setSwimNoteEditingEnabled(enabled) {
-    swimDetailLoaded = enabled;
-    // Both the class (Semantic UI styles it and drops pointer events) and the property (the
-    // browser suppresses the click event, which is what stops the delegated handler).
-    $('.swim-edit-note-btn').toggleClass('disabled', !enabled).prop('disabled', !enabled);
-}
-
 // Monotonic sequence for the one shared detail modal. The two fetches below are async, so a slow
 // response for an earlier dot must not render into the modal after the user has opened another one
 // (which would show one sample's details while the modal's save actions target a different one).
 let swimDetailSeq = 0;
 
-// The item the modal shows, which the modal's note and tag buttons act on and refreshSwimModal reloads
+// The item the modal shows, which refreshSwimModal reloads after a note or tag change
 let _currentModalItem = null;
 
 // Show detail modal for a clicked point (fetches full detail from API)
@@ -760,7 +746,6 @@ function showDotDetail(item) {
     const headerText = geneSymbol ? locusId + ' &mdash; ' + geneSymbol : locusId;
     $('#dot-detail-header').html(headerText);
     $('#dot-detail-content').html('<div class="ui active centered inline loader" style="margin: 30px auto;"></div>');
-    setSwimNoteEditingEnabled(false);
     $('#dot-detail-modal').modal('show');
 
     // Use the params the chart was actually loaded with, not the live controls — the user may
@@ -777,14 +762,11 @@ function showDotDetail(item) {
         .then(([detail, stats]) => {
             if (seq !== swimDetailSeq) return;  // a newer dot already owns the modal
             renderDotDetailContent(item, detail, stats, params);
-            setSwimNoteEditingEnabled(true);
         })
         .catch(err => {
             if (seq !== swimDetailSeq) return;
             console.error('Detail load error:', err);
             $('#dot-detail-content').html('<p style="color: red;">Failed to load details: ' + escapeHtml(err.message) + '</p>');
-            // Left disabled on purpose: the locus's stored note is still unknown, and an empty
-            // editor here would overwrite it.
         });
 }
 
@@ -801,13 +783,11 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
     const swimSource = (params && params.source) || SWIM_DEFAULT_SOURCE;
     const swimOutlierType = (params && params.outlier_type) || 'all';
 
-    // Build UCSC link
-    let ucscLink = '';
-    if (locus.Chrom && locus.Start0Based != null && locus.End1Based != null) {
-        const ucscUrl = 'https://genome.ucsc.edu/cgi-bin/hgTracks?db=hg38&position='
-            + encodeURIComponent(locus.Chrom + ':' + (locus.Start0Based + 1) + '-' + locus.End1Based);
-        ucscLink = '<a href="' + escapeHtml(ucscUrl) + '" target="_blank" style="color: #2185d0;">UCSC Genome Browser</a>';
-    }
+    // Build UCSC link, the same URL as the main table's (buildUcscUrl in header_template.html)
+    const ucscUrl = buildUcscUrl(locus);
+    const ucscLink = ucscUrl
+        ? '<a href="' + escapeHtml(ucscUrl) + '" target="_blank" style="color: #2185d0;">UCSC Genome Browser</a>'
+        : '';
 
     // Build TRExplorer link, the same URL as the main table's (buildTRExplorerUrl in header_template.html)
     const trexUrl = buildTRExplorerUrl(locus);
@@ -823,12 +803,6 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
     html += '<div class="detail-section-header">Genotype</div>';
     html += '<table class="detail-table">';
     html += '<tr><td>Allele Size</td><td><strong>' + escapeHtml(String(sampleItem.allele_size != null ? sampleItem.allele_size : '')) + '</strong> repeat units</td></tr>';
-    if (sampleItem.purity != null) {
-        html += '<tr><td>Purity</td><td>' + escapeHtml(String(sampleItem.purity)) + '</td></tr>';
-    }
-    if (sampleItem.methylation != null) {
-        html += '<tr><td>Methylation</td><td>' + escapeHtml(String(sampleItem.methylation)) + '</td></tr>';
-    }
     html += '</table>';
 
     // Section 2: Sample (from sampleItem)
@@ -854,7 +828,7 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
 
     // Note
     if (userAnn.note) {
-        html += '<div style="margin-bottom: 6px;"><strong>Note:</strong> <span class="note-text">' + escapeHtml(userAnn.note.note_text) + '</span>';
+        html += '<div style="margin-bottom: 6px;"><strong>Note:</strong> <span style="white-space: pre-wrap;">' + escapeHtml(userAnn.note.note_text) + '</span>';
         html += ' <button class="ui mini basic button swim-inline-edit-note" data-locus-id="' + escapeHtml(locus.LocusId) + '" style="padding:3px 8px;"><i class="edit icon"></i>Edit</button>';
         html += ' <button class="ui mini basic red button swim-inline-delete-note" data-locus-id="' + escapeHtml(locus.LocusId) + '" style="padding:3px 8px;"><i class="trash icon"></i>Delete</button>';
         html += '</div>';
@@ -889,8 +863,7 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
     const perOutlierScores = phenoScores.per_outlier || {};
     const perLocusScores = phenoScores.per_locus || {};
     // swimOutlierType is derived above from the loaded params (not the live radio).
-    const otMap = {all: 'AllAlleles', short: 'ShortAlleles', hemi: 'HemizygousAlleles'};
-    const currentOt = otMap[swimOutlierType];
+    const currentOt = OUTLIER_TYPE_MAP[swimOutlierType];
     const outlierScoresForType = perOutlierScores[currentOt] || [];
     const locusScoreForType = perLocusScores[currentOt];
 
@@ -984,16 +957,11 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
         + '<td style="font-weight:600; color:#555;">Stdev</td>'
         + '<td style="font-weight:600; color:#555;">90th Pctl</td></tr>';
 
-    // [display label, population_thresholds key prefix]. Only cohorts with data
-    // (max != null) are shown; HPRC256/TenK10K have no 90th percentile -> '?'.
+    // Only cohorts with data (max != null) are shown; HPRC256/TenK10K have no 90th percentile -> '?'.
     const rPop = v => (v != null ? Math.round(v) : '?');
-    [
-        ['HPRC256', 'HPRC256'],
-        ['AoU1027', 'AoU1027'],
-        ['TenK10K', 'TenK10K'],
-    ].filter(([, k]) => popThresh[k + '_MaxAllele'] != null).forEach(([label, k]) => {
+    POPULATION_COHORTS.filter(k => popThresh[k + '_MaxAllele'] != null).forEach(k => {
         const stdev = popThresh[k + '_Stdev'];
-        html += '<tr><td>' + escapeHtml(label) + '</td>'
+        html += '<tr><td>' + escapeHtml(k) + '</td>'
             + '<td>' + rPop(popThresh[k + '_99thPercentile']) + '</td>'
             + '<td>' + rPop(popThresh[k + '_MaxAllele']) + '</td>'
             + '<td>' + rPop(popThresh[k + '_Mode']) + '</td>'
@@ -1099,9 +1067,8 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
 // =========================================================================
 
 $(document).ready(function() {
-    // Initialize Semantic UI components
+    // Initialize Semantic UI components (checkboxes and radios)
     $('.ui.checkbox').checkbox();
-    $('.ui.radio.checkbox').checkbox();
 
     // Help-text popups open on click of the (?) icon
     $('.help-popup').popup({ on: 'click' });
@@ -1116,18 +1083,7 @@ $(document).ready(function() {
     });
 
     // Gene region mutual exclusivity: include unchecks exclude (and vice versa)
-    $('#swim-control-panel input[name^="swim_gene_region_"]').on('change', function() {
-        const region = this.name.replace('swim_gene_region_', '');
-        if ($(this).parent().checkbox('is checked')) {
-            $(`input[name="swim_exclude_gene_region_${region}"]`).parent().checkbox('uncheck');
-        }
-    });
-    $('#swim-control-panel input[name^="swim_exclude_gene_region_"]').on('change', function() {
-        const region = this.name.replace('swim_exclude_gene_region_', '');
-        if ($(this).parent().checkbox('is checked')) {
-            $(`input[name="swim_gene_region_${region}"]`).parent().checkbox('uncheck');
-        }
-    });
+    linkGeneRegionIncludeAndExcludeCheckboxes('swim_');
 
     // Initialize sample ID dropdown
     $('#swim-sample-id-filter').dropdown({
@@ -1136,13 +1092,9 @@ $(document).ready(function() {
         fullTextSearch: true,
         forceSelection: false,
     });
-    fetch(SWIM_API_BASE + '/schema')
-        .then(r => r.json())
-        .then(data => {
-            const values = (data.sample_ids || []).map(id => ({ name: id, value: id }));
-            setupDropdownMenu($('#swim-sample-id-filter'), values);
-        })
-        .catch(e => console.error('Populate sample IDs error:', e));
+    fetchJsonOrNull(SWIM_API_BASE + '/schema', 'Load schema').then(schema => {
+        if (schema) fillSampleIdDropdown($('#swim-sample-id-filter'), schema);
+    });
 
     // Initialize tag dropdown
     $('#swim-tag-filter').dropdown({
@@ -1151,7 +1103,7 @@ $(document).ready(function() {
         fullTextSearch: true,
         maxResults: 10,
     });
-    refreshSwimTags();
+    refreshTagFilterDropdown($('#swim-tag-filter'));
 
     $('#dot-detail-modal').modal();
 
@@ -1173,8 +1125,8 @@ $(document).ready(function() {
 });
 
 // =========================================================================
-// Swim Plot Annotation CRUD (the write helpers saveNote, deleteNote, addTag and removeTag are in
-// header_template.html, shared with the results page)
+// Swim Plot Annotation CRUD (the note editor openNoteEditor and the write helpers deleteNote,
+// addTag and removeTag are in header_template.html, shared with the results page)
 // =========================================================================
 
 function refreshSwimModal() {
@@ -1198,58 +1150,10 @@ function applySwimTagUpdate(result) {
     if (changed) renderSwimChart(swimRawData);
 }
 
-// Modal action button handlers
-$(document).on('click', '.swim-edit-note-btn', function() {
-    if (!_currentModalItem || !swimDetailLoaded) return;
-    var locusId = _currentModalItem.LocusId;
-    var existing = $('#dot-detail-content .note-text').text() || '';
-    var noteText = prompt('Enter note:', existing);
-    if (noteText === null || !noteText.trim()) return;
-    saveNote(locusId, noteText.trim()).then(refreshSwimModal).catch(function(e) { alert('Failed: ' + e.message); });
-});
-
-// Fill the cached tag list (the add-tag prompt's hint) AND the #swim-tag-filter dropdown menu
-// from one /annotations/tags request. Runs at startup and after every tag change from the modal,
-// so a tag added or removed there is selectable in the filter right away. Preserves the current
-// filter selection.
-function refreshSwimTags() {
-    return fetch(SWIM_API_BASE + '/annotations/tags')
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-            window._allTagsList = d.tags || [];  // user tags only — used for the add-tag hint
-            var selected = $('#swim-tag-filter').dropdown('get value');
-            // all_tags is the user-defined tags (/annotations/tags returns no system tags).
-            var values = (d.all_tags || []).map(function(t) {
-                return { name: t, value: t, selected: t === selected };
-            });
-            setupDropdownMenu($('#swim-tag-filter'), values);
-            if (selected) $('#swim-tag-filter').dropdown('set selected', selected);
-        })
-        .catch(function(e) { console.error('Refresh tags error:', e); });
-}
-
-$(document).on('click', '.swim-add-tag-btn', function() {
-    if (!_currentModalItem) return;
-    var locusId = _currentModalItem.LocusId;
-    var allTags = window._allTagsList || [];
-    var hint = allTags.length > 0 ? 'Existing tags: ' + allTags.join(', ') + '\n\nEnter tag:' : 'Enter tag:';
-    var tag = prompt(hint);
-    if (tag === null || !tag.trim()) return;
-    addTag(locusId, tag.trim()).then(function(result) {
-        applySwimTagUpdate(result);
-        // Refresh tag cache
-        refreshSwimTags();
-        refreshSwimModal();
-    }).catch(function(e) { alert('Failed: ' + e.message); });
-});
-
-// Inline CRUD handlers inside modal content
+// Note and tag buttons in the modal's User Annotations section. Notes are edited in the shared
+// multi-line note editor (openNoteEditor, header_template.html), which opens over this modal.
 $(document).on('click', '.swim-inline-add-note, .swim-inline-edit-note', function() {
-    var locusId = $(this).data('locus-id');
-    var existing = $(this).closest('.annotation-section').find('.note-text').text() || '';
-    var noteText = prompt('Enter note:', existing);
-    if (noteText === null || !noteText.trim()) return;
-    saveNote(locusId, noteText.trim()).then(refreshSwimModal).catch(function(e) { alert('Failed: ' + e.message); });
+    openNoteEditor($(this).data('locus-id'), refreshSwimModal);
 });
 
 $(document).on('click', '.swim-inline-delete-note', function() {
@@ -1266,7 +1170,7 @@ $(document).on('click', '.swim-inline-add-tag', function() {
     if (tag === null || !tag.trim()) return;
     addTag(locusId, tag.trim()).then(function(result) {
         applySwimTagUpdate(result);
-        refreshSwimTags();
+        refreshTagFilterDropdown($('#swim-tag-filter'));
         refreshSwimModal();
     }).catch(function(e) { alert('Failed: ' + e.message); });
 });
@@ -1279,7 +1183,7 @@ $(document).on('click', '.swim-remove-tag-btn', function() {
     var tag = $(this).attr('data-tag');
     removeTag(locusId, tag).then(function(result) {
         applySwimTagUpdate(result);
-        refreshSwimTags();
+        refreshTagFilterDropdown($('#swim-tag-filter'));
         refreshSwimModal();
         // The plotted points were filtered server-side by the active tag, so once this locus no
         // longer carries it, its dots do not belong on the chart. Updating the shapes in place

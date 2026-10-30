@@ -215,7 +215,7 @@ class WriteSwimPlotTests(unittest.TestCase):
             "allele_size": allele_size, "sample_id": sample_id,
             "family_id": "fam", "affected_status": "Affected",
             "analysis_status": "Unsolved", "sex": "male",
-            "phenotype_description": None, "purity": None, "methylation": None,
+            "phenotype_description": None,
             "FirstUnaffectedAlleleSize": None, "is_above_first_unaffected": 1,
             "LocusId": "1-1-10-AAG", "Motif": "AAG", "CanonicalMotif": "AAG",
             "MotifSize": 3, "gene_region": "intron",
@@ -225,17 +225,22 @@ class WriteSwimPlotTests(unittest.TestCase):
 
     def test_row_count_and_column_order(self):
         rows = [self._swim_row("S1", 40), self._swim_row("S2", 39)]
-        count = result_database.write_swim_plot(self.connection, rows)
+        count = result_database.write_swim_plot(self.connection, rows, columns=list(rows[0]))
         self.assertEqual(count, 2)
         self.assertEqual(
             self.connection.execute("SELECT COUNT(*) FROM swim_plot").fetchone()[0], 2)
-        # Column order follows the producing dict's key order.
-        self.assertEqual(table_columns(self.connection, "swim_plot")[0], "outlier_type")
+        self.assertEqual(table_columns(self.connection, "swim_plot"), list(rows[0]))
 
-    def test_empty_swim_rows_skips_table(self):
-        count = result_database.write_swim_plot(self.connection, [])
-        self.assertEqual(count, 0)
-        self.assertNotIn("swim_plot", table_names(self.connection))
+    def test_columns_define_the_table_whatever_the_row_key_order(self):
+        # The table follows the columns argument, not the row dicts: a row's keys in another
+        # order land in the right columns, and a column a row lacks is NULL.
+        row = {"allele_size": 40, "sample_id": "S1"}
+        result_database.write_swim_plot(
+            self.connection, [row], columns=["sample_id", "allele_size", "family_id"])
+        self.assertEqual(table_columns(self.connection, "swim_plot"),
+                         ["sample_id", "allele_size", "family_id"])
+        self.assertEqual(self.connection.execute("SELECT * FROM swim_plot").fetchall(),
+                         [("S1", 40, None)])
 
     def test_empty_swim_rows_with_columns_creates_the_table(self):
         # A build can legitimately find no outlier alleles; the server's swim-plot
@@ -355,8 +360,8 @@ class PopulationGateCohortsTests(unittest.TestCase):
         self.connection.close()
 
     def test_round_trip_through_the_metadata_table(self):
-        # A database built before the cohorts were recorded, with and without a metadata
-        # table, was gated by the default.
+        # A database with no cohorts entry, with or without a metadata table, reads back as
+        # the default.
         self.assertEqual(result_database.read_population_gate_cohorts(self.connection),
                          ("HPRC256", "AoU1027"))
         result_database.write_sample_count(self.connection, 10)
@@ -378,6 +383,75 @@ class PopulationGateCohortsTests(unittest.TestCase):
         result_database.write_population_gate_cohorts(self.connection, ("TenK10K",))
         self.assertEqual(result_database.read_population_gate_cohorts(self.connection), ("TenK10K",))
         self.assertIsNone(result_database.read_sample_count(self.connection))
+
+
+class SampleCountTableTests(unittest.TestCase):
+    """The callset size build_database records in the metadata table.
+
+    The results server reads it back at startup to print "N loci from N genotyped samples" and
+    to report ``total_samples`` through /api/v1/schema. The count has to round-trip, re-recording
+    it has to replace the row rather than add a second one, and a database without the table has
+    to read back as None instead of raising.
+    """
+
+    def setUp(self):
+        self.connection = duckdb_compat.connect(":memory:")
+
+    def tearDown(self):
+        self.connection.close()
+
+    def test_database_without_metadata_table(self):
+        # A database with no metadata table at all (one build_database did not write) is not an
+        # error: the server shows the loci count on its own.
+        self.assertIsNone(result_database.read_sample_count(self.connection))
+
+    def test_write_then_read(self):
+        result_database.write_sample_count(self.connection, 2657)
+        self.assertEqual(result_database.read_sample_count(self.connection), 2657)
+
+    def test_rewrite_replaces_value(self):
+        result_database.write_sample_count(self.connection, 2136)
+        result_database.write_sample_count(self.connection, 2657)
+        self.assertEqual(result_database.read_sample_count(self.connection), 2657)
+        self.assertEqual(
+            self.connection.execute(
+                f"SELECT COUNT(*) FROM {result_database.METADATA_TABLE}").fetchone()[0], 1)
+
+    def test_metadata_table_without_a_sample_count_row(self):
+        # The table exists but holds no sample-count row. The read must report "unknown", not
+        # blow up on the missing row.
+        self.connection.execute(
+            f"CREATE TABLE {result_database.METADATA_TABLE} (key TEXT PRIMARY KEY, value VARCHAR)")
+        self.connection.execute(
+            f"INSERT INTO {result_database.METADATA_TABLE} (key, value) VALUES (?, ?)",
+            ("something_else", "1"))
+        self.assertIsNone(result_database.read_sample_count(self.connection))
+
+    def test_zero_samples_is_not_confused_with_absent(self):
+        # 0 is falsy, so a naive read would report an empty callset the same way it reports a
+        # database that never recorded the count.
+        result_database.write_sample_count(self.connection, 0)
+        self.assertEqual(result_database.read_sample_count(self.connection), 0)
+        self.assertIsNotNone(result_database.read_sample_count(self.connection))
+
+
+class SampleCountSurvivesFinalizeTests(unittest.TestCase):
+    """write_sample_count leaves the commit to its caller, which is finalize_database."""
+
+    def test_count_survives_the_atomic_move(self):
+        with tempfile.TemporaryDirectory() as directory:
+            final_path = os.path.join(directory, "result.duckdb")
+            connection, tmp_path = result_database.open_new_database(final_path)
+            result_database.write_loci_table(
+                connection, [{"LocusId": "1-1-10-A", "Motif": "A"}], ["LocusId", "Motif"])
+            result_database.write_sample_count(connection, 2657)
+            result_database.finalize_database(connection, tmp_path, final_path)
+
+            reopened = duckdb_compat.connect(final_path)
+            try:
+                self.assertEqual(result_database.read_sample_count(reopened), 2657)
+            finally:
+                reopened.close()
 
 
 class WriteAffectedUnsolvedOutliersTableTests(unittest.TestCase):

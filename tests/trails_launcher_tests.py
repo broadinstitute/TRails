@@ -139,6 +139,12 @@ class VirtualEnvironmentTests(unittest.TestCase):
         self.assertIsNotNone(self.run_check("/usr/local", False))
         self.assertTrue(self.created)
 
+    def test_the_optional_install_marker_lives_inside_the_environment(self):
+        # Recreating the environment (venv --clear) removes the optional packages, so it has to
+        # remove the marker too, or no later run would try to install them again.
+        self.assertEqual(os.path.dirname(trails_launcher.OPTIONAL_INSTALL_MARKER),
+                         trails_launcher.VIRTUAL_ENVIRONMENT_DIRECTORY)
+
 
 class InitialRequireAbovePopulationTests(unittest.TestCase):
     """The launcher validates --initial-require-above-population itself and forwards it to the server."""

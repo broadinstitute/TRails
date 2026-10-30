@@ -34,61 +34,61 @@ class MatchColumnsTests(unittest.TestCase):
         self.assertEqual(matches["sample_id"], "sample_id")
 
 
-def _write_tsv(rows, header):
-    handle = tempfile.NamedTemporaryFile(mode="w", suffix=".tsv", delete=False)
-    handle.write("\t".join(header) + "\n")
-    for row in rows:
-        handle.write("\t".join(str(c) for c in row) + "\n")
+def _write(test_case, text, suffix=".tsv"):
+    """Write text to a temporary file that is removed when test_case finishes.
+
+    Args:
+        test_case: The running unittest.TestCase, which registers the cleanup.
+        text: The file contents.
+        suffix: The file name suffix; a name ending in ".gz" is written gzipped.
+
+    Returns:
+        The file's path.
+    """
+    handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     handle.close()
+    test_case.addCleanup(os.remove, handle.name)
+    with (gzip.open if suffix.endswith(".gz") else open)(handle.name, "wt") as output_file:
+        output_file.write(text)
     return handle.name
+
+
+def _write_tsv(test_case, rows, header):
+    """Write a header line and rows as a temporary TSV (see _write) and return its path."""
+    return _write(test_case, "".join("\t".join(str(cell) for cell in line) + "\n"
+                                     for line in [header] + rows))
 
 
 class ReadRepeatCopyNumbersTests(unittest.TestCase):
 
     def test_basic_parse_and_sample_list(self):
         path = _write_tsv(
+            self,
             [["chr1-100-110-AT", "AT", "12,40", "21"]],
             ["TRID", "Motif", "SampleA", "SampleB"],
         )
-        try:
-            locus_rows, sample_ids = input_tables.read_repeat_copy_numbers(path)
-        finally:
-            os.unlink(path)
+        locus_rows, sample_ids = input_tables.read_repeat_copy_numbers(path)
         self.assertEqual(sample_ids, ["SampleA", "SampleB"])
         self.assertEqual(locus_rows[0]["trid"], "chr1-100-110-AT")
         self.assertEqual(locus_rows[0]["motif"], "AT")
         self.assertEqual(locus_rows[0]["genotypes"], {"SampleA": "12,40", "SampleB": "21"})
 
     def test_gzip_read(self):
-        handle = tempfile.NamedTemporaryFile(suffix=".tsv.gz", delete=False)
-        handle.close()
-        with gzip.open(handle.name, "wt") as f:
-            f.write("trid\tmotif\tS1\n")
-            f.write("chr2-5-11-AAT\tAAT\t3\n")
-        try:
-            locus_rows, sample_ids = input_tables.read_repeat_copy_numbers(handle.name)
-        finally:
-            os.unlink(handle.name)
+        path = _write(self, "trid\tmotif\tS1\nchr2-5-11-AAT\tAAT\t3\n", suffix=".tsv.gz")
+        locus_rows, sample_ids = input_tables.read_repeat_copy_numbers(path)
         self.assertEqual(sample_ids, ["S1"])
         self.assertEqual(locus_rows[0]["genotypes"], {"S1": "3"})
 
     def test_missing_trid_raises(self):
-        path = _write_tsv([["AT", "12"]], ["Motif", "S1"])
-        try:
-            with self.assertRaises(ValueError):
-                input_tables.read_repeat_copy_numbers(path)
-        finally:
-            os.unlink(path)
+        path = _write_tsv(self, [["AT", "12"]], ["Motif", "S1"])
+        with self.assertRaises(ValueError):
+            input_tables.read_repeat_copy_numbers(path)
 
 
 class ReadSampleMetadataTests(unittest.TestCase):
 
     def _read(self, rows, header):
-        path = _write_tsv(rows, header)
-        try:
-            return input_tables.read_sample_metadata(path)
-        finally:
-            os.unlink(path)
+        return input_tables.read_sample_metadata(_write_tsv(self, rows, header))
 
     def test_case_insensitive_columns_and_minimal(self):
         sample_lookup, affected, analysis = self._read(
@@ -157,25 +157,21 @@ class ReadPhenotypesTests(unittest.TestCase):
 
     def test_groups_hpo_terms(self):
         path = _write_tsv(
+            self,
             [["S1", "HP:0001250"], ["S1", "HP:0000252"], ["S2", "not_hpo"]],
             ["participant_id", "term_id"],
         )
-        try:
-            result = input_tables.read_phenotypes(path)
-        finally:
-            os.unlink(path)
+        result = input_tables.read_phenotypes(path)
         self.assertEqual(result["S1"], {"HP:0001250", "HP:0000252"})
         self.assertNotIn("S2", result)
 
     def test_case_insensitive_header(self):
         path = _write_tsv(
+            self,
             [["S1", "HP:0001250"]],
             ["Participant_ID", "Term_ID"],
         )
-        try:
-            result = input_tables.read_phenotypes(path)
-        finally:
-            os.unlink(path)
+        result = input_tables.read_phenotypes(path)
         self.assertEqual(result["S1"], {"HP:0001250"})
 
 
@@ -186,13 +182,11 @@ class ReadGeneTableTests(unittest.TestCase):
 
     def test_keeps_known_columns(self):
         path = _write_tsv(
+            self,
             [["ENSG1", "FMR1", "0.9", "0.95", "AD"]],
             ["gene_id", "gene_symbol", "pLI_v2", "pLI_v4", "inheritance"],
         )
-        try:
-            gene_lookup = input_tables.read_gene_table(path)
-        finally:
-            os.unlink(path)
+        gene_lookup = input_tables.read_gene_table(path)
         self.assertEqual(gene_lookup["ENSG1"]["gene_symbol"], "FMR1")
         self.assertEqual(gene_lookup["ENSG1"]["inheritance"], "AD")
 
@@ -207,21 +201,10 @@ class ReadGeneDiseasePhenotypesTests(unittest.TestCase):
             ["1", "FMR1", "HP:0001250", "x", "y", "OMIM:1"],
             ["1", "FMR1", "HP:0000006", "x", "y", "OMIM:1"],  # AD inheritance term
         ]
-        path = _write_tsv(rows, ["ncbi", "gene", "hpo", "name", "freq", "disease"])
-        try:
-            data = input_tables.read_gene_disease_phenotypes(path)
-        finally:
-            os.unlink(path)
+        path = _write_tsv(self, rows, ["ncbi", "gene", "hpo", "name", "freq", "disease"])
+        data = input_tables.read_gene_disease_phenotypes(path)
         self.assertEqual(data["FMR1"]["OMIM:1"]["phenotypes"], {"HP:0001250"})
         self.assertEqual(data["FMR1"]["OMIM:1"]["inheritance"], {"AD"})
-
-
-
-def _write(text, suffix=".tsv"):
-    handle = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False)
-    handle.write(text)
-    handle.close()
-    return handle.name
 
 
 class CoerceAnnotationValueTests(unittest.TestCase):
@@ -240,9 +223,9 @@ class CoerceAnnotationValueTests(unittest.TestCase):
 
     def test_dot_in_population_column_does_not_survive(self):
         path = _write(
+            self,
             "trid\tmotif\tHPRC256_99thPercentile\tS1\n"
             "chr1-100-115-CAG\tCAG\t.\t12,40\n")
-        self.addCleanup(os.remove, path)
         locus_rows, _ = input_tables.read_repeat_copy_numbers(path)
         # A '.' population-stat cell must not reach the numeric downstream as a str.
         self.assertIsNone(locus_rows[0]["extra_columns"]["HPRC256_99thPercentile"])
@@ -253,12 +236,12 @@ class InheritanceHPOTermsTests(unittest.TestCase):
 
     def test_unmapped_inheritance_term_dropped(self):
         path = _write(
+            self,
             "ncbi_gene_id\tgene_symbol\thpo_id\thpo_name\tfrequency\tdisease_id\n"
             "1\tADD1\tHP:0001426\tNon-Mendelian\t-\tOMIM:145500\n"   # unmapped -> dropped
             "1\tADD1\tHP:0000006\tAD\t-\tOMIM:145500\n"             # mapped -> AD
             "1\tADD1\tHP:0004972\tphenotype\t-\tOMIM:145500\n",     # phenotype
             suffix=".txt")
-        self.addCleanup(os.remove, path)
         data = input_tables.read_gene_disease_phenotypes(path)
         entry = data["ADD1"]["OMIM:145500"]
         self.assertEqual(entry["inheritance"], {"AD"})
@@ -270,12 +253,12 @@ class InheritanceHPOTermsTests(unittest.TestCase):
         # alongside the mode of inheritance; both are descendants of HP:0000005 Mode of
         # inheritance, so only the ataxia remains a phenotype to compare patients against.
         path = _write(
+            self,
             "ncbi_gene_id\tgene_symbol\thpo_id\thpo_name\tfrequency\tdisease_id\n"
             "4287\tATXN3\tHP:0000006\tAutosomal dominant inheritance\t-\tOMIM:109150\n"
             "4287\tATXN3\tHP:0003743\tGenetic anticipation\t-\tOMIM:109150\n"
             "4287\tATXN3\tHP:0001251\tAtaxia\t57/57\tOMIM:109150\n",
             suffix=".txt")
-        self.addCleanup(os.remove, path)
         entry = input_tables.read_gene_disease_phenotypes(path)["ATXN3"]["OMIM:109150"]
         self.assertEqual(entry["inheritance"], {"AD"})
         self.assertEqual(entry["phenotypes"], {"HP:0001251"})
@@ -295,9 +278,9 @@ class AnnotationColumnPrefixTests(unittest.TestCase):
 
     def test_aou_sample_column_kept_as_sample(self):
         path = _write(
+            self,
             "trid\tmotif\tAoU_0001\tHG002\n"
             "chr1-100-115-CAG\tCAG\t5,60\t5,6\n")
-        self.addCleanup(os.remove, path)
         _, sample_id_list = input_tables.read_repeat_copy_numbers(path)
         self.assertEqual(sample_id_list, ["AoU_0001", "HG002"])
 
@@ -305,15 +288,9 @@ class AnnotationColumnPrefixTests(unittest.TestCase):
 class AnnotationColumnClassificationTests(unittest.TestCase):
     """Recognized annotation columns annotate the locus instead of being read as samples."""
 
-    def _write(self, text):
-        handle = tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False)
-        handle.write(text)
-        handle.close()
-        self.addCleanup(os.remove, handle.name)
-        return handle.name
-
     def test_annotation_columns_separated_from_samples(self):
-        path = self._write(
+        path = _write(
+            self,
             "trid\tmotif\tgene_id\tHPRC256_99thPercentile\tSAMPLE_A\tSAMPLE_B\n"
             "chr1-100-115-CAG\tCAG\tENSG001\t30\t12,40\t11,12\n")
         locus_rows, sample_id_list = input_tables.read_repeat_copy_numbers(path)
@@ -327,7 +304,8 @@ class AnnotationColumnClassificationTests(unittest.TestCase):
         self.assertEqual(row["extra_columns"]["HPRC256_99thPercentile"], 30)
 
     def test_gencode_alias_and_case_insensitive(self):
-        path = self._write(
+        path = _write(
+            self,
             "trid\tmotif\tGencodeGeneId\tGencode_Gene_Region\tS1\n"
             "chr1-100-115-CAG\tCAG\tENSG9\tCDS\t10,10\n")
         locus_rows, sample_id_list = input_tables.read_repeat_copy_numbers(path)

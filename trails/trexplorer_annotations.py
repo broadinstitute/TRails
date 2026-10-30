@@ -17,12 +17,11 @@ gives each locus of the repeat-copy-numbers table the annotations of its TRExplo
   * a tie that is left goes to the candidate with the last locus id in sort order.
 """
 
-import os
-
 import pandas
 
 import duckdb_compat
 import locus_annotations
+import result_database
 
 MIN_JACCARD_SIMILARITY = 0.66
 
@@ -75,8 +74,10 @@ def _without_chr_prefix(text):
 def build_trexplorer_annotations_database(annotations_tsv_path, database_path):
     """Keep the columns TRails uses from TRExplorer's annotated catalog table, in a DuckDB file.
 
-    The database is built at a temporary path and moved into place, so an interrupted build
-    never leaves a partial database that a later run would take for a finished one.
+    The database is built at a temporary path and moved into place with the result database's
+    own helpers (result_database.open_new_database and finalize_database), so an interrupted
+    build never leaves a partial database that a later run would take for a finished one, and
+    a write-ahead log left next to the old copy is not replayed into the new one.
 
     Args:
         annotations_tsv_path: TRExplorer's ``*.EH.with_annotations.tsv.gz`` catalog table.
@@ -85,17 +86,13 @@ def build_trexplorer_annotations_database(annotations_tsv_path, database_path):
     Returns:
         The number of TRExplorer loci written.
     """
-    tmp_path = database_path + ".tmp"
-    for leftover in (tmp_path, tmp_path + ".wal"):
-        if os.path.exists(leftover):
-            os.remove(leftover)
     region_coordinates = "split_part(ReferenceRegion, ':', 2)"
     numeric_columns = (
         [f"TRY_CAST({c} AS BIGINT) AS {c}" for c in INTEGER_POPULATION_COLUMNS + ["VariationClusterSizeDiff"]]
         + [f"TRY_CAST({c} AS DOUBLE) AS {c}" for c in FLOAT_POPULATION_COLUMNS + ["ReferenceRepeatPurity"]])
     text_columns = ["Motif", "CanonicalMotif", "ReferenceRegion", "Source", "GencodeGeneId", "GencodeGeneRegion",
                     "VariationCluster", "VariationClusterFilterReason"]
-    connection = duckdb_compat.connect(tmp_path)
+    connection, tmp_path = result_database.open_new_database(database_path)
     try:
         connection.execute(
             f"CREATE TABLE {TREXPLORER_LOCI_TABLE} AS SELECT "
@@ -107,10 +104,10 @@ def build_trexplorer_annotations_database(annotations_tsv_path, database_path):
             f"FROM read_csv({_sql_string_literal(annotations_tsv_path)}, delim='\t', header=true, "
             f"all_varchar=true, quote='', escape='')")
         num_loci = connection.execute(f"SELECT COUNT(*) FROM {TREXPLORER_LOCI_TABLE}").fetchone()[0]
-        connection.commit()
-    finally:
+        result_database.finalize_database(connection, tmp_path, database_path)
+    except Exception:
         connection.close()
-    os.replace(tmp_path, database_path)
+        raise
     return num_loci
 
 

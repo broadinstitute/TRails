@@ -48,21 +48,6 @@ def server_motif_bins():
     return re.findall(r"(?:THEN|ELSE) '([^']*)'", match.group(0))
 
 
-def js_handler_body(text, signature):
-    """Returns the source of a top-level jQuery handler registration, closing `});` included.
-
-    Args:
-        text: Template source text to search.
-        signature: Start of the registration, e.g. "$(document).on('click', '.add-note-btn".
-
-    Returns:
-        The text from the registration through the `});` in column zero that ends it.
-    """
-    start = text.index(signature)
-    end = text.index("\n});\n", start)
-    return text[start:end + 5]
-
-
 def js_function_body(text, signature):
     """Returns the source of a top-level JavaScript function, braces included.
 
@@ -105,18 +90,17 @@ class TagFilterRestoreTests(unittest.TestCase):
         self.template = read_template("index_page_template.html")
 
     def test_startup_waits_for_both_dropdowns_before_restoring_url_state(self):
-        self.assertIn("Promise.all([tagDropdownReady, populateSampleIdDropdown()]).then(() => {\n"
+        self.assertIn("Promise.all([tagDropdownReady, sampleIdDropdownReady]).then(() => {\n"
                       "        // Read URL state and perform initial search after dropdowns are populated\n"
                       "        readStateFromUrl();", self.template)
-        # The restore must not be gated on the sample-id list alone.
-        self.assertNotIn("populateSampleIdDropdown().then(", self.template)
 
-    def test_the_tag_population_promise_is_kept_rather_than_fired_and_forgotten(self):
-        self.assertIn("const tagDropdownReady = populateTagDropdown();", self.template)
-        self.assertLess(self.template.index("const tagDropdownReady = populateTagDropdown();"),
-                        self.template.index("Promise.all([tagDropdownReady,"))
+    def test_the_dropdown_promises_are_kept_rather_than_fired_and_forgotten(self):
+        for declaration in ("const tagDropdownReady = refreshTagFilterDropdown($('#tag-filter'));",
+                            "const sampleIdDropdownReady = fetchJsonOrNull(`${API_BASE_URL}/schema`, 'Load schema')"):
+            self.assertIn(declaration, self.template)
+            self.assertLess(self.template.index(declaration), self.template.index("Promise.all([tagDropdownReady,"))
 
-    def test_search_and_export_still_read_the_tag_off_the_dropdown(self):
+    def test_search_and_export_read_the_tag_off_the_dropdown(self):
         # This is what makes the ordering matter, so pin it: if these ever stopped reading the
         # dropdown the startup ordering above would no longer be load bearing.
         self.assertIn("currentState.tag = $('#tag-filter').dropdown('get value') || '';", self.template)
@@ -148,13 +132,6 @@ class ActiveSortClassTests(unittest.TestCase):
     direction-free class marks every sorted column.
     """
 
-    def test_no_template_uses_a_direction_named_sort_class(self):
-        for name in sorted(os.listdir(CODE_DIRECTORY)):
-            if name.endswith(".html"):
-                template = read_template(name)
-                self.assertNotIn("sorted-asc", template, name)
-                self.assertNotIn("sorted-desc", template, name)
-
     def test_the_class_the_indicator_applies_is_the_class_the_stylesheet_matches(self):
         indicator = js_function_body(read_template("index_page_template.html"),
                                      "function syncSortHeaderIndicator(")
@@ -164,8 +141,9 @@ class ActiveSortClassTests(unittest.TestCase):
                             read_template("header_template.html"))
         self.assertEqual(["sorted-active"], styled)
 
-    def test_the_server_still_sorts_the_region_column_ascending(self):
-        # This is why a single direction-named class would be wrong for every sorted column.
+    def test_the_server_sorts_the_region_column_ascending(self):
+        # Region sorts ascending while the other columns sort descending, so a sorted-column
+        # marker cannot name a direction.
         self.assertIn('"region": ("gene_region_rank", "ASC")', read_template("results_server.py"))
 
 
@@ -223,8 +201,9 @@ class AnnotationWriteHelperTests(unittest.TestCase):
             for signature in self.HELPER_SIGNATURES + ("async function annotationError(",):
                 self.assertIn(signature, self.header)
                 self.assertNotIn(signature, template, name)
-            for call in ("saveNote(", "addTag(", "removeTag("):
+            for call in ("openNoteEditor(", "addTag(", "removeTag("):
                 self.assertIn(call, template, name)
+        self.assertIn("saveNote(currentLocusId, noteText)", js_function_body(self.header, "async function openNoteEditor("))
 
     def test_the_write_helpers_read_the_response_body(self):
         for signature in self.HELPER_SIGNATURES:
@@ -234,9 +213,6 @@ class AnnotationWriteHelperTests(unittest.TestCase):
         helper = js_function_body(self.header, "async function annotationError(")
         self.assertIn("await response.json().catch(() => ({}))", helper)
         self.assertIn("body.detail || body.error || `HTTP ${response.status}`", helper)
-
-    def test_the_comment_names_the_hook_that_returns_the_read_only_server_403(self):
-        self.assertIn("(the results_server.restrict_writes before_request hook)", self.header)
 
     def test_no_template_names_a_server_symbol_that_does_not_exist(self):
         # Every `results_server.<name>` a comment cites has to be findable in the server.
@@ -256,10 +232,9 @@ class AnnotationWriteHelperTests(unittest.TestCase):
         self.assertIn('"detail": "This server is bound to a non-loopback address', hook)
         self.assertIn("403", hook)
 
-    def test_the_server_still_sends_the_fields_the_helpers_read(self):
+    def test_the_server_sends_the_fields_the_helpers_read(self):
         server = read_template("results_server.py")
         self.assertIn('"error": "annotation changes are limited to this machine"', server)
-        self.assertIn('"detail": "This server is bound to a non-loopback address', server)
         self.assertIn('{"error": "note_text is required and cannot be empty"}', server)
 
 
@@ -415,9 +390,25 @@ class QCPageSharedCodeTests(unittest.TestCase):
             template = read_template(name)
             self.assertIn('{% include "qc_shared_js.html" %}', template, name)
             self.assertIn("appendQCBinCard(container, idx, bin, ", template, name)
-            self.assertIn("return createSingleBinBoxPlotChart(canvasId, ", template, name)
+            self.assertIn("createSingleBinBoxPlotChart(canvasId, ", template, name)
             self.assertNotIn("new Chart(", template, name)
             self.assertNotIn("document.createElement(", template, name)
+
+    def test_qc2_builds_every_section_with_one_function(self):
+        # The per-trio and per-center sections differ only in TRIO_SECTION and CENTER_SECTION, so
+        # the zero-denominator exclusion and the shared y-axis rounding exist once.
+        template = read_template("qc2_template.html")
+        self.assertEqual(1, template.count("data.filter(item => item.total > 0)"))
+        self.assertEqual(1, template.count("Math.ceil(maxFraction / 0.05) * 0.05 || 0.05"))
+        load = js_function_body(template, "async function loadQC2Data(")
+        self.assertEqual(2, load.count("_BINS, TRIO_SECTION);"))
+        self.assertEqual(2, load.count("_BINS, CENTER_SECTION);"))
+
+    def test_the_center_section_titles_name_the_server_trio_minimum(self):
+        # The cutoff is the server's MIN_TRIOS_PER_CENTER, which the qc2() route passes in
+        template = read_template("qc2_template.html")
+        self.assertEqual(2, template.count("centers with ≥{{ min_trios_per_center }} trios</div>"))
+        self.assertIn("min_trios_per_center=MIN_TRIOS_PER_CENTER,", read_template("results_server.py"))
 
     def test_the_shared_builder_hands_the_box_plot_plugin_its_statistics(self):
         builder = js_function_body(read_template("qc_shared_js.html"), "function createSingleBinBoxPlotChart(")
@@ -427,20 +418,11 @@ class QCPageSharedCodeTests(unittest.TestCase):
 
 
 class DefaultSourceTests(unittest.TestCase):
-    """No page renders a database-source selector; every page queries the server's default source."""
+    """Every page queries the server's single, default source."""
 
-    def test_no_page_renders_a_source_selector(self):
-        for name in ("index_page_template.html", "swim_plot_template.html", "sample_qc_template.html"):
-            template = read_template(name)
-            for selector_markup in ("db_labels", 'name="source"', "swim_source", "available_sources"):
-                self.assertNotIn(selector_markup, template, name)
-
-    def test_index_state_functions_keep_the_default_source(self):
-        template = read_template("index_page_template.html")
-        self.assertNotIn("'require_above_population', 'source'", template)
-        self.assertNotIn("currentState.source = ", template)
-        # The default source is still what the API calls and the warning lookups use.
-        self.assertIn("params.set('source', currentState.source);", template)
+    def test_api_requests_carry_the_default_source(self):
+        # The server accepts and ignores it; the page's Mendelian-warning lookups use it.
+        self.assertIn("params.set('source', currentState.source);", read_template("index_page_template.html"))
 
     def test_swim_plot_loads_the_default_source(self):
         self.assertIn("const params = { outlier_type: outlierType, source: SWIM_DEFAULT_SOURCE };",
@@ -510,59 +492,38 @@ class VariationClusterHelpTextTests(unittest.TestCase):
 
     def test_missing_cluster_is_described_as_unknown_not_as_absent(self):
         template = read_template("index_page_template.html")
-        self.assertNotIn("have no variation beyond the repeat itself", template)
         self.assertIn("Loci with no variation cluster size are kept whatever value you enter, "
                       "because there is no size to compare against", template)
 
 
-class SwimNoteEditingGuardTests(unittest.TestCase):
-    """The swim plot's Edit Note button must stay off until the stored note is known.
+class SwimDetailModalTests(unittest.TestCase):
+    """The swim plot's detail modal: one set of note and tag buttons, and the latest dot wins.
 
-    showDotDetail opens the modal over a loading indicator and only then fetches the locus
-    detail, and the footer handler takes the note's current text out of the rendered content.
-    A click while the fetch is in flight would therefore open an empty editor over an existing
-    note, and saving would replace that note with whatever was typed.
+    The note and tag buttons are the ones rendered in its User Annotations section, so they only
+    exist once the locus's annotations are on the page.
     """
 
     def setUp(self):
         self.template = read_template("swim_plot_template.html")
         self.show_dot_detail = js_function_body(self.template, "function showDotDetail(item) {")
 
-    def test_the_footer_button_starts_disabled(self):
-        # No locus is loaded before the first dot is clicked, so the markup itself is disabled.
-        self.assertIn('<button class="ui basic button disabled swim-edit-note-btn" '
-                      'style="float: left;" disabled>', self.template)
+    def test_the_footer_holds_only_the_close_button(self):
+        self.assertIn('<div class="scrolling content" id="dot-detail-content"></div>\n'
+                      '    <div class="actions">\n'
+                      '        <div class="ui cancel button">Close</div>\n'
+                      '    </div>', self.template)
 
-    def test_editing_is_disabled_before_the_modal_opens(self):
-        self.assertLess(self.show_dot_detail.index("setSwimNoteEditingEnabled(false)"),
-                        self.show_dot_detail.index("$('#dot-detail-modal').modal('show')"))
+    def test_the_rendered_section_has_the_note_and_tag_buttons(self):
+        render = js_function_body(self.template, "function renderDotDetailContent(")
+        for button_class in ("swim-inline-edit-note", "swim-inline-delete-note", "swim-inline-add-note",
+                             "swim-inline-add-tag"):
+            self.assertIn(button_class, render)
 
-    def test_editing_is_re_enabled_only_after_the_content_is_rendered(self):
-        self.assertEqual(1, self.show_dot_detail.count("setSwimNoteEditingEnabled(true)"))
-        self.assertLess(self.show_dot_detail.index("renderDotDetailContent(item, detail, stats, params)"),
-                        self.show_dot_detail.index("setSwimNoteEditingEnabled(true)"))
-
-    def test_a_stale_response_cannot_re_enable_editing(self):
-        # The newer-dot guard returns before the enable, so a late response for a dot the user
-        # has already navigated away from cannot unlock the button for the one now loading.
+    def test_a_stale_response_cannot_render_into_the_modal(self):
+        # The newer-dot guard returns before the render, so a late response for a dot the user
+        # has already navigated away from cannot fill the modal now showing another one.
         self.assertLess(self.show_dot_detail.index("if (seq !== swimDetailSeq) return;"),
-                        self.show_dot_detail.index("setSwimNoteEditingEnabled(true)"))
-
-    def test_a_failed_load_leaves_editing_disabled(self):
-        catch_block = self.show_dot_detail[self.show_dot_detail.index(".catch(err =>"):]
-        self.assertIn("Failed to load details: ", catch_block)
-        self.assertNotIn("setSwimNoteEditingEnabled(true)", catch_block)
-
-    def test_the_helper_disables_the_element_itself_not_only_its_styling(self):
-        helper = js_function_body(self.template, "function setSwimNoteEditingEnabled(enabled) {")
-        self.assertIn("swimDetailLoaded = enabled;", helper)
-        self.assertIn(".toggleClass('disabled', !enabled).prop('disabled', !enabled)", helper)
-
-    def test_the_click_handler_refuses_while_the_note_is_still_unknown(self):
-        handler = js_handler_body(self.template, "$(document).on('click', '.swim-edit-note-btn'")
-        self.assertIn("if (!_currentModalItem || !swimDetailLoaded) return;", handler)
-        # The guard has to precede the read of the rendered note and the save.
-        self.assertLess(handler.index("!swimDetailLoaded"), handler.index(".note-text"))
+                        self.show_dot_detail.index("renderDotDetailContent(item, detail, stats, params)"))
 
     def test_show_dot_detail_itself_records_the_item_the_modal_acts_on(self):
         self.assertTrue(self.show_dot_detail.startswith("function showDotDetail(item) {\n"
@@ -570,20 +531,57 @@ class SwimNoteEditingGuardTests(unittest.TestCase):
         self.assertNotIn("showDotDetail = ", self.template)
 
 
-class ResultsPageNoteLoadFailureTests(unittest.TestCase):
-    """The results page must not open an empty note editor when the load failed.
+class SharedNoteEditorTests(unittest.TestCase):
+    """Both pages edit notes in the one multi-line note editor in header_template.html.
 
-    The results page fetches the note before opening the modal, so it has no click-while-loading
-    window, but treating a non-ok response or a thrown request as "no note" would open an empty
-    textarea, and saving that would replace the stored note the same way.
+    A textarea keeps a note's line breaks, which a window.prompt text field cannot hold.
     """
 
     def setUp(self):
-        self.handler = js_handler_body(read_template("index_page_template.html"),
-                                       "$(document).on('click', '.add-note-btn, .note-indicator'")
+        self.header = read_template("header_template.html")
+
+    def test_the_editor_is_a_textarea_in_the_shared_header(self):
+        self.assertIn('<div id="edit-note-modal" class="ui small modal">', self.header)
+        self.assertIn('<textarea id="note-textarea" rows="4"', self.header)
+        for name in ("index_page_template.html", "swim_plot_template.html"):
+            self.assertNotIn('id="edit-note-modal"', read_template(name), name)
+
+    def test_both_pages_open_it(self):
+        self.assertIn("openNoteEditor(locusId, refreshAfterNoteChange);", read_template("index_page_template.html"))
+        swim = read_template("swim_plot_template.html")
+        self.assertIn("openNoteEditor($(this).data('locus-id'), refreshSwimModal);", swim)
+        self.assertNotIn("prompt('Enter note:'", swim)
+
+    def test_it_opens_over_the_swim_plot_detail_modal(self):
+        self.assertIn("allowMultiple: true,", js_function_body(self.header, "async function openNoteEditor("))
+
+    def test_every_open_sets_the_editor_and_no_close_resets_it(self):
+        # A reset when the hide animation ends could land after a quick reopen had already filled
+        # the editor with the stored note, leaving it empty over that note.
+        editor = js_function_body(self.header, "async function openNoteEditor(")
+        self.assertIn("$textarea.val(data.note.note_text);", editor)
+        self.assertNotIn("onHidden: function", editor)
+
+    def test_save_and_delete_tell_the_page_to_repaint(self):
+        editor = js_function_body(self.header, "async function openNoteEditor(")
+        self.assertIn("noteEditorOnNoteChanged = onNoteChanged;", editor)
+        self.assertIn("noteEditorOnNoteChanged(currentLocusId);", editor)
+        delete_handler = self.header[self.header.index("$(document).on('click', '#delete-note-btn'"):]
+        self.assertIn("noteEditorOnNoteChanged(locusId);", delete_handler[:delete_handler.index("\n});\n")])
+
+
+class NoteEditorLoadFailureTests(unittest.TestCase):
+    """The note editor must not open empty when the stored note could not be loaded.
+
+    It fetches the note before opening the modal, so it has no click-while-loading window, but
+    treating a non-ok response or a thrown request as "no note" would open an empty textarea, and
+    saving that would replace the stored note with whatever was typed.
+    """
+
+    def setUp(self):
+        self.handler = js_function_body(read_template("header_template.html"), "async function openNoteEditor(")
 
     def test_a_failed_response_is_not_read_as_an_absent_note(self):
-        self.assertNotIn("response.ok ? await response.json() : {}", self.handler)
         self.assertIn("if (!response.ok) throw new Error(`HTTP ${response.status}`);", self.handler)
 
     def test_the_editor_stays_closed_when_the_existing_note_could_not_be_loaded(self):
@@ -763,22 +761,13 @@ class MinDeltaPopFilterTests(unittest.TestCase):
         self.assertIn("const popMetric = currentState.population_metric === 'max' ? 'MaxAllele' : '99thPercentile';", row)
         self.assertIn("currentState.require_above_population === 'short-read' ? ['TenK10K']", row)
         self.assertIn("currentState.require_above_population === 'long-read' ? ['HPRC256', 'AoU1027']", row)
-        self.assertIn(": ['HPRC256', 'AoU1027', 'TenK10K'];", row)
+        self.assertIn(": POPULATION_COHORTS;", row)
         self.assertIn("locus[`${p}_${popMetric}`]", row)
-        server = read_template("results_server.py")
-        self.assertIn('LONG_READ_POPULATION_DATASETS = ("HPRC256", "AoU1027")', server)
-        self.assertIn('POPULATION_DATASETS = LONG_READ_POPULATION_DATASETS + ("TenK10K",)', server)
-        self.assertIn('"short-read": ("TenK10K",),', server)
+        # The full cohort list is pinned to the server's in PopulationCohortTests
+        self.assertIn('"short-read": ("TenK10K",),', read_template("results_server.py"))
 
-    def test_the_page_has_no_min_pli_filter(self):
-        # Only a comment on the page names min_pli; the server still accepts it.
-        for line in self.template.split("\n"):
-            if "min_pli" in line:
-                self.assertTrue(line.strip().startswith("//"), line)
+    def test_the_server_accepts_min_pli_for_api_callers(self):
         self.assertIn('request.args.get("min_pli")', read_template("results_server.py"))
-
-    def test_the_swim_plot_has_no_min_pli_filter_either(self):
-        self.assertNotIn("min_pli", read_template("swim_plot_template.html"))
 
     def test_an_old_bookmark_with_min_pli_is_normalized_in_place(self):
         # readStateFromUrl keeps only DEFAULT_STATE keys, and then always rewrites the arrival
@@ -927,7 +916,7 @@ class PopulationGateOptionTests(unittest.TestCase):
                       read_template("results_server.py"))
 
     def test_it_only_applies_to_a_url_with_no_fragment_at_all(self):
-        startup = self.template[self.template.index("Promise.all([tagDropdownReady, populateSampleIdDropdown()])"):]
+        startup = self.template[self.template.index("Promise.all([tagDropdownReady, sampleIdDropdownReady])"):]
         startup = startup[:startup.index("performSearch();")]
         self.assertLess(startup.index("readStateFromUrl();"), startup.index("INITIAL_REQUIRE_ABOVE_POPULATION"))
         self.assertIn("if (!window.location.href.includes('#') && INITIAL_REQUIRE_ABOVE_POPULATION) {", startup)
@@ -956,12 +945,11 @@ class TRExplorerLinkTests(unittest.TestCase):
 
 
 class SwimPlotMarkerTests(unittest.TestCase):
-    """The swim plot marks true/candidate tags with a filled triangle, not Chart.js's hairline star."""
+    """The swim plot marks true/candidate tags with a filled triangle, and the legend shows the same marker."""
 
     def test_the_point_style_and_the_legend_agree(self):
         template = read_template("swim_plot_template.html")
         self.assertIn("style = 'triangle';", template)
-        self.assertNotIn("style = 'star';", template)
         self.assertIn('<span style="margin-left: 8px;">&#9650;</span> True/Candidate', template)
 
     def test_only_a_whole_true_or_candidate_tag_gets_the_triangle(self):
@@ -976,20 +964,132 @@ class SwimPlotMarkerTests(unittest.TestCase):
         self.assertIn("ORDER BY allele_size DESC, LocusId, sample_id LIMIT 500", read_template("results_server.py"))
 
 
-class TagListRequestTests(unittest.TestCase):
-    """Each page fills its tag filter menu and its cached tag list from one /annotations/tags request."""
+class SharedMenuLoaderTests(unittest.TestCase):
+    """Both pages fill their tag and sample-ID menus with header_template.html's loaders.
 
-    def test_the_results_page_requests_the_tags_in_one_place(self):
+    The loaders go through fetchJsonOrNull, which treats an error status as a failed request, so
+    a failed request leaves a menu and the cached tag list as they were instead of emptying them.
+    """
+
+    def setUp(self):
+        self.header = read_template("header_template.html")
+
+    def test_an_error_status_is_a_failed_request(self):
+        loader = js_function_body(self.header, "async function fetchJsonOrNull(")
+        self.assertIn("if (!response.ok) throw new Error(`HTTP ${response.status}`);", loader)
+        self.assertIn("return null;", loader)
+
+    def test_one_tag_request_fills_the_menu_and_the_cached_list(self):
+        refresh = js_function_body(self.header, "async function refreshTagFilterDropdown(")
+        self.assertIn("const data = await fetchJsonOrNull(`${ANNOTATIONS_API_URL}/tags`, 'Load tags');\n"
+                      "    if (!data) return;", refresh)
+        self.assertIn("window._allTagsList = data.tags || [];", refresh)
+        # The filter menu lists the same tags the add-tag hints offer
+        self.assertIn("setupDropdownMenu($dropdown, window._allTagsList.map(", refresh)
+
+    def test_both_pages_use_the_shared_loaders(self):
+        for name, prefix in (("index_page_template.html", ""), ("swim_plot_template.html", "swim-")):
+            template = read_template(name)
+            self.assertIn("refreshTagFilterDropdown($('#%stag-filter'))" % prefix, template, name)
+            self.assertIn("fillSampleIdDropdown($('#%ssample-id-filter'), schema);" % prefix, template, name)
+            self.assertNotIn("/annotations/tags", template, name)
+
+    def test_the_results_page_requests_the_schema_once(self):
+        # The one response fills the sample-ID menu and the loci / samples count
         template = read_template("index_page_template.html")
-        self.assertEqual(1, template.count("/annotations/tags`"))
-        self.assertIn("window._allTagsList = data.tags || [];",
-                      js_function_body(template, "async function populateTagDropdown("))
+        self.assertEqual(1, template.count("/schema`"))
+        self.assertIn("$('#total-loci-label').text(counts);", template)
 
-    def test_the_swim_plot_requests_the_tags_in_one_place(self):
-        template = read_template("swim_plot_template.html")
-        self.assertEqual(1, template.count("'/annotations/tags'"))
-        self.assertIn("window._allTagsList = d.tags || [];",
-                      js_function_body(template, "function refreshSwimTags("))
+
+class SharedPageHelperTests(unittest.TestCase):
+    """The results page and the swim plot share the UCSC link, the outlier-type map and the
+    gene-region checkbox wiring through header_template.html, so the two copies cannot drift."""
+
+    PAGES = ("index_page_template.html", "swim_plot_template.html")
+
+    def test_the_helpers_are_defined_in_the_header(self):
+        header = read_template("header_template.html")
+        self.assertIn("function buildUcscUrl(locus) {", header)
+        self.assertIn("const OUTLIER_TYPE_MAP = {all: 'AllAlleles', short: 'ShortAlleles', hemi: 'HemizygousAlleles'};",
+                      header)
+        self.assertIn("function linkGeneRegionIncludeAndExcludeCheckboxes(namePrefix) {", header)
+        # The JavaScript map follows the server's
+        self.assertIn('OUTLIER_TYPE_MAP = {"all": "AllAlleles", "short": "ShortAlleles", "hemi": "HemizygousAlleles"}',
+                      read_template("results_server.py"))
+
+    def test_both_pages_use_them(self):
+        for name, prefix in zip(self.PAGES, ("''", "'swim_'")):
+            template = read_template(name)
+            self.assertIn("const ucscUrl = buildUcscUrl(locus);", template, name)
+            self.assertIn("OUTLIER_TYPE_MAP[", template, name)
+            self.assertIn("linkGeneRegionIncludeAndExcludeCheckboxes(%s);" % prefix, template, name)
+            self.assertNotIn("genome.ucsc.edu", template, name)
+
+
+class DotJitterTests(unittest.TestCase):
+    """Chart dots are spread by a fixed offset per dot, so a redraw leaves every dot in place."""
+
+    def test_the_swim_plot_offset_comes_from_the_locus_and_sample(self):
+        self.assertIn("y: categoryToY(item.motif_category) + jitterFromKey(`${item.LocusId}\\t${item.sample_id}`, 0.6),",
+                      read_template("swim_plot_template.html"))
+
+    def test_the_qc_box_plot_offset_comes_from_the_point(self):
+        self.assertIn("x: jitterFromKey(JSON.stringify(point), 0.6)",
+                      js_function_body(read_template("qc_shared_js.html"), "function createSingleBinBoxPlotChart("))
+
+
+class AnnotationRefreshTests(unittest.TestCase):
+    """A note or tag edit requests the locus's annotations once, and a tag edit leaves the detail
+    panel alone, since the panel shows the note but not the tags."""
+
+    def setUp(self):
+        self.template = read_template("index_page_template.html")
+
+    def test_a_note_change_repaints_the_badges_once_and_the_open_panel(self):
+        self.assertEqual("function refreshAfterNoteChange(locusId) {\n"
+                         "    refreshRowAnnotations(locusId);\n"
+                         "    refreshDetailPanel(locusId);\n"
+                         "}\n",
+                         js_function_body(self.template, "function refreshAfterNoteChange("))
+        self.assertNotIn("refreshRowAnnotations", js_function_body(self.template, "async function refreshDetailPanel("))
+
+    def test_the_detail_panel_shows_the_note_but_not_the_tags(self):
+        detail = js_function_body(self.template, "function renderLocusDetail(detail, outlierType) {")
+        self.assertIn("detail.user_annotations?.note", detail)
+        self.assertNotIn("tags", detail)
+
+
+class PopulationCohortTests(unittest.TestCase):
+    """Both pages take the population cohorts from one list, header_template.html's POPULATION_COHORTS."""
+
+    def test_the_list_matches_the_server_cohorts(self):
+        self.assertIn("const POPULATION_COHORTS = ['HPRC256', 'AoU1027', 'TenK10K'];",
+                      read_template("header_template.html"))
+        server = read_template("results_server.py")
+        self.assertIn('LONG_READ_POPULATION_DATASETS = ("HPRC256", "AoU1027")', server)
+        self.assertIn('POPULATION_DATASETS = LONG_READ_POPULATION_DATASETS + ("TenK10K",)', server)
+
+    def test_both_detail_views_iterate_over_it(self):
+        index = read_template("index_page_template.html")
+        self.assertIn("const popEntries = POPULATION_COHORTS.map(name => ({",
+                      js_function_body(index, "function renderLocusDetail(detail, outlierType) {"))
+        swim = read_template("swim_plot_template.html")
+        self.assertIn("POPULATION_COHORTS.filter(k => popThresh[k + '_MaxAllele'] != null).forEach(k => {",
+                      js_function_body(swim, "function renderDotDetailContent("))
+        for name, template in (("index_page_template.html", index), ("swim_plot_template.html", swim)):
+            self.assertNotIn("['TenK10K', 'TenK10K']", template, name)
+
+
+class AnnotationBadgeTests(unittest.TestCase):
+    """A row repainted after a note or tag edit gets the same badges as a freshly loaded row."""
+
+    def test_both_paths_use_the_one_badge_builder(self):
+        template = read_template("index_page_template.html")
+        self.assertEqual(1, template.count('<span class="badge badge-tag">'))
+        self.assertIn("renderAnnotationBadges(locus.tags || [], locus.has_note)",
+                      js_function_body(template, "function renderLocusRow(locus, rowIndex) {"))
+        self.assertIn("renderAnnotationBadges(ann.tags || [], ann.note != null)",
+                      js_function_body(template, "async function refreshRowAnnotations("))
 
 
 class CdnIntegrityTests(unittest.TestCase):

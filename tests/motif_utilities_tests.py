@@ -85,8 +85,7 @@ class ComputeCanonicalMotifTests(unittest.TestCase):
         # CAG rotations: CAG, AGC, GCA -> AGC. RC is CTG -> CTG. AGC < CTG.
         self.assertEqual(compute_canonical_motif("CAG"), "AGC")
 
-    def test_reverse_complement_flag_changes_result(self):
-        # For a motif whose reverse-complement rotation is smaller, the flag matters.
+    def test_reverse_complement_flag_does_not_matter_when_the_forward_rotation_is_smallest(self):
         with_rc = compute_canonical_motif("GAA", include_reverse_complement=True)
         without_rc = compute_canonical_motif("GAA", include_reverse_complement=False)
         self.assertEqual(with_rc, "AAG")

@@ -33,19 +33,9 @@ class ParseOutlierEntriesTests(unittest.TestCase):
     def test_descending_sort_and_x_strip(self):
         # Input is not pre-sorted; output must be descending by allele size.
         entries = parse_outlier_entries("10x:s1,40x:s2,25x:s3")
-        self.assertEqual([allele for allele, _, _, _ in entries], [40, 25, 10])
-        self.assertEqual([sid for _, sid, _, _ in entries], ["s2", "s3", "s1"])
         # The trailing 'x' was stripped and alleles are ints.
-        self.assertTrue(all(isinstance(allele, int) for allele, _, _, _ in entries))
-
-    def test_purity_and_methylation_parsing(self):
-        entries = parse_outlier_entries("40x:s2:0.97:0.5,25x:s3:.:.,10x:s1")
-        # Sorted descending: 40, 25, 10.
-        self.assertEqual(entries[0], (40, "s2", "0.97", "0.5"))
-        # A literal "." becomes None for both purity and methylation.
-        self.assertEqual(entries[1], (25, "s3", None, None))
-        # Missing fields become None.
-        self.assertEqual(entries[2], (10, "s1", None, None))
+        self.assertEqual(entries, [(40, "s2"), (25, "s3"), (10, "s1")])
+        self.assertTrue(all(isinstance(allele, int) for allele, _ in entries))
 
     def test_missing_values(self):
         for missing in ["", ".", "NA", "N/A", "nan", "NaN", "None", "null", None, float("nan")]:
@@ -57,9 +47,10 @@ class ParseOutlierEntriesTests(unittest.TestCase):
         self.assertFalse(is_missing_outlier_value("0x:s1"))
 
     def test_malformed_entry_raises(self):
-        # Fewer than two colon-separated fields.
-        with self.assertRaises(ValueError):
-            parse_outlier_entries("10x")
+        # Fewer or more than two colon-separated fields (a sample_id cannot contain ':').
+        for malformed in ("10x", "10x:s1:0.9"):
+            with self.assertRaises(ValueError, msg=malformed):
+                parse_outlier_entries(malformed)
         # Non-integer allele.
         with self.assertRaises(ValueError):
             parse_outlier_entries("abc:s1")
@@ -91,17 +82,52 @@ class StatusTruthTableTests(unittest.TestCase):
 class BlankMetadataValueTests(unittest.TestCase):
 
     def test_blank_to_none(self):
-        for blank in (None, float("nan"), "", "   "):
+        for blank in (None, float("nan"), "", "   ", "NA", " na ", "N/A", "nan", "None", "NULL"):
             self.assertIsNone(blank_to_none(blank), repr(blank))
         self.assertEqual(blank_to_none("F1"), "F1")
         self.assertEqual(blank_to_none(" F1 "), " F1 ")
+        self.assertEqual(blank_to_none("NAFAM"), "NAFAM")
 
     def test_get_family_id(self):
         sample_lookup = {"a": {"family_id": "F1"}, "b": {"family_id": ""},
-                         "c": {"family_id": " "}, "d": {}}
+                         "c": {"family_id": " "}, "d": {}, "e": {"family_id": "NA"}}
         self.assertEqual(get_family_id("a", sample_lookup), "F1")
-        for sample_id in ("b", "c", "d", "no_metadata_row"):
+        for sample_id in ("b", "c", "d", "e", "no_metadata_row"):
             self.assertIsNone(get_family_id(sample_id, sample_lookup), sample_id)
+
+    def test_na_family_ids_do_not_merge_unrelated_samples(self):
+        # Two unrelated samples whose family_id cells both say "NA" (read_sample_metadata
+        # keeps that string) have no family: they are not one family in the counts, in the
+        # _ByFamily ranking, or in the affected_unsolved_outliers_above_unaffected rows.
+        records = [{
+            "LocusId": "L",
+            "OutlierSampleIds_AllAlleles": make_outlier_string([(50, "S1"), (40, "S2"), (30, "S3")]),
+            "OutlierSampleIds_ShortAlleles": "",
+            "OutlierSampleIds_HemizygousAlleles": "",
+        }]
+        sample_lookup = {"S1": {"family_id": "NA"}, "S2": {"family_id": "na"},
+                         "S3": {"family_id": " "}}
+        affected_lookup = {sample_id: "affected" for sample_id in sample_lookup}
+        rows = add_all_outlier_columns(records, sample_lookup, affected_lookup, {})
+        record = records[0]
+        self.assertEqual(record["NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles"], 3)
+        self.assertEqual(record["NumAffectedUnsolvedFamiliesAboveUnaffected_AllAlleles"], 0)
+        self.assertIsNone(record["FirstAffectedAlleleSize_AllAlleles_ByFamily"])
+        self.assertEqual([row["family_id"] for row in rows], [None, None, None])
+
+    def test_blank_phenotypes_are_stored_as_none(self):
+        # The loci table's AffectedPhenotype columns follow the same blank rule as the swim plot's
+        # phenotype_description; a sample without a metadata row has no phenotype either.
+        records = [{
+            "LocusId": "L",
+            "OutlierSampleIds_AllAlleles": make_outlier_string([(50, "S1"), (40, "S2"), (30, "S3")]),
+            "OutlierSampleIds_ShortAlleles": "",
+            "OutlierSampleIds_HemizygousAlleles": "",
+        }]
+        sample_lookup = {"S1": {"phenotype_description": "NA"}, "S2": {"phenotype_description": ""}}
+        add_all_outlier_columns(records, sample_lookup, {}, {})
+        for prefix in ("First", "Second", "Third"):
+            self.assertIsNone(records[0][f"{prefix}AffectedPhenotype_AllAlleles"], prefix)
 
 
 class PopulationThresholdTests(unittest.TestCase):
@@ -238,6 +264,15 @@ class NumAffectedUnsolvedSamplesTests(unittest.TestCase):
         analysis_lookup = {k: "unsolved" for k in affected_lookup}
         sample_counts, _ = self._counts(row, affected_lookup, analysis_lookup)
         self.assertEqual(sample_counts[0], 1)
+
+    def test_sample_also_at_the_tie_allele_keeps_its_larger_allele(self):
+        # a1's second allele ties with u1, but its larger allele is above every unaffected.
+        row = {"OutlierSampleIds_AllAlleles": make_outlier_string(
+            [(50, "a1"), (40, "a2"), (40, "a1"), (40, "u1")])}
+        affected_lookup = {"a1": "affected", "a2": "affected", "u1": "unaffected"}
+        samples = find_affected_unsolved_samples_above_unaffected(
+            row, affected_lookup, {}, self._parsed(row))
+        self.assertEqual(samples[0], {"a1": 50})
 
     def test_stop_at_or_below_p99(self):
         # p99 = 40, so only the allele strictly above 40 (a1 at 50) is counted.
@@ -471,6 +506,14 @@ class AddGeneColumnsTests(unittest.TestCase):
         for record in records:
             self.assertIsNone(record["pLI"])
             self.assertIsNone(record["inheritance"])
+
+    def test_inheritance_is_the_gene_table_inheritance(self):
+        # read_gene_table gives a blank inheritance cell as a float NaN; both columns store None.
+        records = [{"gene_id": "G1"}, {"gene_id": "G2"}, {"gene_id": "missing"}]
+        add_gene_columns(records, {"G1": {"inheritance": "AD"}, "G2": {"inheritance": float("nan")}})
+        self.assertEqual([record["inheritance"] for record in records], ["AD", None, None])
+        for record in records:
+            self.assertEqual(record["inheritance"], record["GeneTableInheritance"])
 
 
 class OutputColumnsTests(unittest.TestCase):
