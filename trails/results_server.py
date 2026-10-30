@@ -36,12 +36,16 @@ import pandas as pd
 # The only module that imports duckdb; everything here goes through its sqlite3-shaped API.
 import duckdb_compat
 
-# get_population_p99_threshold, the build's population bar, which the exports apply too, and
-# blank_to_none, which says whether a metadata cell records anything
+# get_population_p99_threshold, the build's population bar, which the exports apply too;
+# is_unaffected_or_solved_status, the build's #Aff split, which the ExpansionHunter thresholds use;
+# and title_case_status_for_display, how the pages show statuses
 import analysis_columns
 
 # read_sample_metadata, the build's sample-table reader, which load_sample_table reuses
 import input_tables
+
+# Known-disease-locus loading and matching, which the locus-detail page's annotations use
+from locus_annotations import find_matching_disease_locus, load_known_disease_loci
 
 # Canonical motifs, and the bases they are defined for
 from motif_utilities import COMPLEMENT, compute_canonical_motif
@@ -55,28 +59,6 @@ from result_database import AFFECTED_UNSOLVED_OUTLIERS_TABLE, read_population_ga
 # rather than spelling the alphabet out here keeps the two from drifting: anything outside the table
 # makes reverse_complement raise KeyError, so the "motif" query parameter is validated against it.
 VALID_MOTIF_PATTERN = re.compile(f"^[{''.join(sorted(COMPLEMENT))}]+$", re.IGNORECASE)
-
-# Known-disease-locus loading and matching live in the locus_annotations module, which needs
-# intervaltree. Import them defensively so the server stays importable without it; the
-# locus-detail page's known-disease annotations simply degrade to "no match" in that case.
-try:
-    from locus_annotations import find_matching_disease_locus, load_known_disease_loci
-except ImportError as import_error:
-    # A missing module is the supported degraded mode; a missing *name* means the two files have
-    # drifted, which would otherwise disable the known-disease annotations without a word.
-    print(f"WARNING: falling back to the built-in known-disease stubs: {import_error}")
-
-    def load_known_disease_loci(filepath, strchive_filepath=None):
-        """Disabled fallback: no disease catalog available -> empty trees.
-
-        Mirrors the real loader's (interval_trees, strchive_trees) return shape so the startup
-        call site unpacks identically.
-        """
-        return {}, {}
-
-    def find_matching_disease_locus(chrom, start, end, motif, interval_trees, strchive_trees=None):
-        """Disabled fallback: with no disease catalog, no locus matches -> (None, None)."""
-        return None, None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -138,7 +120,7 @@ LIST_COLUMNS_STATIC = [
     "Source", "ReferenceRegion",
     "gene_id", "gene_region", "gene_region_rank",
     "GeneTableGeneSymbol", "GeneTableInheritance", "GeneTableLLMPhenotypeSummary",
-    "pLI", "inheritance",
+    "pLI",
     "IsKnownMotif", "IsInMendelianGene", "KnownDiseaseLocus",
     # The three variation-cluster columns are optional: they are carried over from the input
     # TSV only when it supplies them. A database without them reports them as None
@@ -485,26 +467,10 @@ def jsonify(data):
 
 TEMPLATE_DIR = os.path.dirname(os.path.abspath(__file__))
 jinja2_env = jinja2.Environment(loader=jinja2.FileSystemLoader(TEMPLATE_DIR))
-
-
-def _safe_tojson(value):
-    """HTML-safe JSON for embedding values in <script> blocks.
-
-    Escapes the characters that would otherwise let a value break out of the
-    surrounding <script> tag or be reinterpreted as HTML. The escaped output is
-    still valid JSON and parses identically in the browser. json.dumps already writes
-    every non-ASCII character as a backslash-u escape, including the line separators
-    U+2028 and U+2029, which a <script> block must not contain raw.
-    """
-    return (
-        json.dumps(value)
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-        .replace("&", "\\u0026")
-    )
-
-
-jinja2_env.filters["tojson"] = _safe_tojson
+# The pages embed values in <script> blocks with Jinja's tojson filter, which escapes <, >, & and '
+# so a value cannot end the block. Keys keep their insertion order rather than being sorted, since
+# the warning popup lists a sample's motif_rates in the order load_mendelian_warnings adds them.
+jinja2_env.policies["json.dumps_kwargs"] = {"sort_keys": False}
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -1952,9 +1918,12 @@ def build_locus_filter_clauses(params, filters_applied_elsewhere=()):
 def build_api_query(params):
     """Build the SQL queries from validated API query parameters.
 
+    Every query takes sql_params. select_query returns every matching locus in the requested
+    order, as the exports want them; /api/v1/loci adds its page's LIMIT and OFFSET.
+
     Returns:
-        Tuple (select_query, count_query, motif_count_query, gene_region_count_query,
-        sql_params, sql_params_with_pagination).
+        Tuple (select_query, count_query, motif_count_query, gene_region_count_query, sql_params).
+        gene_region_count_query is None when the database has no gene_region column.
     """
     source_columns = app.config["DB_COLUMNS_SET"]
     where, sql_params = build_api_where_clause(params)
@@ -1968,7 +1937,7 @@ def build_api_query(params):
     # One pass over loci. DuckDB is columnar: the filter and the sort read only the columns they
     # name, and the remaining ~180 are read only for the page's rows, so picking the page's
     # LocusIds in a subquery first would only make the table be scanned twice.
-    select_query = f"SELECT * FROM loci WHERE {where}{order_by} LIMIT ? OFFSET ?"
+    select_query = f"SELECT * FROM loci WHERE {where}{order_by}"
     count_query = f"SELECT COUNT(*) FROM loci WHERE {where}"
     # The motif name breaks ties on count, so two motifs with the same number of loci keep a
     # fixed order in the response instead of swapping between identical requests.
@@ -1978,8 +1947,7 @@ def build_api_query(params):
         f"SELECT gene_region, COUNT(*) as count FROM loci WHERE {where} GROUP BY gene_region"
         if has_gene_region else None)
 
-    sql_params_with_pagination = sql_params + [params["page_size"], (params["page"] - 1) * params["page_size"]]
-    return select_query, count_query, motif_count_query, gene_region_count_query, sql_params, sql_params_with_pagination
+    return select_query, count_query, motif_count_query, gene_region_count_query, sql_params
 
 
 def row_to_list_dict(row, ot):
@@ -2545,12 +2513,13 @@ def get_loci():
         return error
 
     ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
-    select_query, count_query, motif_count_query, gene_region_count_query, sql_params, sql_params_with_pagination = build_api_query(params)
+    select_query, count_query, motif_count_query, gene_region_count_query, sql_params = build_api_query(params)
 
     conn = get_db()
     try:
         total = conn.execute(count_query, sql_params).fetchone()[0]
-        rows = conn.execute(select_query, sql_params_with_pagination).fetchall()
+        rows = conn.execute(f"{select_query} LIMIT ? OFFSET ?",
+                            sql_params + [params["page_size"], (params["page"] - 1) * params["page_size"]]).fetchall()
         motif_rows = conn.execute(motif_count_query, sql_params).fetchall()
         gene_region_rows = (conn.execute(gene_region_count_query, sql_params).fetchall()
                             if gene_region_count_query else [])
@@ -3093,7 +3062,7 @@ def iterate_export_dicts_with_samples(conn, query, sql_params, ot):
 
     Args:
         conn: DuckDB database connection.
-        query: The loci query of the export, without LIMIT/OFFSET.
+        query: The export's loci query (build_api_query's select_query).
         sql_params: The parameters of query.
         ot: The outlier type's column suffix, e.g. "AllAlleles".
 
@@ -3257,8 +3226,7 @@ def export_loci():
         return error_response
 
     ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
-    select_query, count_query, _, _, sql_params, _ = build_api_query(params)
-    base_query = select_query.replace(" LIMIT ? OFFSET ?", "")
+    select_query, count_query, _, _, sql_params = build_api_query(params)
 
     conn = get_db()
     # The exporters close conn once their streamed body is written
@@ -3268,12 +3236,12 @@ def export_loci():
         conn.close()
         raise
     if format_param == "bed":
-        return export_bed(conn, base_query, sql_params, total, params)
+        return export_bed(conn, select_query, sql_params, total, params)
     if format_param == "tsv":
-        return export_tsv(conn, base_query, sql_params, total, ot, params)
+        return export_tsv(conn, select_query, sql_params, total, ot, params)
     if format_param == "json":
-        return export_json(conn, base_query, sql_params, total, ot, params)
-    return export_expansion_hunter(conn, base_query, sql_params, total, ot, params)
+        return export_json(conn, select_query, sql_params, total, ot, params)
+    return export_expansion_hunter(conn, select_query, sql_params, total, ot, params)
 
 
 @app.route("/api/v1/loci/<locus_id>")
@@ -3328,7 +3296,7 @@ SWIM_PLOT_ALLELE_LEVEL_FILTERS = ("min_expansion", "apply_pathogenic_threshold",
 
 @app.route("/api/v1/swim_plot_data")
 def get_swim_plot_data():
-    """Return swim-plot data: one entry per outlier sample per motif category.
+    """Return swim-plot data: the 500 largest outlier alleles (swim_plot rows) of each motif category.
 
     Takes the /api/v1/loci parameters (see validate_params), plus require_affected_above_unaffected,
     which keeps only the alleles above every unaffected or solved sample's allele at their locus.
@@ -3422,7 +3390,7 @@ def get_swim_plot_data():
         # reads the table with several threads, so ordering by allele_size alone would pick a
         # different 500 of the tied rows on each request.
         for motif_category in categories:
-            query = ("""SELECT rowid, allele_size, motif_category, affected_status,
+            query = ("""SELECT allele_size, motif_category, affected_status,
                        LocusId, sample_id, Motif, gene_region, GeneTableGeneSymbol,
                        family_id, sex, analysis_status, phenotype_description
                 FROM swim_plot
@@ -3887,9 +3855,14 @@ def main():
         print(f"Loaded {total_loci:,d} loci from {total_samples:,d} genotyped samples")
     print(f"Loaded {len(app.config['LOOKUPS']['sample']):,d} samples")
     print(f"Loaded {len(app.config['ANNOTATIONS']['notes'])} notes, {len(app.config['ANNOTATIONS']['all_tags'])} unique tags")
-    for col in ("CanonicalMotif", "IsKnownMotif", "IsInMendelianGene"):
-        if col not in app.config["DB_COLUMNS_SET"]:
-            print(f"Note: database missing optional column: {col} (using fallback)")
+    for column, consequence in (
+            ("CanonicalMotif", "the motif filter matches the Motif column's rotations and reverse "
+                               "complements instead, and the motif counts count Motif values"),
+            ("IsKnownMotif", "the known-motifs-only filter will match no loci"),
+            ("IsInMendelianGene", "the Mendelian-genes-only filter will match no loci, and the grouped "
+                                  "view counts no disease-gene loci")):
+        if column not in app.config["DB_COLUMNS_SET"]:
+            print(f"Note: database missing optional column {column}: {consequence}")
     print(f"Mendelian QC page: {'available' if app.config['HAS_MENDELIAN'] else 'hidden (no mendelian_violations table)'}")
 
     app.config["BIND_HOST"] = args.host

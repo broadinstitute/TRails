@@ -3,7 +3,7 @@
 // Shared QC helpers used by index_page_template.html, sample_qc_template.html,
 // qc2_template.html, and swim_plot_template.html. Kept in one place so fixes to the
 // box-plot stats / Mendelian-warning popup can't drift between the pages. (escapeHtml,
-// isAffectedStatus, ESCAPING_ADDITIONS_DROPDOWN_SETTINGS, setupDropdownMenu,
+// isAffectedStatus, ESCAPING_ADDITIONS_DROPDOWN_SETTINGS, setupDropdownMenu, getDropdownValue,
 // renderMendelianWarning, computeBoxStats, computePercentile, jitterFromKey,
 // singleBinBoxPlotPlugin, the QC pages' per-bin builders
 // appendQCBinCard and createSingleBinBoxPlotChart, and the Mendelian-warning popup handler.)
@@ -52,8 +52,9 @@ const ESCAPING_ADDITIONS_DROPDOWN_SETTINGS = {
 // containing markup executes, and one containing a double quote breaks out of the attribute.
 // Escaping both fixes that, but leaves the escaped text sitting in data-value, so this then
 // writes the raw strings back with .attr()/.data()/.text(), which assign literally rather than
-// parsing HTML. The menu is therefore safe to build AND dropdown('get value') still returns the
-// value exactly as stored, so the filter it sends matches the database.
+// parsing HTML. The menu is therefore safe to build, and each item's value is the string exactly
+// as stored. Read the selection back with getDropdownValue, not dropdown('get value'), which
+// returns a double quote as '&quot;'.
 //
 // `items` is an array of {name, value} objects holding the raw, unescaped strings.
 function setupDropdownMenu($dropdown, items) {
@@ -62,7 +63,6 @@ function setupDropdownMenu($dropdown, items) {
             return {
                 name: escapeHtml(item.name),
                 value: escapeHtml(item.value),
-                selected: item.selected,
             };
         }),
     });
@@ -72,6 +72,15 @@ function setupDropdownMenu($dropdown, items) {
                .data('value', items[index].value)
                .text(items[index].name);
     });
+}
+
+// A Semantic UI dropdown's selected value as it was chosen or typed. Semantic UI stores the value
+// with every double quote replaced by '&quot;' (set.value runs it through escape.value) and
+// dropdown('get value') returns that stored form, so a tag a"b would come back as a&quot;b, be
+// saved that way and match nothing as a filter. A multiple dropdown's value is a comma-separated
+// string of its selections.
+function getDropdownValue($dropdown) {
+    return String($dropdown.dropdown('get value') || '').replace(/&quot;/g, '"');
 }
 
 // Helper function to render warning icon if sample has warnings: its Mendelian-violation warning

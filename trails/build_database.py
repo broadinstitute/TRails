@@ -22,7 +22,7 @@ fully-tested unit):
      region, variation cluster (for columns the matrix left empty), then
      ``locus_annotations.add_population_stdev_percentile_columns``
   7. known-disease-locus match + ``IsKnownMotif`` + ``IsInMendelianGene``
-  8. ``analysis_columns.add_gene_columns``               -> pLI / inheritance
+  8. ``analysis_columns.add_gene_columns``               -> GeneTable* columns + pLI
   9. ``analysis_columns.add_all_outlier_columns``        -> the affected/unaffected analysis
      + the affected_unsolved_outliers_above_unaffected rows
  10. ``phenotype_scoring.compute_phenotype_scores``      -> phenotype-score columns + rows
@@ -61,10 +61,20 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
     """Read the input TSVs and write the TRails result database to db_path.
 
     Builds every table in memory and populates the DuckDB database directly, with
-    no intermediate files. Optional inputs (phenotypes, gene table, known-loci
-    catalog) are simply skipped when absent, and the build still runs: a missing
-    gene/phenotype input leaves the corresponding columns NULL rather than
-    hard-failing.
+    no intermediate files. Optional inputs are skipped when absent, and the build
+    still runs:
+
+      * without a gene table, the GeneTable* and pLI columns are written all NULL,
+        and IsInMendelianGene is 0 unless the matrix supplies it;
+      * without a known-loci catalog, KnownDiseaseLocus is NULL and IsKnownMotif 0,
+        unless the matrix supplies them;
+      * without a phenotypes table, or with skip_phenotype_scores, the
+        MaxGenePhenoSim_* and SumPairwiseSim_* columns are left out of the loci
+        table altogether rather than written as NULL (a query naming one fails),
+        and neither phenotype-score table is written;
+      * without a TRExplorer annotations database, the TRExplorer* and population
+        columns the matrix does not supply are left out of the loci table too,
+        and a warning says the #Aff / #Fam counts are not population-gated.
 
     Args:
         repeat_copy_numbers_tsv: Merged per-allele genotype matrix (trid, motif,
@@ -108,16 +118,6 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
     if n_loci is not None:
         locus_rows = locus_rows[:n_loci]
     print(f"  {len(locus_rows):,} loci, {len(sample_id_list):,} samples")
-
-    # The OutlierSampleIds_* strings encode entries as "{allele}x:{sample_id}[:...]", so a ':' in a
-    # sample id truncates it everywhere downstream and can silently merge two samples into one.
-    # read_sample_metadata rejects it on its side; reject it here too, otherwise a cohort with such
-    # ids just moves onto the no-metadata path and builds a quietly wrong database.
-    bad_sample_ids = [s for s in sample_id_list if ":" in str(s) or "," in str(s)]
-    if bad_sample_ids:
-        raise ValueError(
-            f"Sample column headers in {repeat_copy_numbers_tsv} must not contain ':' or ',' "
-            f"(both are OutlierSampleIds delimiters): {bad_sample_ids[:10]}")
 
     # Stage 2: read the sample metadata and build the lookups.
     print(f"Reading sample metadata: {sample_metadata_tsv}")
@@ -216,7 +216,7 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
         else:
             record.setdefault("IsInMendelianGene", 0)
 
-    # Stage 8: gene-derived pLI / inheritance columns.
+    # Stage 8: the gene-table columns (GeneTable*, including GeneTableInheritance) and pLI.
     print("Adding gene columns ...")
     analysis_columns.add_gene_columns(records, gene_lookup)
 

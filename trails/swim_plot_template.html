@@ -389,12 +389,11 @@ function getSwimParams() {
     });
 
     // Sample ID dropdown
-    const selectedIds = $('#swim-sample-id-filter').dropdown('get value');
-    const idStr = Array.isArray(selectedIds) ? selectedIds.join(',') : (selectedIds || '');
+    const idStr = getDropdownValue($('#swim-sample-id-filter'));
     if (idStr) params.sample_id_keyword = idStr;
 
     // Tag dropdown
-    const tagVal = $('#swim-tag-filter').dropdown('get value');
+    const tagVal = getDropdownValue($('#swim-tag-filter'));
     if (tagVal) params.tag = tagVal;
 
     return params;
@@ -819,7 +818,7 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
     // User Annotations section (notes/tags)
     const userAnn = locusDetail.user_annotations || {};
     html += '<div class="detail-section-header">User Annotations</div>';
-    html += '<div class="annotation-section" data-locus-id="' + escapeHtml(locus.LocusId) + '">';
+    html += '<div class="annotation-section">';
 
     // Note
     if (userAnn.note) {

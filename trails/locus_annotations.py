@@ -27,10 +27,6 @@ import re
 
 import intervaltree
 
-# Result of load_known_disease_loci. interval_trees / strchive_trees are
-# chrom -> IntervalTree (disease loci, payload in .data).
-KnownDiseaseLoci = collections.namedtuple("KnownDiseaseLoci", ["interval_trees", "strchive_trees"])
-
 from analysis_columns import blank_to_none
 from motif_utilities import COMPLEMENT, compute_canonical_motif, compute_canonical_motifs_with_n_as_any_base
 
@@ -176,9 +172,10 @@ def load_known_disease_loci(filepath=None, strchive_filepath=None):
             given, STRchive trees are built from it.
 
     Returns:
-        A ``KnownDiseaseLoci`` namedtuple ``(interval_trees, strchive_trees)``. Both map a
-        chromosome (without ``chr`` prefix) to an ``intervaltree.IntervalTree``;
-        ``strchive_trees`` is ``{}`` when no STRchive source was provided.
+        A tuple ``(interval_trees, strchive_trees)``. Both map a chromosome (without
+        ``chr`` prefix) to an ``intervaltree.IntervalTree`` whose intervals carry the
+        disease locus dict in ``.data``; ``strchive_trees`` is ``{}`` when no STRchive
+        source was provided.
     """
     loci = []
     if filepath is not None:
@@ -208,7 +205,7 @@ def load_known_disease_loci(filepath=None, strchive_filepath=None):
         with open(strchive_filepath, "rt") as input_file:
             strchive_trees = _build_strchive_trees(json.load(input_file))
 
-    return KnownDiseaseLoci(dict(interval_trees), strchive_trees)
+    return dict(interval_trees), strchive_trees
 
 
 def strchive_locus_motifs(locus_data):

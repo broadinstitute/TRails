@@ -85,6 +85,13 @@ class ReadRepeatCopyNumbersTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             input_tables.read_repeat_copy_numbers(path)
 
+    def test_sample_column_header_with_colon_or_comma_rejected(self):
+        # Sample ids are packed into the OutlierSampleIds strings, where ':' and ',' are delimiters.
+        path = _write_tsv(self, [["chr1-100-110-AT", "AT", "12", "13", "14"]],
+                          ["trid", "motif", "S:1", "S,2", "S3"])
+        with self.assertRaisesRegex(ValueError, r"Sample column headers in .* must not contain ':' or ','.*'S:1', 'S,2'"):
+            input_tables.read_repeat_copy_numbers(path)
+
 
 class ReadSampleMetadataTests(unittest.TestCase):
 
@@ -116,9 +123,9 @@ class ReadSampleMetadataTests(unittest.TestCase):
         self.assertEqual(affected["S1"], "affected")
         self.assertEqual(affected["S2"], "unaffected")
 
-    def test_sample_id_with_colon_rejected(self):
-        with self.assertRaises(ValueError):
-            self._read([["S:1"]], ["sample_id"])
+    def test_sample_id_with_colon_or_comma_rejected(self):
+        with self.assertRaisesRegex(ValueError, r"sample_id values in .* must not contain ':' or ','.*'S:1', 'S,2'"):
+            self._read([["S:1"], ["S,2"], ["S3"]], ["sample_id"])
 
     def test_dedup_keep_first(self):
         sample_lookup, _, _ = self._read(

@@ -9,7 +9,6 @@ so no real TCP port is bound. They check that:
 """
 
 import gzip
-import importlib.util
 import json
 import os
 import sys
@@ -57,7 +56,6 @@ def _build_minimal_db(path):
         gene_region_rank INTEGER,
         NumRepeatsInReference INTEGER,
         pLI REAL,
-        inheritance TEXT,
         FirstAffectedAlleleSize_AllAlleles INTEGER,
         SecondAffectedAlleleSize_AllAlleles INTEGER,
         ThirdAffectedAlleleSize_AllAlleles INTEGER,
@@ -75,17 +73,17 @@ def _build_minimal_db(path):
     rows = [
         ("chr1-100-110-AT", "AT", "AT", 1, 0, "5x:1,6x:2", "5x:1", None,
          "6x:sampleA,5x:sampleB", "5x:sampleB", None, "TRails", "chr1", 100, 110,
-         "chr1:100-110", "", 2, "GENE1", "CDS", 1, 5, 0.9, "AD",
+         "chr1:100-110", "", 2, "GENE1", "CDS", 1, 5, 0.9,
          6, 5, None, 4, 2, 1, "sampleA", "seizures", 0.5, 1.2,
          "GENE1", "AD", "summary"),
         ("chr2-200-209-AAG", "AAG", "AAG", 0, 1, "3x:4", "3x:4", None,
          "4x:sampleC", "4x:sampleC", None, "TRails", "chr2", 200, 209,
-         "chr2:200-209", "", 3, "GENE2", "intron", 5, 3, 0.1, "AR",
+         "chr2:200-209", "", 3, "GENE2", "intron", 5, 3, 0.1,
          4, None, None, None, 1, 0, "sampleC", "ataxia", 0.0, 0.0,
          "GENE2", "AR", "summary2"),
     ]
     conn.executemany(
-        "INSERT INTO loci VALUES (" + ",".join("?" * 37) + ")", rows
+        "INSERT INTO loci VALUES (" + ",".join("?" * 36) + ")", rows
     )
 
     # Build the fixture's swim_plot through the same writer the build uses, so it gets the real
@@ -142,6 +140,18 @@ class ResultsServerTests(MinimalDatabaseTestCase):
         locus_ids = {r["LocusId"] for r in data["results"]}
         self.assertIn("chr1-100-110-AT", locus_ids)
         self.assertIn("chr2-200-209-AAG", locus_ids)
+
+    def test_the_results_are_paged_and_the_export_is_not(self):
+        pages = [self.client.get(f"/api/v1/loci?outlier_type=all&page_size=1&page={page}").get_json()
+                 for page in (1, 2, 3)]
+        self.assertEqual([[r["LocusId"] for r in page["results"]] for page in pages],
+                         [["chr1-100-110-AT"], ["chr2-200-209-AAG"], []])
+        self.assertEqual([(page["total"], page["total_pages"]) for page in pages], [(2, 2)] * 3)
+        # The export takes the same parameters, and writes every matching locus whatever the page
+        response = self.client.get("/api/v1/export?outlier_type=all&format=bed&page_size=1&page=2")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([line.split("\t")[3] for line in response.get_data(as_text=True).splitlines()],
+                         ["chr1-100-110-AT", "chr2-200-209-AAG"])
 
     def test_unknown_query_parameters_are_ignored(self):
         response = self.client.get("/api/v1/loci?outlier_type=all&unrecognized=foo")
@@ -556,9 +566,8 @@ class ResultsServerTests(MinimalDatabaseTestCase):
         # stays case-insensitive. search_filter_tests.py checks the matching itself
         # (case-insensitive, a literal underscore); this test pins the query's shape.
         ids = ["chr1-100-110-AT", "CHR2-200-209-AAG", "chr1_alt-1-10-CAG"]
-        select_query, _, _, _, sql_params, _ = results_server.build_api_query({
-            "outlier_type": "all", "page": 1, "page_size": 50,
-            "search_terms": [("locus_id", locus_id) for locus_id in ids],
+        select_query, _, _, _, sql_params = results_server.build_api_query({
+            "outlier_type": "all", "search_terms": [("locus_id", locus_id) for locus_id in ids],
         })
         self.assertEqual(select_query.count("lower(LocusId) IN ("), 1)
         self.assertIn("lower(LocusId) IN (?,?,?)", select_query)
@@ -568,9 +577,8 @@ class ResultsServerTests(MinimalDatabaseTestCase):
     def test_pasted_locus_ids_keep_their_place_among_the_other_search_terms(self):
         # The ids are hoisted to the front of the OR, so their bind parameters have to move with
         # them: a gene symbol term binding out of order would filter on the wrong value.
-        select_query, _, _, _, sql_params, _ = results_server.build_api_query({
-            "outlier_type": "all", "page": 1, "page_size": 50,
-            "search_terms": [("gene_symbol", "GENE1"), ("locus_id", "chr1-100-110-AT")],
+        select_query, _, _, _, sql_params = results_server.build_api_query({
+            "outlier_type": "all", "search_terms": [("gene_symbol", "GENE1"), ("locus_id", "chr1-100-110-AT")],
         })
         self.assertIn("(lower(LocusId) IN (?) OR GeneTableGeneSymbol ILIKE ?)", select_query)
         self.assertEqual(sql_params[-2:], ["chr1-100-110-at", "%GENE1%"])
@@ -943,6 +951,18 @@ class PhenotypeKeywordAgreesWithTheSwimPlotTests(ServerTestCase):
 
     def test_an_unmatched_keyword_returns_nothing(self):
         self.assertEqual(self.get_locus_ids("phenotype_keyword=no_such_phenotype"), set())
+
+
+class PageJsonTests(unittest.TestCase):
+    """The tojson filter the pages embed their <script> values with."""
+
+    def test_a_value_cannot_end_the_script_block_and_keys_keep_their_order(self):
+        # The Mendelian warning popup lists motif_rates in their insertion order, which sorted
+        # keys would change ("25plusbp" before "2bp").
+        rendered = results_server.jinja2_env.from_string("{{ value | tojson }}").render(
+            value={"2bp": "</script><b>'&", "25plusbp": 1})
+        self.assertEqual(rendered, '{"2bp": "\\u003c/script\\u003e\\u003cb\\u003e\\u0027\\u0026", "25plusbp": 1}')
+        self.assertEqual(json.loads(rendered), {"2bp": "</script><b>'&", "25plusbp": 1})
 
 
 class SplitOutlierEntriesTests(unittest.TestCase):
@@ -1393,9 +1413,8 @@ class PhenotypeKeywordFallbackColumnSubsetTests(ServerTestCase):
         self.assertFalse(results_server.app.config["HAS_SWIM_PLOT_PHENOTYPES"])
 
     def test_only_the_declared_column_is_named(self):
-        select_query, _, _, _, sql_params, _ = results_server.build_api_query({
-            "outlier_type": "all", "page": 1, "page_size": 50,
-            "phenotype_keyword": ["seizures"],
+        select_query, _, _, _, sql_params = results_server.build_api_query({
+            "outlier_type": "all", "phenotype_keyword": ["seizures"],
         })
         self.assertIn("FirstAffectedPhenotype_AllAlleles ILIKE ?", select_query)
         self.assertNotIn("SecondAffectedPhenotype_AllAlleles", select_query)
@@ -1437,10 +1456,9 @@ class PhenotypeKeywordWithoutAnyPhenotypeColumnTests(ServerTestCase):
         cls.configure_server(cls.db_path)
 
     def test_the_filter_matches_no_rows_rather_than_being_ignored(self):
-        select_query, _, _, _, _, _ = results_server.build_api_query({
-            "outlier_type": "all", "page": 1, "page_size": 50,
-            "phenotype_keyword": ["seizures"],
-        })
+        select_query = results_server.build_api_query({
+            "outlier_type": "all", "phenotype_keyword": ["seizures"],
+        })[0]
         self.assertIn("1=0", select_query)
         self.assertNotIn("AffectedPhenotype", select_query)
         response = self.client.get("/api/v1/loci?outlier_type=all&phenotype_keyword=seizures")
@@ -1520,52 +1538,6 @@ class FamilyCountTests(ServerTestCase):
             response = self.client.get(f"/api/v1/loci?{query}")
             self.assertEqual(response.status_code, 200, (query, response.get_data(as_text=True)))
             self.assertEqual(response.get_json()["total"], expected_total, query)
-
-
-def _load_results_server_without_locus_annotations():
-    """Import a second copy of results_server.py with locus_annotations unimportable.
-
-    This is the degraded mode the module's ImportError fallbacks exist for: locus_annotations
-    imports intervaltree at module scope, so a missing intervaltree makes the import raise and
-    the server falls back to its built-in stubs. Loading the file under a different module name
-    leaves the results_server module the rest of these tests share untouched.
-
-    Returns:
-        The freshly executed module object, holding the fallback definitions.
-    """
-    spec = importlib.util.spec_from_file_location(
-        "results_server_degraded_mode", results_server.__file__)
-    module = importlib.util.module_from_spec(spec)
-    missing = object()
-    saved = sys.modules.get("locus_annotations", missing)
-    sys.modules["locus_annotations"] = None  # makes "from locus_annotations import ..." raise
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        if saved is missing:
-            del sys.modules["locus_annotations"]
-        else:
-            sys.modules["locus_annotations"] = saved
-    return module
-
-
-class DegradedModeFallbackTests(unittest.TestCase):
-    """Without locus_annotations, no locus matches a known disease locus."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.degraded = _load_results_server_without_locus_annotations()
-
-    def test_the_fallback_really_is_a_stub(self):
-        # If this fails the import did not raise and the assertions below would be testing the
-        # real locus_annotations functions rather than the fallbacks.
-        self.assertEqual(self.degraded.load_known_disease_loci("ignored"), ({}, {}))
-
-    def test_a_locus_matches_no_known_disease_locus(self):
-        lookups = {"disease_trees": {}, "strchive_trees": {}}
-        row = {"LocusId": "chr1-100-110-AT", "Chrom": "chr1", "Start0Based": 100, "End1Based": 110, "Motif": "AT"}
-        self.assertIsNone(self.degraded.compute_known_disease_info(row, lookups))
-        self.assertIsNone(self.degraded.known_disease_pathogenic_min("chr1", 100, 110, "AT", {}, {}))
 
 
 class RequestCheckTests(MinimalDatabaseTestCase):

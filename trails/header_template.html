@@ -156,10 +156,10 @@ async function refreshTagFilterDropdown($dropdown) {
     const data = await fetchJsonOrNull(`${ANNOTATIONS_API_URL}/tags`, 'Load tags');
     if (!data) return;
     window._allTagsList = data.tags || [];
-    const selected = $dropdown.dropdown('get value');
+    const selected = getDropdownValue($dropdown);
     // Raw, unescaped strings: setupDropdownMenu (qc_shared_js.html) is what makes them safe to
     // render while keeping data-value equal to the stored tag.
-    setupDropdownMenu($dropdown, window._allTagsList.map(tag => ({ name: tag, value: tag, selected: tag === selected })));
+    setupDropdownMenu($dropdown, window._allTagsList.map(tag => ({ name: tag, value: tag })));
     if (selected) $dropdown.dropdown('set selected', selected);
 }
 

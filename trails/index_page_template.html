@@ -833,7 +833,7 @@ function readStateFromUI() {
     currentState.population_metric = $('input[name="population_metric"]:checked').val() || '99th';
     currentState.include_loci_without_population_data = $('input[name="include_loci_without_population_data"]').parent().checkbox('is checked');
     currentState.group_by = $('input[name="group_by"]:checked').val() || DEFAULT_STATE.group_by;
-    currentState.group_sort = $('#group-sort-dropdown').dropdown('get value') || DEFAULT_STATE.group_sort;
+    currentState.group_sort = getDropdownValue($('#group-sort-dropdown')) || DEFAULT_STATE.group_sort;
     currentState.group_sort_direction = $('input[name="group_sort_direction"]:checked').val() || DEFAULT_STATE.group_sort_direction;
 
     // Boolean checkboxes
@@ -866,7 +866,7 @@ function readStateFromUI() {
     // handlers (it is an ordered, comma-separated list), so it is NOT re-read here.
 
     // Tag dropdown
-    currentState.tag = $('#tag-filter').dropdown('get value') || '';
+    currentState.tag = getDropdownValue($('#tag-filter'));
 
     // Text/number inputs
     for (const name of ['min_expansion', 'min_repeats_threshold', 'min_repeats_above_population',
@@ -877,10 +877,7 @@ function readStateFromUI() {
     }
 
     // Sample ID dropdown
-    const selectedIds = $('#sample-id-filter').dropdown('get value');
-    currentState.sample_id_keyword = Array.isArray(selectedIds)
-        ? selectedIds.join(',')
-        : (selectedIds || '');
+    currentState.sample_id_keyword = getDropdownValue($('#sample-id-filter'));
 
     // Reset page to 1 when filters change
     currentState.page = 1;
@@ -1815,7 +1812,7 @@ function renderLocusRow(locus, rowIndex) {
     const famUnsolvedStyle = nFamUnsolved > 0 ? 'color: #c62828; font-weight: 600;' : 'color: #888;';
 
     // Inheritance
-    const inheritance = locus.GeneTableInheritance || locus.inheritance || '';
+    const inheritance = locus.GeneTableInheritance || '';
 
     // Gene phenotype summary (truncated with "more" link)
     const genePhenoFull = locus.GeneTableLLMPhenotypeSummary || '';
@@ -1922,7 +1919,7 @@ function renderLocusRow(locus, rowIndex) {
         selectedAllelesCell = `<td class="col-selected-allele col-numeric"><div class="cell-main">${largest != null ? largest : ''}</div>${members}</td>`;
     }
 
-    return `<tr class="locus-row" data-locus-id="${escapeHtml(locus.LocusId)}" data-row-index="${rowIndex}">
+    return `<tr class="locus-row" data-locus-id="${escapeHtml(locus.LocusId)}">
         <td class="col-expand"><span class="expand-toggle" title="Expand details"><i class="chevron right icon"></i></span></td>
         <td class="col-row-num">${rowIndex + 1}</td>
         <td class="col-locus">${locusCell}</td>
@@ -2629,33 +2626,28 @@ function renderAnnotationBadges(tags, hasNote) {
 }
 
 async function refreshRowAnnotations(locusId) {
-    try {
-        const response = await fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`);
-        if (!response.ok) return;
-        const ann = await response.json();
+    const ann = await fetchJsonOrNull(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`, 'Refresh row annotations');
+    if (!ann) return;
 
-        // Build new tag badges and note icon
-        const newContent = renderAnnotationBadges(ann.tags || [], ann.note != null);
+    // Build new tag badges and note icon
+    const newContent = renderAnnotationBadges(ann.tags || [], ann.note != null);
 
-        // Update or create the badges row of every row that lists the locus: in a grouped view the
-        // same locus can be open under several groups, and only some of them may have a badges row
-        $(`tr.locus-row[data-locus-id="${locusId}"]`).each(function() {
-            const $locusCell = $(this).find('.col-locus');
-            const $badgesRow = $locusCell.find('.badges-row');
-            if ($badgesRow.length) {
-                // Remove old annotation-badges span and prepend new one (user tags come first)
-                $badgesRow.find('.annotation-badges').remove();
-                if (newContent) {
-                    $badgesRow.prepend(newContent);
-                }
-            } else if (newContent) {
-                // No badges row exists yet, create one after cell-main
-                $locusCell.find('.cell-main').after(`<div class="cell-sub badges-row">${newContent}</div>`);
+    // Update or create the badges row of every row that lists the locus: in a grouped view the
+    // same locus can be open under several groups, and only some of them may have a badges row
+    $(`tr.locus-row[data-locus-id="${locusId}"]`).each(function() {
+        const $locusCell = $(this).find('.col-locus');
+        const $badgesRow = $locusCell.find('.badges-row');
+        if ($badgesRow.length) {
+            // Remove old annotation-badges span and prepend new one (user tags come first)
+            $badgesRow.find('.annotation-badges').remove();
+            if (newContent) {
+                $badgesRow.prepend(newContent);
             }
-        });
-    } catch (e) {
-        console.error('Refresh row annotations error:', e);
-    }
+        } else if (newContent) {
+            // No badges row exists yet, create one after cell-main
+            $locusCell.find('.cell-main').after(`<div class="cell-sub badges-row">${newContent}</div>`);
+        }
+    });
 }
 
 // After a note is saved or deleted: update the row's badges and, if open, its detail panel
@@ -2715,7 +2707,7 @@ $(document).on('click', '.add-tag-btn', async function() {
     $modal
         .modal({
             onApprove: function() {
-                const dropdownValue = $addTagDropdown.dropdown('get value');
+                const dropdownValue = getDropdownValue($addTagDropdown);
                 const searchValue = $addTagDropdown.find('input.search').val();
                 const tag = (dropdownValue || searchValue || '').trim();
                 if (!tag) return false; // prevent close if empty
@@ -2742,16 +2734,10 @@ $(document).on('click', '.add-tag-btn', async function() {
         .modal('show');
 });
 
-// Helper function to fetch tags for a locus
+// A locus's tags, or none when they could not be loaded (fetchJsonOrNull logs the failure)
 async function fetchLocusTags(locusId) {
-    try {
-        const response = await fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`);
-        if (!response.ok) return [];
-        const data = await response.json();
-        return data.tags || [];
-    } catch (e) {
-        return [];
-    }
+    const data = await fetchJsonOrNull(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`, 'Load locus tags');
+    return data?.tags || [];
 }
 
 // Helper function to render existing tags in the modal

@@ -6,9 +6,9 @@ analysis columns: the First/Second/Third affected and unaffected allele sizes
 (both per-sample and per-family), the matching affected phenotypes and sample
 ids, the NumAffectedUnsolved{Samples,Families}AboveUnaffected counts, and the
 rows of the affected_unsolved_outliers_above_unaffected table that lists the
-samples those counts count. It also adds the gene-derived ``pLI`` /
-``inheritance`` columns, and exposes the exact 137-name ordered
-``OUTPUT_COLUMNS`` list that defines the loci table.
+samples those counts count. It also adds the gene-table columns (GeneTable* and
+``pLI``), and exposes the exact 136-name ordered ``OUTPUT_COLUMNS`` list that
+defines the loci table.
 
 The in-memory representation is a list of dicts (one dict per locus), so there is
 no pandas dependency and the algorithms are dict-native.
@@ -635,7 +635,7 @@ GENE_TABLE_COLUMN_BY_SOURCE_FIELD = {
 
 
 def add_gene_columns(records, gene_lookup):
-    """Fill the GeneTable* columns, ``pLI`` and ``inheritance`` from the gene table, in place.
+    """Fill the GeneTable* columns and ``pLI`` from the gene table, in place.
 
     For each record, looks up its ``gene_id`` in ``gene_lookup`` and sets:
       * the ten GENE_TABLE_COLUMN_BY_SOURCE_FIELD columns (``GeneTableGeneSymbol``,
@@ -643,8 +643,6 @@ def add_gene_columns(records, gene_lookup):
         fields, with a blank (NaN) field as None.
       * ``pLI`` = max of the gene's pLI_v2 and pLI_v4 (whichever are present),
         or None.
-      * ``inheritance`` = the gene's inheritance mode, or None. It always equals
-        ``GeneTableInheritance``.
 
     All of them are set to None when there is no gene_lookup, when the record's
     gene_id is missing, or when the gene_id is not in the lookup, so the loci
@@ -683,10 +681,8 @@ def add_gene_columns(records, gene_lookup):
                 value = gene_row.get(source_field)
                 record[column] = None if is_none_or_nan(value) else value
 
-        record["inheritance"] = record["GeneTableInheritance"]
 
-
-# The ordered 137-name loci-table schema. Other per-locus annotation columns the matrix
+# The ordered 136-name loci-table schema. Other per-locus annotation columns the matrix
 # supplies (e.g. HPRC256_90thPercentile) are appended after these by
 # result_database.write_loci_table.
 OUTPUT_COLUMNS = [
@@ -736,9 +732,8 @@ OUTPUT_COLUMNS = [
     "GeneTableLLMPhenotypeSummary",
     "GeneTableSources",
 
-    # Combined pLI and inheritance
+    # Combined pLI
     "pLI",
-    "inheritance",
 
     # Affected allele sizes (by sample_id)
     "FirstAffectedAlleleSize_AllAlleles",

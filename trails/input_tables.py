@@ -188,6 +188,10 @@ def read_repeat_copy_numbers(path):
         of dicts, one per locus, each ``{"trid": ..., "motif": ...,
         "genotypes": {sample_id: cell_string}, "extra_columns": {canonical: value}}``
         and ``sample_id_list`` is the ordered list of sample-column names.
+
+    Raises:
+        ValueError: If the ``trid`` or ``motif`` column is missing, or a sample
+            column header contains ``':'`` or ``','``.
     """
     df = pandas.read_table(path, dtype=str, keep_default_na=False)
 
@@ -216,6 +220,7 @@ def read_repeat_copy_numbers(path):
             sample_id_list.append(column)
         else:
             annotation_columns[column] = canonical
+    _reject_sample_ids_containing_outlier_delimiters(sample_id_list, f"Sample column headers in {path}")
 
     locus_rows = []
     for record in df.to_dict(orient="records"):
@@ -228,6 +233,29 @@ def read_repeat_copy_numbers(path):
         })
 
     return locus_rows, sample_id_list
+
+
+def _reject_sample_ids_containing_outlier_delimiters(sample_ids, description):
+    """Raise a ValueError naming the sample ids that contain ':' or ','.
+
+    The OutlierSampleIds_* strings pack entries as "{allele}x:{sample_id}" joined with ",",
+    so either character in a sample id corrupts the parse and can silently merge two
+    samples into one. The matrix's sample columns and the sample table's sample_id values
+    both end up in those strings, so both readers apply this one rule.
+
+    Args:
+        sample_ids: The sample ids to check.
+        description: What the ids are, named in the error, e.g. "Sample column headers in
+            matrix.tsv".
+
+    Raises:
+        ValueError: If any id contains ':' or ','. The message lists up to 10 of them.
+    """
+    bad_sample_ids = [sample_id for sample_id in sample_ids if ":" in str(sample_id) or "," in str(sample_id)]
+    if bad_sample_ids:
+        raise ValueError(
+            f"{description} must not contain ':' or ',' (both are OutlierSampleIds "
+            f"delimiters): {bad_sample_ids[:10]}")
 
 
 def read_sample_metadata(path):
@@ -279,14 +307,7 @@ def read_sample_metadata(path):
     for logical_name, actual_column in matches.items():
         df[logical_name] = raw_df[actual_column]
 
-    # sample_id must not contain ':' or ',': entries are packed as "{allele}x:{sample_id}" and
-    # joined with ",", so either character corrupts the parse.
-    bad_sample_ids = [s for s in df["sample_id"] if ":" in str(s) or "," in str(s)]
-    if bad_sample_ids:
-        raise ValueError(
-            f"sample_id values must not contain ':' or ',' (both are OutlierSampleIds "
-            f"delimiters): {bad_sample_ids[:10]}"
-        )
+    _reject_sample_ids_containing_outlier_delimiters(df["sample_id"], f"sample_id values in {path}")
 
     # Normalize analysis_status.
     if "analysis_status" in df.columns:

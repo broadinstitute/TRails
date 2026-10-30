@@ -142,18 +142,8 @@ class SearchQueryTests(ServerTestCase):
             conn.close()
 
     def _query(self, **extra_params):
-        """Run the count and select queries for a set of params against the test database."""
-        params = dict({"outlier_type": "all", "page": 1, "page_size": 50}, **extra_params)
-        select_query, count_query, _, _, sql_params, sql_params_with_pagination = \
-            results_server.build_api_query(params)
-        conn = duckdb_compat.connect(self.db_path, read_only=True)
-        try:
-            locus_ids = {row[0] for row in conn.execute(select_query, sql_params_with_pagination)}
-            total = conn.execute(count_query, sql_params).fetchone()[0]
-        finally:
-            conn.close()
-        self.assertEqual(total, len(locus_ids))
-        return locus_ids
+        """Return the LocusIds the select query keeps for a set of params against the test database."""
+        return set(self.get_locus_ids_from_api_query(self.db_path, **extra_params))
 
     def _search(self, text):
         # split_search_terms is what validate_params runs on the raw search string, so the term
@@ -307,13 +297,7 @@ class PopulationFilterTestCase(ServerTestCase):
             conn.close()
 
     def _query(self, **extra_params):
-        params = dict({"outlier_type": "all", "page": 1, "page_size": 50}, **extra_params)
-        select_query, _, _, _, _, sql_params_with_pagination = results_server.build_api_query(params)
-        conn = duckdb_compat.connect(self.db_path, read_only=True)
-        try:
-            return {row[0] for row in conn.execute(select_query, sql_params_with_pagination)}
-        finally:
-            conn.close()
+        return set(self.get_locus_ids_from_api_query(self.db_path, **extra_params))
 
 
 class MinRepeatsAbovePopulationTests(PopulationFilterTestCase):
@@ -465,14 +449,7 @@ class VariationClusterSortTests(ServerTestCase):
 
     def _ordered_locus_ids(self, **extra_params):
         """Run the select query for a set of params and return the LocusIds in row order."""
-        params = dict({"outlier_type": "all", "page": 1, "page_size": 50}, **extra_params)
-        select_query, _, _, _, _, sql_params_with_pagination = \
-            results_server.build_api_query(params)
-        conn = duckdb_compat.connect(self.db_path, read_only=True)
-        try:
-            return [row[0] for row in conn.execute(select_query, sql_params_with_pagination)]
-        finally:
-            conn.close()
+        return self.get_locus_ids_from_api_query(self.db_path, **extra_params)
 
     def test_sorts_numerically_not_lexically(self):
         # 148 > 20 > 9, and the locus with no variation cluster at all sorts last.
@@ -561,13 +538,7 @@ class VariationClusterTypeTests(ServerTestCase):
 
         results_server.app.config["DB_PATH"] = db_path
         results_server.app.config["DB_COLUMNS_SET"] = set(self.COLUMNS)
-        params = dict({"outlier_type": "all", "page": 1, "page_size": 50}, **extra_params)
-        select_query, _c, _m, _g, _p, sql_params_with_pagination = results_server.build_api_query(params)
-        conn = duckdb_compat.connect(db_path, read_only=True)
-        try:
-            return declared, {row[0] for row in conn.execute(select_query, sql_params_with_pagination)}
-        finally:
-            conn.close()
+        return declared, set(self.get_locus_ids_from_api_query(db_path, **extra_params))
 
     def test_all_integer_column_is_written_bigint_and_still_filters(self):
         declared, kept = self._query(self._records(), max_variation_cluster_size_diff=20)

@@ -10,6 +10,7 @@ import analysis_columns
 import duckdb_compat
 import phenotype_scoring
 import result_database
+from tests.database_test_helpers import ordered_table_column_names
 
 
 def leave_a_killed_writers_wal(db_path, table_name):
@@ -31,17 +32,6 @@ def leave_a_killed_writers_wal(db_path, table_name):
          "os.kill(os.getpid(), 9)\n",
          db_path, table_name],
         check=False)
-
-
-def table_columns(connection, table_name):
-    """Returns the ordered list of column names of ``table_name``."""
-    return [column[0] for column in
-            connection.execute(f"SELECT * FROM {table_name} LIMIT 0").description]
-
-
-def table_names(connection):
-    """Returns the set of table names in the database."""
-    return duckdb_compat.list_tables(connection)
 
 
 def primary_key_columns(connection, table_name):
@@ -111,7 +101,7 @@ class WriteLociTableTests(unittest.TestCase):
         self.assertEqual(row_count, 2)
         # FirstAffectedAlleleSize_AllAlleles is absent from every record, so it
         # must NOT appear; the rest keep OUTPUT_COLUMNS order (not dict order).
-        self.assertEqual(table_columns(self.connection, "loci"),
+        self.assertEqual(ordered_table_column_names(self.connection, "loci"),
                          ["LocusId", "Motif", "CanonicalMotif", "MotifSize", "Chrom"])
 
     def test_row_count_and_values_round_trip(self):
@@ -130,7 +120,7 @@ class WriteLociTableTests(unittest.TestCase):
         ]
         result_database.write_loci_table(
             self.connection, records, self.output_columns)
-        self.assertIn("CanonicalMotif", table_columns(self.connection, "loci"))
+        self.assertIn("CanonicalMotif", ordered_table_column_names(self.connection, "loci"))
         values = self.connection.execute(
             "SELECT CanonicalMotif FROM loci ORDER BY LocusId").fetchall()
         self.assertEqual(values, [(None,), ("A",)])
@@ -229,7 +219,7 @@ class WriteSwimPlotTests(unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertEqual(
             self.connection.execute("SELECT COUNT(*) FROM swim_plot").fetchone()[0], 2)
-        self.assertEqual(table_columns(self.connection, "swim_plot"), list(rows[0]))
+        self.assertEqual(ordered_table_column_names(self.connection, "swim_plot"), list(rows[0]))
 
     def test_columns_define_the_table_whatever_the_row_key_order(self):
         # The table follows the columns argument, not the row dicts: a row's keys in another
@@ -237,7 +227,7 @@ class WriteSwimPlotTests(unittest.TestCase):
         row = {"allele_size": 40, "sample_id": "S1"}
         result_database.write_swim_plot(
             self.connection, [row], columns=["sample_id", "allele_size", "family_id"])
-        self.assertEqual(table_columns(self.connection, "swim_plot"),
+        self.assertEqual(ordered_table_column_names(self.connection, "swim_plot"),
                          ["sample_id", "allele_size", "family_id"])
         self.assertEqual(self.connection.execute("SELECT * FROM swim_plot").fetchall(),
                          [("S1", 40, None)])
@@ -248,7 +238,7 @@ class WriteSwimPlotTests(unittest.TestCase):
         count = result_database.write_swim_plot(
             self.connection, [], columns=list(self._swim_row("S1", 40).keys()))
         self.assertEqual(count, 0)
-        self.assertIn("swim_plot", table_names(self.connection))
+        self.assertIn("swim_plot", duckdb_compat.list_tables(self.connection))
         self.assertEqual(
             self.connection.execute(
                 "SELECT COUNT(*) FROM swim_plot WHERE allele_size > 10").fetchone()[0], 0)
@@ -266,8 +256,8 @@ class WritePhenotypeTablesTests(unittest.TestCase):
         per_outlier, per_locus = result_database.write_phenotype_tables(
             self.connection, [], [])
         self.assertEqual((per_outlier, per_locus), (0, 0))
-        self.assertNotIn("per_outlier_phenotype_scores", table_names(self.connection))
-        self.assertNotIn("per_locus_phenotype_scores", table_names(self.connection))
+        self.assertNotIn("per_outlier_phenotype_scores", duckdb_compat.list_tables(self.connection))
+        self.assertNotIn("per_locus_phenotype_scores", duckdb_compat.list_tables(self.connection))
 
     def _rows_from_the_producer(self):
         """Returns ``(per_outlier_rows, per_locus_rows)`` from a small real scoring run.
@@ -300,7 +290,7 @@ class WritePhenotypeTablesTests(unittest.TestCase):
         # so a change to either phenotype-score schema fails this test instead of
         # passing silently.
         self.assertEqual(
-            table_columns(self.connection, "per_outlier_phenotype_scores"),
+            ordered_table_column_names(self.connection, "per_outlier_phenotype_scores"),
             ["locus_id", "sample_id", "outlier_type", "allele_size", "gene_symbol",
              "gene_phenotype_similarity", "gene_phenotype_overlap_count",
              "n_matching_diseases", "best_matching_disease",
@@ -308,7 +298,7 @@ class WritePhenotypeTablesTests(unittest.TestCase):
              "pairwise_shared_count_raw", "pairwise_shared_count_ic",
              "next_sample_id"])
         self.assertEqual(
-            table_columns(self.connection, "per_locus_phenotype_scores"),
+            ordered_table_column_names(self.connection, "per_locus_phenotype_scores"),
             ["locus_id", "outlier_type", "num_qualifying_samples",
              "sum_pairwise_similarity", "sum_pairwise_shared_raw",
              "sum_pairwise_shared_ic", "max_gene_phenotype_similarity",
@@ -331,7 +321,7 @@ class WriteMendelianTablesTests(unittest.TestCase):
         per_sample, per_motif = result_database.write_mendelian_tables(
             self.connection, [], [])
         self.assertEqual((per_sample, per_motif), (0, 0))
-        self.assertNotIn("mendelian_violations", table_names(self.connection))
+        self.assertNotIn("mendelian_violations", duckdb_compat.list_tables(self.connection))
 
     def test_writes_tables_with_sample_id_primary_key(self):
         per_sample_rows = [{
@@ -342,7 +332,7 @@ class WriteMendelianTablesTests(unittest.TestCase):
         per_sample, per_motif = result_database.write_mendelian_tables(
             self.connection, per_sample_rows, per_motif_rows)
         self.assertEqual((per_sample, per_motif), (1, 1))
-        self.assertEqual(table_columns(self.connection, "mendelian_violations")[0], "sample_id")
+        self.assertEqual(ordered_table_column_names(self.connection, "mendelian_violations")[0], "sample_id")
         # sample_id declared as PRIMARY KEY.
         self.assertEqual(
             primary_key_columns(self.connection, "mendelian_violations"), ["sample_id"])

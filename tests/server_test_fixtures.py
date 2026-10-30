@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import unittest
 
+import duckdb_compat
 import results_server
 import swim_plot
 
@@ -75,6 +76,30 @@ class ServerTestCase(unittest.TestCase):
         response = self.client.get(f"/api/v1/loci?outlier_type=all&{query}")
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         return {r["LocusId"] for r in response.get_json()["results"]}
+
+    def get_locus_ids_from_api_query(self, db_path, **params):
+        """Return the LocusIds build_api_query's select query returns for outlier_type=all and params.
+
+        Runs the query directly against db_path, with the server's current app.config, and checks
+        that its count query agrees with the number of rows.
+
+        Args:
+            db_path: Path to the test database.
+            **params: Further validated query parameters, e.g. sort_by=["variation_cluster"].
+
+        Returns:
+            List of the LocusIds, in the query's order.
+        """
+        select_query, count_query, _, _, sql_params = results_server.build_api_query(
+            dict({"outlier_type": "all"}, **params))
+        conn = duckdb_compat.connect(db_path, read_only=True)
+        conn.row_factory = duckdb_compat.Row
+        try:
+            locus_ids = [row["LocusId"] for row in conn.execute(select_query, sql_params)]
+            self.assertEqual(conn.execute(count_query, sql_params).fetchone()[0], len(locus_ids))
+        finally:
+            conn.close()
+        return locus_ids
 
     def record_template_render_arguments(self):
         """Make the pages record their template's arguments instead of rendering, for one test.

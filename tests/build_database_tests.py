@@ -9,6 +9,7 @@ and populated outlier columns — and that a re-run is idempotent.
 import contextlib
 import io
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -16,6 +17,7 @@ import analysis_columns
 import build_database
 import duckdb_compat
 import result_database
+from tests.database_test_helpers import ordered_table_column_names
 
 
 def _write_tsv(path, header, rows):
@@ -26,19 +28,11 @@ def _write_tsv(path, header, rows):
             output_file.write("\t".join(str(cell) for cell in row) + "\n")
 
 
-def _table_names(connection):
-    return duckdb_compat.list_tables(connection)
-
-
-def _table_columns(connection, table_name):
-    return [column[0] for column in
-            connection.execute(f"SELECT * FROM {table_name} LIMIT 0").description]
-
-
 class BuildDatabaseEndToEndTests(unittest.TestCase):
 
     def setUp(self):
         self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory)
 
         # Five samples: a complete trio (CHILD/MOTHER/FATHER) plus two singletons,
         # two of which (CHILD, SINGLE1) carry phenotype terms.
@@ -89,11 +83,6 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
                 ["SINGLE1", "HP:0001250"],  # seizures
             ])
 
-    def tearDown(self):
-        for name in os.listdir(self.directory):
-            os.remove(os.path.join(self.directory, name))
-        os.rmdir(self.directory)
-
     def test_build_produces_expected_database(self):
         returned = build_database.build(
             self.matrix_path, self.metadata_path, self.db_path,
@@ -104,7 +93,7 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
 
         connection = duckdb_compat.connect(self.db_path)
         try:
-            tables = _table_names(connection)
+            tables = duckdb_compat.list_tables(connection)
             for required in ["loci", "swim_plot", "metadata"]:
                 self.assertIn(required, tables)
 
@@ -131,7 +120,7 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
                 connection.execute("SELECT COUNT(*) FROM loci").fetchone()[0], 4)
 
             # loci columns are a subset of OUTPUT_COLUMNS, in OUTPUT_COLUMNS order.
-            loci_columns = _table_columns(connection, "loci")
+            loci_columns = ordered_table_column_names(connection, "loci")
             self.assertTrue(set(loci_columns).issubset(set(analysis_columns.OUTPUT_COLUMNS)))
             self.assertEqual(
                 loci_columns,
@@ -178,7 +167,7 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
         """Return a deterministic snapshot of the built database's loci table."""
         connection = duckdb_compat.connect(self.db_path)
         try:
-            columns = _table_columns(connection, "loci")
+            columns = ordered_table_column_names(connection, "loci")
             rows = connection.execute(
                 "SELECT * FROM loci ORDER BY LocusId").fetchall()
             return columns, rows
@@ -192,7 +181,7 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
         build_database.build(self.matrix_path, self.metadata_path, self.db_path)
         connection = duckdb_compat.connect(self.db_path)
         try:
-            tables = _table_names(connection)
+            tables = duckdb_compat.list_tables(connection)
             self.assertIn("loci", tables)
             self.assertIn("swim_plot", tables)
             self.assertIn("mendelian_violations", tables)
@@ -235,6 +224,7 @@ class AffectedUnsolvedOutliersTableTests(unittest.TestCase):
 
     def setUp(self):
         self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory)
         self.matrix_path = os.path.join(self.directory, "matrix.tsv")
         self.metadata_path = os.path.join(self.directory, "samples.tsv")
         self.db_path = os.path.join(self.directory, "result.duckdb")
@@ -270,11 +260,6 @@ class AffectedUnsolvedOutliersTableTests(unittest.TestCase):
                 ["U1", "male", "FAM_C", "unaffected", "unaffected"],
                 ["U2", "female", "FAM_D", "affected", "solved"],
             ])
-
-    def tearDown(self):
-        for name in os.listdir(self.directory):
-            os.remove(os.path.join(self.directory, name))
-        os.rmdir(self.directory)
 
     def build_and_read(self, **build_arguments):
         """Builds the database and returns (stored counts, counts implied by the table, gate cohorts).
@@ -346,6 +331,7 @@ class StrchiveOnlyCatalogTests(unittest.TestCase):
 
     def setUp(self):
         self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory)
         self.matrix_path = os.path.join(self.directory, "matrix.tsv")
         self.metadata_path = os.path.join(self.directory, "samples.tsv")
         self.strchive_path = os.path.join(self.directory, "strchive.json")
@@ -360,11 +346,6 @@ class StrchiveOnlyCatalogTests(unittest.TestCase):
                 '[{"id": "STR_A", "disease": "DiseaseA", "chrom": "chr2", '
                 '"start_hg38": 500, "stop_hg38": 530, '
                 '"reference_motif_reference_orientation": ["CAG"]}]')
-
-    def tearDown(self):
-        for name in os.listdir(self.directory):
-            os.remove(os.path.join(self.directory, name))
-        os.rmdir(self.directory)
 
     def test_a_locus_in_the_strchive_catalog_gets_its_known_disease_locus(self):
         build_database.build(

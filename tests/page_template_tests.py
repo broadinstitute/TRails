@@ -103,7 +103,7 @@ class TagFilterRestoreTests(unittest.TestCase):
     def test_search_and_export_read_the_tag_off_the_dropdown(self):
         # This is what makes the ordering matter, so pin it: if these ever stopped reading the
         # dropdown the startup ordering above would no longer be load bearing.
-        self.assertIn("currentState.tag = $('#tag-filter').dropdown('get value') || '';", self.template)
+        self.assertIn("currentState.tag = getDropdownValue($('#tag-filter'));", self.template)
         for handler in ("$('#search-button').on('click', function() {", "async function performExport(format) {"):
             self.assertIn("readStateFromUI();", self.template[self.template.index(handler):][:2000])
 
@@ -1181,6 +1181,26 @@ class SearchErrorResponseTests(unittest.TestCase):
                       "            throw new Error(errorData.detail || `HTTP ${response.status}`);", search)
 
 
+class DropdownValueReadTests(unittest.TestCase):
+    """Every dropdown value is read through getDropdownValue, which undoes Semantic UI storing a
+    double quote as '&quot;', so a tag a"b is saved and filtered as a"b."""
+
+    def test_the_helper_restores_double_quotes(self):
+        helper = js_function_body(read_template("qc_shared_js.html"), "function getDropdownValue(")
+        self.assertIn("return String($dropdown.dropdown('get value') || '').replace(/&quot;/g, '\"');", helper)
+
+    def test_it_is_the_only_code_that_reads_a_dropdown_value(self):
+        templates = {name: read_template(name) for name in sorted(os.listdir(CODE_DIRECTORY)) if name.endswith(".html")}
+        self.assertEqual(1, sum(template.count(".dropdown('get value')") for template in templates.values()))
+        for name, reader in (("index_page_template.html", "getDropdownValue($('#tag-filter'))"),
+                             ("index_page_template.html", "getDropdownValue($('#sample-id-filter'))"),
+                             ("index_page_template.html", "getDropdownValue($addTagDropdown)"),
+                             ("swim_plot_template.html", "getDropdownValue($('#swim-tag-filter'))"),
+                             ("swim_plot_template.html", "getDropdownValue($('#swim-sample-id-filter'))"),
+                             ("header_template.html", "const selected = getDropdownValue($dropdown);")):
+            self.assertIn(reader, templates[name], name)
+
+
 class SwimPlotMendelianGeneFilterTests(unittest.TestCase):
     """The swim plot sends the Mendelian-gene filter under the name the API parses, mendelian_genes_only."""
 
@@ -1244,8 +1264,10 @@ class ApiBaseUrlTests(unittest.TestCase):
         self.assertEqual(1, all_templates.count("window.location.origin + '/api/v1'"))
 
     def test_the_results_page_reads_annotations_from_the_shared_url(self):
+        # refreshRowAnnotations and fetchLocusTags, both through fetchJsonOrNull, which logs a
+        # failed request and returns null
         self.assertEqual(2, read_template("index_page_template.html").count(
-            "fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`)"))
+            "await fetchJsonOrNull(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`, "))
 
 
 class GeneRegionListTests(unittest.TestCase):

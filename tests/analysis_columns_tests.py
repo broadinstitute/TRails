@@ -527,45 +527,47 @@ class AddGeneColumnsTests(unittest.TestCase):
         }
         add_gene_columns(records, gene_lookup)
         self.assertEqual(records[0]["pLI"], 0.9)
-        self.assertEqual(records[0]["inheritance"], "AD")
+        self.assertEqual(records[0]["GeneTableInheritance"], "AD")
         self.assertEqual(records[1]["pLI"], 0.5)
         self.assertIsNone(records[2]["pLI"])
-        self.assertEqual(records[2]["inheritance"], "XR")
+        self.assertEqual(records[2]["GeneTableInheritance"], "XR")
         # gene_id not in lookup -> both None.
         self.assertIsNone(records[3]["pLI"])
-        self.assertIsNone(records[3]["inheritance"])
+        self.assertIsNone(records[3]["GeneTableInheritance"])
 
     def test_no_gene_lookup_yields_null(self):
         records = [{"gene_id": "G1"}, {"gene_id": None}]
         add_gene_columns(records, None)
         for record in records:
             self.assertIsNone(record["pLI"])
-            self.assertIsNone(record["inheritance"])
+            self.assertIsNone(record["GeneTableInheritance"])
 
-    def test_inheritance_is_the_gene_table_inheritance(self):
-        # read_gene_table gives a blank inheritance cell as a float NaN; both columns store None.
+    def test_blank_gene_table_inheritance_is_none(self):
+        # read_gene_table gives a blank inheritance cell as a float NaN, stored as None. The
+        # inheritance mode is stored only as GeneTableInheritance.
         records = [{"gene_id": "G1"}, {"gene_id": "G2"}, {"gene_id": "missing"}]
         add_gene_columns(records, {"G1": {"inheritance": "AD"}, "G2": {"inheritance": float("nan")}})
-        self.assertEqual([record["inheritance"] for record in records], ["AD", None, None])
+        self.assertEqual([record["GeneTableInheritance"] for record in records], ["AD", None, None])
         for record in records:
-            self.assertEqual(record["inheritance"], record["GeneTableInheritance"])
+            self.assertNotIn("inheritance", record)
 
 
 class OutputColumnsTests(unittest.TestCase):
 
     def test_exact_count_and_uniqueness(self):
-        self.assertEqual(len(OUTPUT_COLUMNS), 137)
-        self.assertEqual(len(set(OUTPUT_COLUMNS)), 137)
+        self.assertEqual(len(OUTPUT_COLUMNS), 136)
+        self.assertEqual(len(set(OUTPUT_COLUMNS)), 136)
 
     def test_anchor_positions(self):
         # Spot-check fixed positions in OUTPUT_COLUMNS (the trailing comments give 1-based
         # column numbers).
         self.assertEqual(OUTPUT_COLUMNS[0], "LocusId")
         self.assertEqual(OUTPUT_COLUMNS[32], "pLI")  # col 33
-        self.assertEqual(OUTPUT_COLUMNS[33], "inheritance")  # col 34
-        self.assertEqual(OUTPUT_COLUMNS[34], "FirstAffectedAlleleSize_AllAlleles")  # col 35
-        self.assertEqual(OUTPUT_COLUMNS[134], "VariationClusterSizeDiff")  # col 135
-        self.assertEqual(OUTPUT_COLUMNS[136], "VariationClusterFilterReason")  # col 137
+        self.assertEqual(OUTPUT_COLUMNS[33], "FirstAffectedAlleleSize_AllAlleles")  # col 34
+        self.assertEqual(OUTPUT_COLUMNS[133], "VariationClusterSizeDiff")  # col 134
+        self.assertEqual(OUTPUT_COLUMNS[135], "VariationClusterFilterReason")  # col 136
+        # The inheritance mode is GeneTableInheritance; no duplicate "inheritance" column.
+        self.assertNotIn("inheritance", OUTPUT_COLUMNS)
 
     def test_each_cohort_has_median_and_mode_after_its_max_allele(self):
         for cohort in ("AoU1027", "HPRC256", "TenK10K"):
