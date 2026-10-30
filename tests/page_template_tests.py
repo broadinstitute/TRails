@@ -198,7 +198,7 @@ class AnnotationWriteHelperTests(unittest.TestCase):
         for name in self.PAGES_THAT_WRITE_ANNOTATIONS:
             template = read_template(name)
             self.assertIn('{% include "header_template.html" %}', template, name)
-            for signature in self.HELPER_SIGNATURES + ("async function annotationError(",):
+            for signature in self.HELPER_SIGNATURES:
                 self.assertIn(signature, self.header)
                 self.assertNotIn(signature, template, name)
             for call in ("openNoteEditor(", "addTag(", "removeTag("):
@@ -207,12 +207,7 @@ class AnnotationWriteHelperTests(unittest.TestCase):
 
     def test_the_write_helpers_read_the_response_body(self):
         for signature in self.HELPER_SIGNATURES:
-            body = js_function_body(self.header, signature)
-            self.assertIn("throw await annotationError(response);", body, signature)
-            self.assertNotIn("new Error(`HTTP ${response.status}`)", body, signature)
-        helper = js_function_body(self.header, "async function annotationError(")
-        self.assertIn("await response.json().catch(() => ({}))", helper)
-        self.assertIn("body.detail || body.error || `HTTP ${response.status}`", helper)
+            self.assertIn("throw await errorFromResponse(response);", js_function_body(self.header, signature), signature)
 
     def test_no_template_names_a_server_symbol_that_does_not_exist(self):
         # Every `results_server.<name>` a comment cites has to be findable in the server.
@@ -563,7 +558,7 @@ class NoteEditorLoadFailureTests(unittest.TestCase):
         self.handler = js_function_body(read_template("header_template.html"), "async function openNoteEditor(")
 
     def test_a_failed_response_is_not_read_as_an_absent_note(self):
-        self.assertIn("if (!response.ok) throw new Error(`HTTP ${response.status}`);", self.handler)
+        self.assertIn("if (!response.ok) throw await errorFromResponse(response);", self.handler)
 
     def test_the_editor_stays_closed_when_the_existing_note_could_not_be_loaded(self):
         catch_block = self.handler[self.handler.index("} catch (e) {"):]
@@ -954,7 +949,7 @@ class SharedMenuLoaderTests(unittest.TestCase):
 
     def test_an_error_status_is_a_failed_request(self):
         loader = js_function_body(self.header, "async function fetchJsonOrNull(")
-        self.assertIn("if (!response.ok) throw new Error(`HTTP ${response.status}`);", loader)
+        self.assertIn("if (!response.ok) throw await errorFromResponse(response);", loader)
         self.assertIn("return null;", loader)
 
     def test_one_tag_request_fills_the_menu_and_the_cached_list(self):
@@ -1172,13 +1167,29 @@ class TypedInDropdownValueEscapingTests(unittest.TestCase):
                       "        .addClass('sorted-active');", indicator)
 
 
-class SearchErrorResponseTests(unittest.TestCase):
-    """A failed search whose response is not JSON (e.g. a proxy's error page) reports its HTTP status."""
+class ErrorResponseTests(unittest.TestCase):
+    """Every failed API response is turned into an Error by header_template.html's errorFromResponse.
 
-    def test_the_error_body_is_read_with_a_fallback(self):
-        search = js_function_body(read_template("index_page_template.html"), "async function performSearch(")
-        self.assertIn("const errorData = await response.json().catch(() => ({}));\n"
-                      "            throw new Error(errorData.detail || `HTTP ${response.status}`);", search)
+    It carries the server's "detail" or "error" text, and a response that is not JSON (e.g. a
+    proxy's error page) gives "HTTP <status>".
+    """
+
+    def test_the_shared_helper_reads_the_body_with_a_fallback(self):
+        helper = js_function_body(read_template("header_template.html"), "async function errorFromResponse(")
+        self.assertIn("const body = await response.json().catch(() => ({}));", helper)
+        self.assertIn("return new Error(body.detail || body.error || `HTTP ${response.status}`);", helper)
+
+    def test_every_page_request_uses_it(self):
+        templates = {name: read_template(name) for name in sorted(os.listdir(CODE_DIRECTORY)) if name.endswith(".html")}
+        # The helper's own read is the only place a template reads an error body
+        self.assertEqual(1, sum(template.count(".json().catch(") for template in templates.values()))
+        for name, function_signature in (("index_page_template.html", "async function performSearch("),
+                                         ("index_page_template.html", "async function loadLocusDetailInto("),
+                                         ("swim_plot_template.html", "async function loadSwimPlot("),
+                                         ("qc2_template.html", "async function loadQC2Data("),
+                                         ("sample_qc_template.html", "async function loadSampleQCData(")):
+            self.assertIn("if (!response.ok) throw await errorFromResponse(response);",
+                          js_function_body(templates[name], function_signature), function_signature)
 
 
 class DropdownValueReadTests(unittest.TestCase):

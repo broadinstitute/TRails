@@ -119,10 +119,7 @@ function createChartsForSection(containerId, data) {
 async function loadSampleQCData() {
     try {
         const response = await fetch(`${API_BASE_URL}/sample_qc_data`);
-        if (!response.ok) {
-            const errData = await response.json().catch(() => ({}));
-            throw new Error(errData.detail || `HTTP ${response.status}`);
-        }
+        if (!response.ok) throw await errorFromResponse(response);
         const data = await response.json();
 
         // Hide loading, show sections

@@ -16,6 +16,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.parse
 
 import duckdb_compat
 import result_database
@@ -644,7 +645,7 @@ class BlankFilterValueTests(EndpointConfigTestCase):
 
     def test_blank_list_filters_are_dropped(self):
         for param in ("locus_id", "gene_symbol", "phenotype_keyword", "sample_id_keyword",
-                      "sample_id_like"):
+                      "sample_id_like", "motif", "motif_size"):
             for raw in (",", " , ", ",,"):
                 data = self._loci(f"{param}={raw}")
                 self.assertEqual({r["LocusId"] for r in data["results"]}, self.ALL_LOCUS_IDS,
@@ -688,9 +689,7 @@ class VariationClusterFilterWithoutTheColumnTests(EndpointConfigTestCase):
     """
 
     def _swim_sample_ids(self, query):
-        response = self.client.get(f"/api/v1/swim_plot_data?outlier_type=all&{query}")
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
-        return {entry["sample_id"] for entry in response.get_json()["data"]}
+        return {sample_id for _, sample_id in self.get_swim_plot_rows(query)}
 
     def test_swim_plot_keeps_every_locus(self):
         unfiltered = self._swim_sample_ids("")
@@ -827,10 +826,7 @@ class SearchEndToEndTests(ServerTestCase):
         return {r["LocusId"] for r in data["results"]}
 
     def _swim_locus_ids(self, search):
-        response = self.client.get("/api/v1/swim_plot_data",
-                                   query_string={"outlier_type": "all", "search": search})
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
-        return {entry["LocusId"] for entry in response.get_json()["data"]}
+        return {locus_id for locus_id, _ in self.get_swim_plot_rows(urllib.parse.urlencode({"search": search}))}
 
     def test_a_lowercase_locus_id_is_found(self):
         # The stored id spells its motif in lower case, which is what the input matrix wrote, and

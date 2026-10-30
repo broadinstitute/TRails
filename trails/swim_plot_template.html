@@ -412,10 +412,7 @@ async function loadSwimPlot() {
     try {
         const response = await fetch(url);
         if (requestId !== swimLoadSeq) return;  // superseded by a newer load
-        if (!response.ok) {
-            const errData = await response.json().catch(() => ({}));
-            throw new Error(errData.detail || `HTTP ${response.status}`);
-        }
+        if (!response.ok) throw await errorFromResponse(response);
         const result = await response.json();
         if (requestId !== swimLoadSeq) return;  // superseded while parsing the response
         swimRawData = result.data || [];
@@ -743,14 +740,14 @@ function showDotDetail(item) {
     $('#dot-detail-content').html('<div class="ui active centered inline loader" style="margin: 30px auto;"></div>');
     $('#dot-detail-modal').modal('show');
 
-    // Use the params the chart was actually loaded with, not the live controls — the user may
-    // have changed the outlier-type radio without reloading, which would otherwise fetch detail
-    // for a different outlier type than the plotted dot belongs to (wrong details or 404).
+    // Use the params the chart was actually loaded with, not the live controls: the user may have
+    // changed the outlier-type radio without reloading, and the sample outlier stats and phenotype
+    // scores must be for the outlier type the plotted dot belongs to.
     const params = swimLoadedParams || getSwimParams();
     const detailUrl = buildLocusDetailUrl(item.LocusId);
     const statsUrl = `${API_BASE_URL}/sample_outlier_stats?sample_id=${encodeURIComponent(item.sample_id)}&locus_id=${encodeURIComponent(item.LocusId)}&outlier_type=${encodeURIComponent(params.outlier_type)}`;
 
-    const detailPromise = fetch(detailUrl).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+    const detailPromise = fetch(detailUrl).then(async r => { if (!r.ok) throw await errorFromResponse(r); return r.json(); });
     const statsPromise = fetch(statsUrl).then(r => r.ok ? r.json() : null).catch(() => null);
 
     Promise.all([detailPromise, statsPromise])
@@ -951,7 +948,8 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
         + '<td style="font-weight:600; color:#555;">Stdev</td>'
         + '<td style="font-weight:600; color:#555;">90th Pctl</td></tr>';
 
-    // Only cohorts with data (max != null) are shown; HPRC256/TenK10K have no 90th percentile -> '?'.
+    // Only cohorts with data (max != null) are shown. A <cohort>_90thPercentile column exists only
+    // when the input matrix supplies one, so the 90th Pctl column shows '?' for any cohort without it.
     const rPop = v => (v != null ? Math.round(v) : '?');
     POPULATION_COHORTS.filter(k => popThresh[k + '_MaxAllele'] != null).forEach(k => {
         const stdev = popThresh[k + '_Stdev'];

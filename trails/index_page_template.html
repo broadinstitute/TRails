@@ -1125,11 +1125,7 @@ async function performSearch() {
         const grouped = currentState.group_by !== 'locus';
         const response = await fetchWithTimeout(grouped ? buildGroupedApiUrl() : buildApiUrl());
         if (requestId !== searchRequestSeq) return;  // superseded by a newer search
-        if (!response.ok) {
-            // An error page that is not JSON (e.g. from a proxy) falls back to the HTTP status
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.detail || `HTTP ${response.status}`);
-        }
+        if (!response.ok) throw await errorFromResponse(response);
         const data = await response.json();
         if (requestId !== searchRequestSeq) return;  // superseded while parsing the response
         // The server returns a page past the last one empty, and the pager would read e.g.
@@ -1611,10 +1607,7 @@ async function loadGroupLoci($container, page) {
     $container.html('<div class="ui tiny active inline loader"></div> Loading...');
     try {
         const response = await fetchWithTimeout(buildGroupLociApiUrl(groupId, page));
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.detail || `HTTP ${response.status}`);
-        }
+        if (!response.ok) throw await errorFromResponse(response);
         $container.html(renderGroupLociTable(groupId, await response.json()));
     } catch (error) {
         $container.html(`<span style="color: red;">Error: ${escapeHtml(error.message)}</span>`);
@@ -2060,8 +2053,8 @@ function renderLocusDetail(detail, outlierType) {
 
     // Threshold values
     const firstUnaffected = locus[`FirstUnaffectedAlleleSize_${ot}`];
-    // Only cohorts with data (max != null) are shown. 90thPercentile is absent for
-    // HPRC256/TenK10K (no source data) and renders as "p90=?".
+    // Only cohorts with data (max != null) are shown. A <cohort>_90thPercentile column exists only
+    // when the input matrix supplies one, so p90 shows "p90=?" for any cohort without it.
     const popEntries = POPULATION_COHORTS.map(name => ({
         name,
         max:    popThresholds[`${name}_MaxAllele`],
@@ -2596,7 +2589,7 @@ function highlightGroupSamplesInDetail($locusRow, $detailRow) {
 // throws, and each caller reports it its own way.
 async function loadLocusDetailInto(locusId, $locusRows) {
     const response = await fetchWithTimeout(buildLocusDetailUrl(locusId));
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) throw await errorFromResponse(response);
     const html = renderLocusDetail(await response.json(), currentState.outlier_type);
     $locusRows.each(function() {
         const $detailRow = $(this).next('.locus-detail-row');
@@ -2819,7 +2812,7 @@ $(document).on('click', '.badge-known-locus', async function(e) {
 
     try {
         const response = await fetch(buildLocusDetailUrl(locusId));
-        if (!response.ok) throw new Error('Failed to fetch locus details');
+        if (!response.ok) throw await errorFromResponse(response);
         const data = await response.json();
         const knownDisease = data.annotations?.known_disease_locus;
 

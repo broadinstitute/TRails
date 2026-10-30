@@ -182,10 +182,7 @@ function createChartsForSection(containerId, data, bins, section) {
 async function loadQC2Data() {
     try {
         const response = await fetch(`${API_BASE_URL}/qc2_data`);
-        if (!response.ok) {
-            const errData = await response.json().catch(() => ({}));
-            throw new Error(errData.detail || `HTTP ${response.status}`);
-        }
+        if (!response.ok) throw await errorFromResponse(response);
         const data = await response.json();
 
         // Hide loading, show sections

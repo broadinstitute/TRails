@@ -81,13 +81,23 @@ function linkGeneRegionIncludeAndExcludeCheckboxes(namePrefix) {
     }
 }
 
+// The Error to throw for a failed API response, carrying the server's own explanation: the
+// "detail" field most error replies have (e.g. the read-only-server 403 from the
+// results_server.restrict_writes before_request hook), or the "error" field of the annotation
+// routes' validation failures. A body that is not JSON (e.g. a proxy's error page) gives
+// "HTTP <status>". Callers show the message in the page or in an alert.
+async function errorFromResponse(response) {
+    const body = await response.json().catch(() => ({}));
+    return new Error(body.detail || body.error || `HTTP ${response.status}`);
+}
+
 // GET a JSON API response, or null when the request fails or the server answers with an error
 // status (logged to the console under `description`), so a failed request leaves the page's
 // menus as they were instead of emptying them.
 async function fetchJsonOrNull(url, description) {
     try {
         const response = await fetch(url);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.ok) throw await errorFromResponse(response);
         return await response.json();
     } catch (e) {
         console.error(`${description} error:`, e);
@@ -103,22 +113,14 @@ function fillSampleIdDropdown($dropdown, schema) {
 // A locus's note and tags
 const ANNOTATIONS_API_URL = `${API_BASE_URL}/annotations`;
 
-// The annotation write routes explain every failure in the response body: a "detail" field for
-// the read-only-server 403 (the results_server.restrict_writes before_request hook) and an "error" field for the
-// validation failures, so surface that text instead of a bare status number. The callers show
-// e.message in an alert.
-async function annotationError(response) {
-    const body = await response.json().catch(() => ({}));
-    return new Error(body.detail || body.error || `HTTP ${response.status}`);
-}
-
+// Annotation writes; a failure throws errorFromResponse's Error, which the callers show in an alert
 async function saveNote(locusId, noteText) {
     const response = await fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}/note`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({note_text: noteText}),
     });
-    if (!response.ok) throw await annotationError(response);
+    if (!response.ok) throw await errorFromResponse(response);
     return response.json();
 }
 
@@ -126,7 +128,7 @@ async function deleteNote(locusId) {
     const response = await fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}/note`, {
         method: 'DELETE',
     });
-    if (!response.ok) throw await annotationError(response);
+    if (!response.ok) throw await errorFromResponse(response);
     return response.json();
 }
 
@@ -136,7 +138,7 @@ async function addTag(locusId, tag) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({tag: tag}),
     });
-    if (!response.ok) throw await annotationError(response);
+    if (!response.ok) throw await errorFromResponse(response);
     return response.json();
 }
 
@@ -144,7 +146,7 @@ async function removeTag(locusId, tag) {
     const response = await fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}/tags/${encodeURIComponent(tag)}`, {
         method: 'DELETE',
     });
-    if (!response.ok) throw await annotationError(response);
+    if (!response.ok) throw await errorFromResponse(response);
     return response.json();
 }
 
@@ -184,7 +186,7 @@ async function openNoteEditor(locusId, onNoteChanged) {
     // an existing note destroys it on save.
     try {
         const response = await fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.ok) throw await errorFromResponse(response);
         const data = await response.json();
         if (seq !== noteEditorSeq) return;  // a newer open already owns the modal
 

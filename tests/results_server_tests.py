@@ -916,10 +916,7 @@ class PhenotypeKeywordAgreesWithTheSwimPlotTests(ServerTestCase):
         cls.configure_server(cls.db_path)
 
     def _swim_locus_ids(self, keyword):
-        response = self.client.get(
-            f"/api/v1/swim_plot_data?outlier_type=all&phenotype_keyword={keyword}")
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
-        return {entry["LocusId"] for entry in response.get_json()["data"]}
+        return {locus_id for locus_id, _ in self.get_swim_plot_rows(f"phenotype_keyword={keyword}")}
 
     def test_the_top_three_affected_phenotypes_still_match(self):
         self.assertEqual(self.get_locus_ids("phenotype_keyword=seizures"), {"chr1-100-110-AT"})
@@ -951,6 +948,43 @@ class PhenotypeKeywordAgreesWithTheSwimPlotTests(ServerTestCase):
 
     def test_an_unmatched_keyword_returns_nothing(self):
         self.assertEqual(self.get_locus_ids("phenotype_keyword=no_such_phenotype"), set())
+
+
+class CommaSeparatedParameterTests(unittest.TestCase):
+    """The comma-list parsing behind the list filters, motif and motif_size."""
+
+    def test_entries_are_stripped_and_blanks_dropped(self):
+        self.assertEqual(results_server.parse_comma_separated_values(" a, b ,,c "), ["a", "b", "c"])
+        for blank in (None, "", " ", ",", " , ,"):
+            self.assertEqual(results_server.parse_comma_separated_values(blank), [], repr(blank))
+
+    def test_motif_size_entries(self):
+        for text, expected_clause, expected_params in (
+                ("3", "(loci.MotifSize = ?)", [3]),
+                (" 3 - 6 ", "(loci.MotifSize BETWEEN ? AND ?)", [3, 6]),
+                ("5-", "(loci.MotifSize >= ?)", [5]),
+                # Split at the first dash, so this is an open start, not a negative size
+                ("-10", "(loci.MotifSize <= ?)", [10]),
+                ("--5", "(loci.MotifSize <= ?)", [-5]),
+                ("1-2, 3,4-,-5",
+                 "(loci.MotifSize BETWEEN ? AND ? OR loci.MotifSize = ? OR loci.MotifSize >= ? OR loci.MotifSize <= ?)",
+                 [1, 2, 3, 4, 5])):
+            self.assertEqual(results_server.parse_motif_size_filter(text), (expected_clause, expected_params, None), text)
+        for blank in ("", " ", ",", " , ,"):
+            self.assertEqual(results_server.parse_motif_size_filter(blank), (None, [], None), repr(blank))
+
+    def test_motif_size_errors(self):
+        for text, expected_error in (
+                ("a", "Invalid motif_size value: 'a'"),
+                ("a-b", "Invalid motif_size range: 'a-b'"),
+                ("3-b", "Invalid motif_size range: '3-b'"),
+                ("3-6-9", "Invalid motif_size range: '3-6-9'"),
+                ("x-", "Invalid motif_size value: 'x-'"),
+                ("-x", "Invalid motif_size value: '-x'"),
+                (" - ", "Invalid motif_size format: '-'"),
+                ("3, a", "Invalid motif_size value: 'a'"),
+                ("9223372036854775808", "Invalid motif_size value: '9223372036854775808'")):
+            self.assertEqual(results_server.parse_motif_size_filter(text), (None, [], expected_error), text)
 
 
 class PageJsonTests(unittest.TestCase):
@@ -1795,11 +1829,6 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
     sample-level filters and SWIM_PLOT_ALLELE_LEVEL_FILTERS pick rows: each row is one allele.
     """
 
-    def _swim_rows(self, query):
-        response = self.client.get(f"/api/v1/swim_plot_data?outlier_type=all&{query}")
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
-        return {(entry["LocusId"], entry["sample_id"]) for entry in response.get_json()["data"]}
-
     def test_locus_filters_keep_the_loci_the_results_table_returns(self):
         self.client.post("/api/v1/annotations/chr2-200-209-AAG/tags", json={"tag": "swim"})
         self.addCleanup(self.client.delete, "/api/v1/annotations/chr2-200-209-AAG/tags/swim")
@@ -1809,7 +1838,8 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
                       "reference_region=chr1:100-110", "search=GENE2", "search=chr1:105", "search=nothing",
                       "search=CHR2-200-209-aag", "tag=swim", "tag=no_such_tag", "known_loci_only=true",
                       "max_variation_cluster_size_diff=5", "min_repeats_threshold=5"):
-            self.assertEqual({locus_id for locus_id, _ in self._swim_rows(query)}, self.get_locus_ids(query), query)
+            self.assertEqual({locus_id for locus_id, _ in self.get_swim_plot_rows(query)}, self.get_locus_ids(query),
+                             query)
 
     def test_invalid_values_are_rejected_as_by_the_results_table(self):
         for query in ("gene_regions=foo", "exclude_gene_regions=foo", "motif=AXT", "motif_size=a-b",
@@ -1824,10 +1854,10 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
     def test_sample_level_filters_keep_the_rows_of_the_matching_samples(self):
         # The results table keeps the locus; the swim plot draws only that sample's allele there.
         self.assertEqual(self.get_locus_ids("sample_id_keyword=sampleB"), {"chr1-100-110-AT"})
-        self.assertEqual(self._swim_rows("sample_id_keyword=SAMPLEB"), {("chr1-100-110-AT", "sampleB")})
-        self.assertEqual(self._swim_rows("sample_id_like=ple_"), set())
-        self.assertEqual(self._swim_rows("sample_id_like=pleC"), {("chr2-200-209-AAG", "sampleC")})
-        self.assertEqual(self._swim_rows("phenotype_keyword=SEIZ"), {("chr1-100-110-AT", "sampleA")})
+        self.assertEqual(self.get_swim_plot_rows("sample_id_keyword=SAMPLEB"), {("chr1-100-110-AT", "sampleB")})
+        self.assertEqual(self.get_swim_plot_rows("sample_id_like=ple_"), set())
+        self.assertEqual(self.get_swim_plot_rows("sample_id_like=pleC"), {("chr2-200-209-AAG", "sampleC")})
+        self.assertEqual(self.get_swim_plot_rows("phenotype_keyword=SEIZ"), {("chr1-100-110-AT", "sampleA")})
 
     def test_the_pathogenic_threshold_compares_each_allele(self):
         # chr1's largest affected allele (6) reaches the minimum, so the results table keeps the
@@ -1836,12 +1866,12 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
         self.addCleanup(results_server.app.config.__setitem__, "KNOWN_DISEASE_LOCUS_THRESHOLDS", saved)
         results_server.app.config["KNOWN_DISEASE_LOCUS_THRESHOLDS"] = {"chr1-100-110-AT": 6}
         self.assertEqual(self.get_locus_ids("apply_pathogenic_threshold=true"), {"chr1-100-110-AT"})
-        self.assertEqual(self._swim_rows("apply_pathogenic_threshold=1"), {("chr1-100-110-AT", "sampleA")})
+        self.assertEqual(self.get_swim_plot_rows("apply_pathogenic_threshold=1"), {("chr1-100-110-AT", "sampleA")})
 
     def test_require_affected_above_unaffected(self):
         # sampleB is unaffected, and sampleC has no unaffected allele to be compared with.
         for value in ("1", "true"):
-            self.assertEqual(self._swim_rows(f"require_affected_above_unaffected={value}"),
+            self.assertEqual(self.get_swim_plot_rows(f"require_affected_above_unaffected={value}"),
                              {("chr1-100-110-AT", "sampleA"), ("chr2-200-209-AAG", "sampleC")})
 
     def test_require_affected_above_unaffected_follows_the_builds_rule(self):
@@ -1878,16 +1908,16 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
         self.addCleanup(self.configure_server, self.db_path)
 
         self.assertEqual(self.get_locus_ids("require_above_unaffected=first"), {"chr1-100-110-AT", "chr1-300-310-AT"})
-        swim_rows = self._swim_rows("require_affected_above_unaffected=1")
+        swim_rows = self.get_swim_plot_rows("require_affected_above_unaffected=1")
         self.assertEqual(swim_rows, {("chr1-100-110-AT", "UNKNOWN"), ("chr1-300-310-AT", "AFFECTED")})
         self.assertEqual({locus_id for locus_id, _ in swim_rows}, self.get_locus_ids("require_above_unaffected=first"))
 
     def test_the_matching_loci_are_looked_up_once_per_request(self):
         recorded_queries = _record_queries(self)
-        self._swim_rows("gene_regions=cds&search=GENE1")
+        self.get_swim_plot_rows("gene_regions=cds&search=GENE1")
         self.assertEqual(len([sql for sql in recorded_queries if "FROM loci" in sql]), 1)
         recorded_queries.clear()
-        self._swim_rows("")
+        self.get_swim_plot_rows("")
         self.assertFalse([sql for sql in recorded_queries if "FROM loci" in sql])
 
     def test_min_delta_population_compares_the_gate_cohorts_as_the_results_table_does(self):
@@ -1921,7 +1951,7 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
         for gate, expected_loci in (("long-read", {"A", "B"}), ("all", {"B"})):
             query = f"require_above_population={gate}&min_repeats_above_population=5"
             self.assertEqual(self.get_locus_ids(query), expected_loci, query)
-            self.assertEqual({locus_id for locus_id, _ in self._swim_rows(query)}, expected_loci, query)
+            self.assertEqual({locus_id for locus_id, _ in self.get_swim_plot_rows(query)}, expected_loci, query)
 
 
 def _build_db_with_population_percentiles(path, population_gate_cohorts):

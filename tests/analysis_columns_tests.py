@@ -535,6 +535,17 @@ class AddGeneColumnsTests(unittest.TestCase):
         self.assertIsNone(records[3]["pLI"])
         self.assertIsNone(records[3]["GeneTableInheritance"])
 
+    def test_pli_uses_whichever_values_are_present(self):
+        gene_lookup = {
+            "ONLY_V4": {"pLI_v2": None, "pLI_v4": 0.7},
+            "ONLY_V4_NAN_V2": {"pLI_v2": float("nan"), "pLI_v4": 0.4},
+            "NO_PLI_FIELDS": {"gene_symbol": "X"},
+            "STRING_VALUES": {"pLI_v2": "0.2", "pLI_v4": "0.95"},
+        }
+        records = [{"gene_id": gene_id} for gene_id in gene_lookup]
+        add_gene_columns(records, gene_lookup)
+        self.assertEqual([record["pLI"] for record in records], [0.7, 0.4, None, 0.95])
+
     def test_no_gene_lookup_yields_null(self):
         records = [{"gene_id": "G1"}, {"gene_id": None}]
         add_gene_columns(records, None)

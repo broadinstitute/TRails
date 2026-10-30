@@ -7,8 +7,10 @@ gives each locus of the repeat-copy-numbers table the annotations of its TRExplo
 
   * a TRExplorer locus is a candidate when it is on the same chromosome, its interval overlaps
     the locus with a Jaccard similarity (intersection over union) of at least
-    MIN_JACCARD_SIMILARITY, and its motif matches: the same canonical motif when both motifs
-    are 1-6 bp, the same motif length when the locus's motif is 7 bp or more;
+    MIN_JACCARD_SIMILARITY, and its motif matches by locus_annotations.motifs_match's rule: for
+    motifs of at most locus_annotations.MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE bp, the same length
+    and a shared canonical motif, with an N in either motif matching any base (catalogs write
+    polyalanine loci such as ARX as NGC or GCN); for longer motifs, the same length;
   * the candidate with the locus's own id wins (chr prefixes ignored);
   * otherwise each candidate is ranked by the first of these it has: its HPRC256 standard
     deviation, its AoU1027 standard deviation, its reference repeat purity. A candidate ranked
@@ -22,6 +24,7 @@ import pandas
 import duckdb_compat
 import locus_annotations
 import result_database
+from motif_utilities import compute_canonical_motifs_with_n_as_any_base
 
 MIN_JACCARD_SIMILARITY = 0.66
 
@@ -133,6 +136,7 @@ def _match_loci(locus_records, annotations_database_path):
         A dict mapping the index of each matched record in locus_records to a dict of its
         TRExplorer locus's columns plus ``jaccard_similarity``.
     """
+    max_motif_size = locus_annotations.MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE
     user_loci = pandas.DataFrame({
         "record_index": range(len(locus_records)),
         "LocusId": [_without_chr_prefix(r["LocusId"]) for r in locus_records],
@@ -141,6 +145,12 @@ def _match_loci(locus_records, annotations_database_path):
         "End1Based": [r["End1Based"] for r in locus_records],
         "MotifSize": [len(r["Motif"]) for r in locus_records],
         "CanonicalMotif": [r["CanonicalMotif"] for r in locus_records],
+        # Comma-joined, and only for a short motif with an N: every other locus's only canonical
+        # motif is CanonicalMotif, so the motif rule below skips this column for it.
+        "CanonicalMotifsWithNAsAnyBase": pandas.array(
+            [",".join(sorted(compute_canonical_motifs_with_n_as_any_base(r["Motif"])))
+             if len(r["Motif"]) <= max_motif_size and "N" in r["Motif"].upper() else None
+             for r in locus_records], dtype="string"),
     })
     overlap = "(LEAST(u.End1Based, t.End1Based) - GREATEST(u.Start0Based, t.Start0Based))"
     union = f"((u.End1Based - u.Start0Based) + (t.End1Based - t.Start0Based) - {overlap})"
@@ -158,6 +168,18 @@ def _match_loci(locus_records, annotations_database_path):
     try:
         connection.execute(f"ATTACH {_sql_string_literal(annotations_database_path)} AS trexplorer (READ_ONLY)")
         connection.register("user_loci", user_loci)
+        # TRExplorer spells a few polyalanine loci with an N as well. Their canonical motifs with N
+        # as any base go into the query as constants, so the catalog table is joined as it is.
+        trexplorer_n_motifs = [row[0] for row in connection.execute(
+            f"SELECT DISTINCT Motif FROM trexplorer.{TREXPLORER_LOCI_TABLE} "
+            f"WHERE length(Motif) <= {max_motif_size} AND contains(Motif, 'N') ORDER BY Motif").fetchall()]
+        trexplorer_canonical_motifs = "[t.CanonicalMotif]"
+        if trexplorer_n_motifs:
+            trexplorer_canonical_motifs = "CASE t.Motif " + "".join(
+                f"WHEN {_sql_string_literal(motif)} THEN [" + ", ".join(
+                    _sql_string_literal(canonical_motif)
+                    for canonical_motif in sorted(compute_canonical_motifs_with_n_as_any_base(motif))) + "] "
+                for motif in trexplorer_n_motifs) + "ELSE [t.CanonicalMotif] END"
         cursor = connection.execute(
             f"WITH candidates AS ("
             f"  SELECT u.record_index, u.LocusId = t.LocusId AS same_locus_id, "
@@ -165,8 +187,16 @@ def _match_loci(locus_records, annotations_database_path):
             f"  FROM user_loci u JOIN trexplorer.{TREXPLORER_LOCI_TABLE} t "
             f"    ON {genome_coordinate('t', 'Start0Based')} < {genome_coordinate('u', 'End1Based')} "
             f"   AND {genome_coordinate('t', 'End1Based')} > {genome_coordinate('u', 'Start0Based')} "
-            f"  WHERE (u.MotifSize <= 6 AND length(t.Motif) <= 6 AND u.CanonicalMotif = t.CanonicalMotif) "
-            f"     OR (u.MotifSize >= 7 AND length(t.Motif) = u.MotifSize)"
+            # locus_annotations.motifs_match's rule. Without an N on either side, a short motif's
+            # only canonical motif is CanonicalMotif. A shared canonical motif implies the same
+            # length. Every u-t equality stays inside an OR: a top-level one becomes a hash-join
+            # key in place of the IEJoin on the coordinates, which made the query ~30x slower.
+            f"  WHERE (u.MotifSize <= {max_motif_size} AND length(t.Motif) <= {max_motif_size} "
+            f"         AND (u.CanonicalMotif = t.CanonicalMotif "
+            f"              OR ((u.CanonicalMotifsWithNAsAnyBase IS NOT NULL OR contains(t.Motif, 'N')) "
+            f"                  AND list_has_any(COALESCE(string_split(u.CanonicalMotifsWithNAsAnyBase, ','), "
+            f"                                            [u.CanonicalMotif]), {trexplorer_canonical_motifs})))) "
+            f"     OR (u.MotifSize > {max_motif_size} AND length(t.Motif) = u.MotifSize)"
             f") "
             f"SELECT * EXCLUDE (same_locus_id) FROM candidates t "
             f"WHERE jaccard_similarity >= {MIN_JACCARD_SIMILARITY} "

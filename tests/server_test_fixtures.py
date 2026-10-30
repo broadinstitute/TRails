@@ -77,6 +77,20 @@ class ServerTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         return {r["LocusId"] for r in response.get_json()["results"]}
 
+    def get_swim_plot_rows(self, query):
+        """Return the rows /api/v1/swim_plot_data returns for outlier_type=all and further parameters.
+
+        Args:
+            query: The further query parameters, e.g. "phenotype_keyword=ataxia", URL-encoded
+                where a value needs it. "" for none.
+
+        Returns:
+            Set of the (LocusId, sample_id) pairs of the returned rows.
+        """
+        response = self.client.get(f"/api/v1/swim_plot_data?outlier_type=all&{query}")
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return {(entry["LocusId"], entry["sample_id"]) for entry in response.get_json()["data"]}
+
     def get_locus_ids_from_api_query(self, db_path, **params):
         """Return the LocusIds build_api_query's select query returns for outlier_type=all and params.
 

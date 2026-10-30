@@ -380,7 +380,8 @@ def parse_locus_id(locus_id, repeat_copy_numbers_tsv=None):
     written by a tool that uses some other locus-id shape reaches this function
     unchanged. Rather than letting the tuple unpacking or ``int()`` raise a bare
     message, this names the column, the offending value and the file, in the
-    same shape as the sample-id check in ``build_database.build``.
+    same shape as the sample-id check in
+    ``input_tables._reject_sample_ids_containing_outlier_delimiters``.
 
     Args:
         locus_id: The ``LocusId`` / ``trid`` value, e.g. ``"chr1-100-110-CAG"``.

@@ -95,10 +95,12 @@ VALID_SORTS = (
 REQUIRED_TABLE = "loci"
 REQUIRED_COLUMNS = {"LocusId", "Chrom", "Start0Based", "End1Based", "Motif", "MotifSize"}
 
-# A coordinate is bound as a 64-bit integer, so a larger one cannot be passed as a query
-# parameter. A reference-region start must stay strictly below the limit, since a bare
-# position is widened to [start, start + 1).
-MAX_REFERENCE_COORDINATE = 2 ** 63 - 1
+# Integer query parameters are bound as BIGINT, which is signed 64-bit, so binding a larger Python
+# int raises at query time and would surface as a 500. Every parsed integer that becomes a query
+# parameter goes through parse_int64 or parse_reference_region, so an oversized value fails
+# validation with a 400 like any other bad input.
+MIN_INT64 = -(2 ** 63)
+MAX_INT64 = 2 ** 63 - 1
 
 # The values of require_above_unaffected and require_families_above_unaffected, and the prefix of
 # the affected-allele column each one compares
@@ -175,14 +177,6 @@ def resolve_tag_to_loci(tag):
     return app.config["ANNOTATIONS"]["tag_to_loci"].get(tag, set())
 
 
-# Integer query parameters are bound as BIGINT, which is signed 64-bit, so binding a larger Python
-# int raises at query time and would surface as a 500. Every parsed integer that becomes a query
-# parameter goes through parse_int64 so an oversized value fails validation with a 400 like any
-# other bad input.
-MIN_INT64 = -(2 ** 63)
-MAX_INT64 = 2 ** 63 - 1
-
-
 def escape_like_wildcards(text):
     """Escape SQL ILIKE metacharacters so text matches literally.
 
@@ -216,6 +210,19 @@ def parse_int64(text):
     return value
 
 
+def parse_comma_separated_values(text):
+    """Split a comma-separated parameter value into its entries.
+
+    Args:
+        text: The raw parameter value, or None when the parameter is absent.
+
+    Returns:
+        List of the stripped, non-empty entries, in order. A value that is all separators and
+        blanks (",", " , ") gives an empty list.
+    """
+    return [entry.strip() for entry in (text or "").split(",") if entry.strip()]
+
+
 def parse_motif_size_filter(motif_size_str):
     """Parse a motif_size filter string into SQL clauses and parameters.
 
@@ -225,58 +232,45 @@ def parse_motif_size_filter(motif_size_str):
     - -<int>: open-ended range (e.g., "-10" means MotifSize <= 10)
     - <int>-<int>: closed range (e.g., "3-6" means MotifSize BETWEEN 3 AND 6)
 
-    Multiple entries are combined with OR.
+    Multiple entries are combined with OR. An entry is split at its first "-", so "-10" is an
+    open start rather than a negative size.
 
     Args:
         motif_size_str: The filter string from the API parameter.
 
     Returns:
         Tuple of (sql_clause, params, error_message). sql_clause is a WHERE clause
-        fragment, params is the list of parameter values, and error_message is a
-        string when parsing failed (None otherwise).
+        fragment over loci.MotifSize, params is the list of parameter values, and
+        error_message is a string when parsing failed (None otherwise).
     """
-    if not motif_size_str or not motif_size_str.strip():
-        return None, [], None
-
-    parts = [p.strip() for p in motif_size_str.split(",") if p.strip()]
-    if not parts:
-        return None, [], None
-
     clauses = []
     params = []
+    for part in parse_comma_separated_values(motif_size_str):
+        low_text, dash, high_text = (text.strip() for text in part.partition("-"))
+        if dash and not low_text and not high_text:
+            return None, [], f"Invalid motif_size format: '{part}'"
+        try:
+            # None for an open end. An entry without a dash is all low_text: the exact size.
+            low = parse_int64(low_text) if low_text else None
+            high = parse_int64(high_text) if high_text else None
+        except ValueError:
+            return None, [], f"Invalid motif_size {'range' if low_text and high_text else 'value'}: '{part}'"
 
-    for part in parts:
-        if "-" in part:
-            idx = part.index("-")
-            left = part[:idx].strip()
-            right = part[idx + 1:].strip()
-            if left and right:
-                try:
-                    clauses.append("MotifSize BETWEEN ? AND ?")
-                    params.extend([parse_int64(left), parse_int64(right)])
-                except ValueError:
-                    return None, [], f"Invalid motif_size range: '{part}'"
-            elif left and not right:
-                try:
-                    params.append(parse_int64(left))
-                    clauses.append("MotifSize >= ?")
-                except ValueError:
-                    return None, [], f"Invalid motif_size value: '{part}'"
-            elif not left and right:
-                try:
-                    params.append(parse_int64(right))
-                    clauses.append("MotifSize <= ?")
-                except ValueError:
-                    return None, [], f"Invalid motif_size value: '{part}'"
-            else:
-                return None, [], f"Invalid motif_size format: '{part}'"
+        if not dash:
+            clauses.append("loci.MotifSize = ?")
+            params.append(low)
+        elif low is not None and high is not None:
+            clauses.append("loci.MotifSize BETWEEN ? AND ?")
+            params.extend([low, high])
+        elif low is not None:
+            clauses.append("loci.MotifSize >= ?")
+            params.append(low)
         else:
-            try:
-                params.append(parse_int64(part))
-                clauses.append("MotifSize = ?")
-            except ValueError:
-                return None, [], f"Invalid motif_size value: '{part}'"
+            clauses.append("loci.MotifSize <= ?")
+            params.append(high)
 
+    if not clauses:
+        return None, [], None
     return "(" + " OR ".join(clauses) + ")", params, None
 
 
@@ -427,9 +421,11 @@ def parse_reference_region(region_string):
     end = int(end_text) if dash else start
     if end < start:
         return None, f"reference_region '{region_string}' ends before it starts — {expected}"
-    if start >= MAX_REFERENCE_COORDINATE or end > MAX_REFERENCE_COORDINATE:
+    # The start must stay strictly below MAX_INT64, since a bare position is widened to
+    # [start, start + 1).
+    if start >= MAX_INT64 or end > MAX_INT64:
         return None, (f"reference_region '{region_string}' has a coordinate above "
-                      f"{MAX_REFERENCE_COORDINATE} — {expected}")
+                      f"{MAX_INT64} — {expected}")
 
     return (chrom, start, max(end, start + 1)), None
 
@@ -1084,17 +1080,16 @@ def validate_params():
         else:
             params["population_metric"] = pm
 
-    if request.args.get("motif"):
-        motif_list = [m.strip() for m in request.args["motif"].split(",") if m.strip()]
-        # compute_canonical_motif raises KeyError on any base outside the IUPAC table, which would
-        # surface as a 500. Reject the value here so a typo gets the same 400 as every other filter.
-        invalid_motifs = [m for m in motif_list if not VALID_MOTIF_PATTERN.match(m)]
-        if invalid_motifs:
-            errors.append(
-                f"motif must contain only IUPAC bases ({''.join(sorted(COMPLEMENT))}); got "
-                f"'{invalid_motifs[0]}'")
-        elif motif_list:
-            params["motif"] = motif_list
+    motif_list = parse_comma_separated_values(request.args.get("motif"))
+    # compute_canonical_motif raises KeyError on any base outside the IUPAC table, which would
+    # surface as a 500. Reject the value here so a typo gets the same 400 as every other filter.
+    invalid_motifs = [m for m in motif_list if not VALID_MOTIF_PATTERN.match(m)]
+    if invalid_motifs:
+        errors.append(
+            f"motif must contain only IUPAC bases ({''.join(sorted(COMPLEMENT))}); got "
+            f"'{invalid_motifs[0]}'")
+    elif motif_list:
+        params["motif"] = motif_list
 
     if request.args.get("min_repeats_threshold"):
         try:
@@ -1144,21 +1139,14 @@ def validate_params():
     # truthy as a request string but parses to nothing, and build_api_query would then emit
     # "IN ()" or an empty "()", which DuckDB rejects as a syntax error. An empty list is the
     # same as no filter at all, so drop it.
-    phenotype_keywords = [kw.strip() for kw in request.args.get("phenotype_keyword", "").split(",") if kw.strip()]
-    if phenotype_keywords:
-        params["phenotype_keyword"] = phenotype_keywords
-
-    sample_id_keywords = [kw.strip() for kw in request.args.get("sample_id_keyword", "").split(",") if kw.strip()]
-    if sample_id_keywords:
-        params["sample_id_keyword"] = sample_id_keywords
-
-    sample_id_like_keywords = [kw.strip() for kw in request.args.get("sample_id_like", "").split(",") if kw.strip()]
-    if sample_id_like_keywords:
-        params["sample_id_like"] = sample_id_like_keywords
+    for name in ("phenotype_keyword", "sample_id_keyword", "sample_id_like", "locus_id", "gene_symbol"):
+        values = parse_comma_separated_values(request.args.get(name))
+        if values:
+            params[name] = values
 
     # search (optional, comma-separated; each term routed by shape, all OR'ed together). The
-    # separate locus_id / reference_region / gene_symbol / gene_id parameters below are for
-    # anyone calling the API directly; the UI sends this one instead.
+    # separate locus_id / gene_symbol (above) and reference_region / gene_id (below) parameters
+    # are for anyone calling the API directly; the UI sends this one instead.
     if request.args.get("search"):
         search_terms = []
         for term in split_search_terms(request.args["search"]):
@@ -1182,10 +1170,6 @@ def validate_params():
             errors.append("max_variation_cluster_size_diff must be an integer number of base pairs, "
                           f"got '{request.args['max_variation_cluster_size_diff']}'")
 
-    locus_ids = [lid.strip() for lid in request.args.get("locus_id", "").split(",") if lid.strip()]
-    if locus_ids:
-        params["locus_id"] = locus_ids
-
     if request.args.get("reference_region"):
         region, error = parse_reference_region(request.args["reference_region"])
         if error:
@@ -1203,9 +1187,6 @@ def validate_params():
         # ?gene_id=ENSG00000102081.5 match the stored spelling instead of silently returning
         # nothing. A value that is not an Ensembl gene id is passed through unchanged.
         params["gene_id"] = normalize_gene_id(request.args["gene_id"]) or request.args["gene_id"].strip()
-    gene_symbols = [gs.strip() for gs in request.args.get("gene_symbol", "").split(",") if gs.strip()]
-    if gene_symbols:
-        params["gene_symbol"] = gene_symbols
 
     if request.args.get("motif_size"):
         clause, params_list, error = parse_motif_size_filter(request.args["motif_size"])
@@ -1225,18 +1206,14 @@ def validate_params():
         if request.args.get(name, "").strip():
             params[name] = request.args[name].strip()
 
-    if request.args.get("sort_by"):
-        sort_fields = []
-        for sort_field in request.args["sort_by"].split(","):
-            sort_field = sort_field.strip()
-            if not sort_field:
-                continue
-            if sort_field not in VALID_SORTS:
-                errors.append(f"sort_by value '{sort_field}' is invalid. Valid: {sorted(VALID_SORTS)}")
-            elif sort_field not in sort_fields:
-                sort_fields.append(sort_field)
-        if sort_fields:
-            params["sort_by"] = sort_fields
+    sort_fields = []
+    for sort_field in parse_comma_separated_values(request.args.get("sort_by")):
+        if sort_field not in VALID_SORTS:
+            errors.append(f"sort_by value '{sort_field}' is invalid. Valid: {sorted(VALID_SORTS)}")
+        elif sort_field not in sort_fields:
+            sort_fields.append(sort_field)
+    if sort_fields:
+        params["sort_by"] = sort_fields
 
     if errors:
         return None, (jsonify({"error": "Invalid parameters", "detail": errors}), 400)
@@ -1824,9 +1801,10 @@ def build_locus_filter_clauses(params, filters_applied_elsewhere=()):
                 search_params.extend(region_params)
         if locus_id_values:
             # One "lower(LocusId) IN (...)" for every pasted id: a single hash probe per row,
-            # which DuckDB can also answer from the column's statistics, where a predicate per
-            # id would cost one comparison per id per row. Pasting a few hundred ids is normal
-            # here, so the difference is seconds per request.
+            # where a predicate per id would cost one comparison per id per row. lower() makes it
+            # a full scan of the LocusId column, since the column's per-row-group min/max cannot
+            # skip any rows for it. Pasting a few hundred ids is normal here, so the difference is
+            # seconds per request.
             # Both sides are lower-cased because the build stores a locus id as the input matrix
             # spelled it and the match is case-insensitive. An IN list holds no wildcards, so a
             # contig name carrying "_" needs no escaping and matches literally.
@@ -1888,7 +1866,7 @@ def build_locus_filter_clauses(params, filters_applied_elsewhere=()):
             clauses.append("0")
 
     if "motif_size_clause" in params:
-        clauses.append(params["motif_size_clause"].replace("MotifSize", "loci.MotifSize"))
+        clauses.append(params["motif_size_clause"])
         sql_params.extend(params["motif_size_params"])
 
     if "tag" in params:
@@ -3625,10 +3603,11 @@ def get_schema():
             "max_variation_cluster_size_diff": {"type": "integer", "description": "Keep loci whose TRExplorer variation cluster is at most this many base pairs larger than the repeat itself. Loci with no variation cluster annotation are kept"},
             "exclude_vc_depth_filtered": {"type": "boolean", "description": "Drop loci where no variation cluster could be computed because the region had too little coverage in the population dataset the clusters were derived from (VariationClusterFilterReason = DEPTH), shown as a gold crossed-out circle in the VC column"},
             "exclude_vc_size_filtered": {"type": "boolean", "description": "Drop loci where a variation cluster was computed and then discarded because it was wider than the maximum allowed (VariationClusterFilterReason = EXTENSION), shown as a dark red crossed-out circle in the VC column"},
-            # The UI sends 'search' instead of the parameters below, which are for direct API callers.
+            # The UI sends 'search' instead of these three, which are for direct API callers.
             "gene_id": {"type": "string"},
             "gene_symbol": {"type": "string"},
             "locus_id": {"type": "string"},
+
             "tag": {"type": "string", "description": "Filter to loci with this tag"},
             "affected_unsolved_outlier_sample_id": {"type": "string", "description": "Keep the loci where #Aff counts this sample (affected and unsolved, allele above every unaffected or solved sample's and above the population 99th percentile). Each result then carries SelectedSampleOrFamilyAlleles"},
             "affected_unsolved_outlier_family_id": {"type": "string", "description": "Keep the loci where #Aff counts at least one sample of this family. Each result then carries SelectedSampleOrFamilyAlleles"},

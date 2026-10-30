@@ -139,6 +139,19 @@ class MatchLociTests(TRExplorerAnnotationsTestCase):
                    user_locus("3-100-160-AAAAAAC")]    # 7 bp against 6 bp: never
         self.assertEqual(self.matched_locus_ids(rows, records), ["1-100-130-CAG", None, "2-100-170-AAAAAAC", None])
 
+    def test_an_n_in_either_motif_matches_any_base_as_in_motifs_match(self):
+        # Catalogs write polyalanine loci such as ARX as NGC or GCN, and TRExplorer spells a few
+        # of its own loci that way too. The overlap match follows locus_annotations.motifs_match.
+        rows = [catalog_row("X-25013649-25013697-GCC"), catalog_row("2-100-130-NGC"),
+                catalog_row("3-100-130-GCC")]
+        records = [user_locus("chrX-25013649-25013697-NGC"),   # N in the locus's motif: GCC matches
+                   user_locus("2-100-130-GCG"),                # N in TRExplorer's motif: GCG matches
+                   user_locus("3-100-130-NAA")]                # NAA stands for AAA/CAA/GAA/TAA: never GCC
+        self.assertEqual(self.matched_locus_ids(rows, records),
+                         ["X-25013649-25013697-GCC", "2-100-130-NGC", None])
+        self.assertEqual([locus_annotations.motifs_match(record["Motif"], row["Motif"])
+                          for record, row in zip(records, rows)], [True, True, False])
+
     def test_the_same_coordinates_on_another_chromosome_do_not_match(self):
         rows = [catalog_row("2-100-130-CAG"), catalog_row("X-100-130-CAG")]
         self.assertEqual(self.matched_locus_ids(rows, [user_locus("1-100-130-CAG"), user_locus("chrX-100-130-CAG")]),

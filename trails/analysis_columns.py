@@ -663,16 +663,9 @@ def add_gene_columns(records, gene_lookup):
             for column in GENE_TABLE_COLUMN_BY_SOURCE_FIELD.values():
                 record[column] = None
         else:
-            pli_v2 = gene_row.get("pLI_v2")
-            pli_v4 = gene_row.get("pLI_v4")
-            if not is_none_or_nan(pli_v4) and not is_none_or_nan(pli_v2):
-                record["pLI"] = max(float(pli_v4), float(pli_v2))
-            elif not is_none_or_nan(pli_v4):
-                record["pLI"] = float(pli_v4)
-            elif not is_none_or_nan(pli_v2):
-                record["pLI"] = float(pli_v2)
-            else:
-                record["pLI"] = None
+            present_pli_values = [float(value) for value in (gene_row.get("pLI_v2"), gene_row.get("pLI_v4"))
+                                  if not is_none_or_nan(value)]
+            record["pLI"] = max(present_pli_values) if present_pli_values else None
 
             # Populate the 10 GeneTable* output columns from the gene row so they exist in the
             # loci table (the server filters/selects them directly). read_gene_table does not
