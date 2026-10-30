@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 
+import analysis_columns
 import duckdb_compat
 import phenotype_scoring
 import result_database
@@ -162,9 +163,9 @@ class WriteLociTableTests(unittest.TestCase):
 
     def test_a_mixed_column_survives_a_marker_past_the_type_sample(self):
         # The same mixed column as above, at build scale. The loader hands DuckDB a chunk of
-        # thousands of rows at a time and DuckDB used to type each column from a sample of
-        # 1000 of them, so a marker at row 2500 was invisible: the column came out INT32 and
-        # the insert failed with "Could not convert string 'not_available' to INT32".
+        # thousands of rows at a time, and a column DuckDB typed from a sample of 1000 of them
+        # would miss the marker at row 2500: it would come out INT32 and the insert would fail
+        # with "Could not convert string 'not_available' to INT32".
         records = [{"LocusId": f"{i}-1-10-A", "Motif": i} for i in range(3000)]
         records[2500]["Motif"] = "not_available"
         result_database.write_loci_table(self.connection, records, self.output_columns)
@@ -187,6 +188,16 @@ class WriteLociTableTests(unittest.TestCase):
         self.assertEqual(
             self.connection.execute(
                 "SELECT COUNT(*) FROM loci WHERE pLI > 0.9").fetchone()[0], 0)
+
+    def test_no_records_write_the_full_schema(self):
+        # With no records to take the column list from, the full schema is written, so the
+        # table exists and is queryable instead of failing on 'CREATE TABLE loci ()'.
+        row_count = result_database.write_loci_table(
+            self.connection, [], analysis_columns.OUTPUT_COLUMNS)
+        self.assertEqual(row_count, 0)
+        self.assertEqual(duckdb_compat.table_columns(self.connection, "loci"),
+                         set(analysis_columns.OUTPUT_COLUMNS))
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM loci").fetchone()[0], 0)
 
 
 class WriteSwimPlotTests(unittest.TestCase):
@@ -355,7 +366,7 @@ class PopulationGateCohortsTests(unittest.TestCase):
         result_database.write_population_gate_cohorts(self.connection, ("HPRC256", "AoU1027", "TenK10K"))
         self.assertEqual(result_database.read_population_gate_cohorts(self.connection),
                          ("HPRC256", "AoU1027", "TenK10K"))
-        # Stored comma-joined, the analysis code's format, beside the sample count.
+        # Stored comma-joined, beside the sample count.
         self.assertEqual(
             self.connection.execute(
                 "SELECT value FROM metadata WHERE key = ?",

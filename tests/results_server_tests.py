@@ -5,10 +5,10 @@ These tests build a tiny temporary DuckDB database with a minimal ``loci`` table
 so no real TCP port is bound. They check that:
 
   * GET /api/v1/loci returns rows from the database,
-  * a request carrying the legacy ``?source=`` query parameter does NOT 500
+  * a request carrying the ``?source=`` query parameter the pages send is answered
     (the parameter is ignored, not rejected),
-  * there is no /readviz route (it returns 404), and
-  * the kept pages/endpoints (schema, swim, export, qc) behave gracefully.
+  * there is no read-visualization route (it returns 404), and
+  * the pages and endpoints (schema, swim, export, qc) behave gracefully.
 """
 
 import gzip
@@ -185,7 +185,7 @@ class ResultsServerTests(unittest.TestCase):
         self.assertNotIn("source", data["filters"])
 
     def test_schema_total_samples_is_null_without_the_metadata_table(self):
-        # This fixture predates the metadata table, so the key is reported as null rather than
+        # This fixture has no metadata table, so the key is reported as null rather than
         # omitted: the index page checks for null before appending ", N samples" to the count.
         data = self.client.get("/api/v1/schema").get_json()
         self.assertIn("total_samples", data)
@@ -213,8 +213,8 @@ class ResultsServerTests(unittest.TestCase):
             self.assertEqual(response.get_json()["total"], 2, query)
 
     def test_swim_plot_data_with_variation_cluster_exclusions_without_the_column(self):
-        # The swim-plot endpoint has no copy of these two flags (it ignores them), so it must
-        # keep returning its data rather than going empty alongside the results table.
+        # The swim plot applies these flags through the same locus filters as the results table,
+        # so without the column it keeps returning its data too.
         response = self.client.get("/api/v1/swim_plot_data?outlier_type=all"
                                    "&exclude_vc_depth_filtered=true&exclude_vc_size_filtered=true")
         self.assertEqual(response.status_code, 200)
@@ -256,9 +256,7 @@ class ResultsServerTests(unittest.TestCase):
         self.assertEqual(len(data["loci"]), 1)
         locus = data["loci"][0]
         self.assertEqual(locus["LocusId"], "chr1-100-110-AT")
-        # Every qualifying outlier sample must appear, not just the first one —
-        # this is the whole point of the nested Samples list over the old flat
-        # First/Second/ThirdAffected* columns.
+        # Every qualifying outlier sample appears in the nested Samples list, not just the first.
         sample_ids = {s["Sample ID"] for s in locus["Samples"]["AllAlleleOutliers"]}
         self.assertEqual(sample_ids, {"sampleA", "sampleB"})
 
@@ -342,8 +340,8 @@ class ResultsServerTests(unittest.TestCase):
 
     def test_concurrent_annotation_writes_all_succeed(self):
         # Flask serves with threaded=True and DuckDB raises instead of waiting when two
-        # connections write the same row at once, so the annotation writes are serialized.
-        # Without that, one of each overlapping pair came back as a 500.
+        # connections write the same row at once, so the annotation writes are serialized and
+        # overlapping writes all succeed.
         barrier = threading.Barrier(6)
         statuses = []
         lock = threading.Lock()
@@ -388,7 +386,7 @@ class ResultsServerTests(unittest.TestCase):
     def test_index_page_renders(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        # The readviz request route is gone, so its handler script must not appear.
+        # The server has no read-visualization request route, so the page calls none.
         self.assertNotIn("/readviz/request", response.get_data(as_text=True))
 
     def test_initial_require_above_population_reaches_the_index_page(self):
@@ -515,7 +513,7 @@ class ResultsServerTests(unittest.TestCase):
 
     def test_sample_id_like_does_not_match_allele_sizes(self):
         # OutlierSampleIds_AllAlleles is "6x:sampleA,5x:sampleB" at chr1 and "4x:sampleC" at chr2,
-        # so a numeric keyword used to match the allele size in front of every sample id.
+        # so a numeric keyword must not match the allele size in front of every sample id.
         self.assertEqual(self._sample_id_like_ids("6"), set())
         self.assertEqual(self._sample_id_like_ids("4"), set())
         # The "x:" delimiter is not part of a sample id either.
@@ -545,11 +543,10 @@ class ResultsServerTests(unittest.TestCase):
     # -- Merged search box: locus ids -------------------------------------------
 
     def test_pasted_locus_ids_become_one_set_lookup(self):
-        # A predicate per pasted id costs terms x rows, which made a few hundred ids take
-        # seconds. They belong in a single IN list instead, lower-cased on both sides so the
-        # match stays case-insensitive. The behavior this replaced is asserted in
-        # search_filter_tests.py (case-insensitive matching, a literal underscore); this test
-        # pins the plan so the per-term chain cannot come back unnoticed.
+        # A predicate per pasted id costs terms x rows, which for a few hundred ids takes
+        # seconds, so the ids go in a single IN list, lower-cased on both sides so the match
+        # stays case-insensitive. search_filter_tests.py checks the matching itself
+        # (case-insensitive, a literal underscore); this test pins the query's shape.
         ids = ["chr1-100-110-AT", "CHR2-200-209-AAG", "chr1_alt-1-10-CAG"]
         select_query, _, _, _, sql_params, _ = results_server.build_api_query({
             "outlier_type": "all", "page": 1, "page_size": 50,
@@ -916,11 +913,10 @@ def _build_db_with_swim_plot_phenotypes(path):
 class PhenotypeKeywordAgreesWithTheSwimPlotTests(unittest.TestCase):
     """A keyword selects a locus when ANY of its outliers carries that phenotype, in both views.
 
-    The results table used to match the loci table's First/Second/ThirdAffectedPhenotype columns,
-    which summarize at most the top three AFFECTED outliers, while the swim plot matched
-    phenotype_description on every outlier row. A locus whose only matching phenotype belonged to
-    its fourth affected outlier, or to an unaffected one, was therefore missing from the table
-    while still being drawn in the swim plot.
+    The results table matches every outlier's phenotype, as the swim plot does, rather than only
+    the loci table's First/Second/ThirdAffectedPhenotype columns, which summarize at most the top
+    three AFFECTED outliers. A locus whose only matching phenotype belongs to its fourth affected
+    outlier, or to an unaffected one, is therefore in both views.
     """
 
     @classmethod
@@ -988,48 +984,51 @@ class ComputePlotThresholdsTests(unittest.TestCase):
     """The ExpansionHunter export's PlotReadVisualization thresholds."""
 
     AFFECTED = {"sampleA": "affected", "sampleB": "unaffected", "sampleC": "affected"}
+    LONG_READ_GATE = ("HPRC256", "AoU1027")
+
+    def _thresholds(self, row_dict, long_outliers, short_outliers, affected_lookup,
+                    population_gate_cohorts=LONG_READ_GATE):
+        return results_server.compute_plot_thresholds(
+            row_dict, long_outliers, short_outliers, affected_lookup, population_gate_cohorts)
 
     def test_largest_affected_above_the_largest_unaffected(self):
-        self.assertEqual(
-            results_server.compute_plot_thresholds({}, "6x:sampleA,5x:sampleB", "", self.AFFECTED),
-            {"LongAllele": 6})
+        self.assertEqual(self._thresholds({}, "6x:sampleA,5x:sampleB", "", self.AFFECTED), {"LongAllele": 6})
 
     def test_population_percentiles_raise_the_bar(self):
         # The comparison value is the largest of the unaffected outliers and the population
         # percentiles, so an affected allele below a percentile earns no threshold.
-        self.assertIsNone(results_server.compute_plot_thresholds(
-            {"HPRC256_99thPercentile": 10}, "6x:sampleA,5x:sampleB", "", self.AFFECTED))
-        self.assertIsNone(results_server.compute_plot_thresholds(
-            {"AoU1027_99thPercentile": 10}, "6x:sampleA,5x:sampleB", "", self.AFFECTED))
+        self.assertIsNone(self._thresholds({"HPRC256_99thPercentile": 10}, "6x:sampleA,5x:sampleB", "", self.AFFECTED))
+        self.assertIsNone(self._thresholds({"AoU1027_99thPercentile": 10}, "6x:sampleA,5x:sampleB", "", self.AFFECTED))
         # A percentile below the allele size leaves the threshold in place.
         self.assertEqual(
-            results_server.compute_plot_thresholds(
-                {"HPRC256_99thPercentile": 4, "AoU1027_99thPercentile": None},
-                "6x:sampleA,5x:sampleB", "", self.AFFECTED),
+            self._thresholds({"HPRC256_99thPercentile": 4, "AoU1027_99thPercentile": None},
+                             "6x:sampleA,5x:sampleB", "", self.AFFECTED),
             {"LongAllele": 6})
+
+    def test_only_the_gate_cohorts_raise_the_bar(self):
+        # TenK10K counts only when the build gated its counts with it.
+        row_dict = {"HPRC256_99thPercentile": 4, "TenK10K_99thPercentile": 10}
+        self.assertEqual(self._thresholds(row_dict, "6x:sampleA,5x:sampleB", "", self.AFFECTED), {"LongAllele": 6})
+        self.assertIsNone(self._thresholds(row_dict, "6x:sampleA,5x:sampleB", "", self.AFFECTED,
+                                           ("HPRC256", "AoU1027", "TenK10K")))
 
     def test_the_largest_outlier_has_to_be_affected(self):
         # sampleB is the largest here, and it is unaffected, so nothing qualifies even though a
         # smaller affected outlier follows it.
-        self.assertIsNone(results_server.compute_plot_thresholds(
-            {}, "7x:sampleB,6x:sampleA", "", self.AFFECTED))
+        self.assertIsNone(self._thresholds({}, "7x:sampleB,6x:sampleA", "", self.AFFECTED))
 
     def test_short_allele_threshold(self):
-        self.assertEqual(
-            results_server.compute_plot_thresholds({}, "", "5x:sampleC", self.AFFECTED),
-            {"ShortAllele": 5})
+        self.assertEqual(self._thresholds({}, "", "5x:sampleC", self.AFFECTED), {"ShortAllele": 5})
         # Both lists can qualify at once.
-        self.assertEqual(
-            results_server.compute_plot_thresholds(
-                {}, "6x:sampleA,5x:sampleB", "5x:sampleC", self.AFFECTED),
-            {"LongAllele": 6, "ShortAllele": 5})
+        self.assertEqual(self._thresholds({}, "6x:sampleA,5x:sampleB", "5x:sampleC", self.AFFECTED),
+                         {"LongAllele": 6, "ShortAllele": 5})
 
     def test_no_outliers_and_unknown_samples(self):
-        self.assertIsNone(results_server.compute_plot_thresholds({}, "", "", self.AFFECTED))
+        self.assertIsNone(self._thresholds({}, "", "", self.AFFECTED))
         # A sample with no metadata row is not known to be affected.
-        self.assertIsNone(results_server.compute_plot_thresholds({}, "6x:sampleZ", "", {}))
+        self.assertIsNone(self._thresholds({}, "6x:sampleZ", "", {}))
         # Entries that do not parse are skipped rather than raising.
-        self.assertIsNone(results_server.compute_plot_thresholds({}, "garbage", "", self.AFFECTED))
+        self.assertIsNone(self._thresholds({}, "garbage", "", self.AFFECTED))
 
 
 def _build_db_with_unknown_category(path):
@@ -1057,7 +1056,7 @@ def _build_db_with_unknown_category(path):
 
 
 class AffectedStatusDisplayTests(unittest.TestCase):
-    """WS5: 'possibly affected' must be preserved for display, not collapsed."""
+    """Display keeps "possibly affected" rather than collapsing it to "affected"."""
 
     def test_possibly_affected_preserved(self):
         sample_lookup = {"sA": {"affected_status": "possibly affected",
@@ -1075,7 +1074,7 @@ class AffectedStatusDisplayTests(unittest.TestCase):
 
 
 class SchemaAndUnknownCategoryTests(unittest.TestCase):
-    """WS3 + WS4: schema sample_ids fall back to swim_plot; Unknown rows served."""
+    """schema sample_ids fall back to swim_plot, and Unknown-category rows are served."""
 
     @classmethod
     def setUpClass(cls):
@@ -1146,7 +1145,7 @@ class SchemaSampleCountTests(unittest.TestCase):
 
 
 class PermissiveSampleTableTests(unittest.TestCase):
-    """X1 / X12: the server's load_sample_table accepts minimal metadata."""
+    """load_sample_table accepts minimal metadata and reads it the way the build does."""
 
     def _write(self, text):
         handle = tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False)
@@ -1159,15 +1158,24 @@ class PermissiveSampleTableTests(unittest.TestCase):
         path = self._write("sample_id\nS1\nS2\n")
         sample_rows, affected_lookup, analysis_lookup = results_server.load_sample_table(path)
         self.assertEqual(set(sample_rows), {"S1", "S2"})
-        self.assertEqual(analysis_lookup["S1"], "unknown")
-        # Absent affected_status is falsy (treated as not-unaffected downstream).
+        # Absent statuses are falsy (treated as not-unaffected downstream) and display as Unknown.
         self.assertFalse(affected_lookup["S1"])
+        self.assertFalse(analysis_lookup["S1"])
+        described = results_server.describe_sample("S1", sample_rows, affected_lookup, analysis_lookup)
+        self.assertEqual((described["affected_status"], described["analysis_status"]), ("Unknown", "Unknown"))
 
     def test_case_insensitive_id_and_extra_columns_preserved(self):
         path = self._write("Sample ID\tancestry\nS1\tEUR\n")
         sample_rows, _affected, _analysis = results_server.load_sample_table(path)
         self.assertIn("S1", sample_rows)
         self.assertEqual(sample_rows["S1"]["ancestry"], "EUR")  # extra column preserved
+
+    def test_extra_columns_come_from_the_first_row_of_a_duplicated_sample(self):
+        path = self._write("sample_id\tFamilyID\tancestry\nS1\tF1\tEUR\nS1\tF9\tAFR\n")
+        sample_rows, _affected, _analysis = results_server.load_sample_table(path)
+        self.assertEqual(sample_rows["S1"]["family_id"], "F1")
+        self.assertEqual(sample_rows["S1"]["ancestry"], "EUR")
+        self.assertNotIn("FamilyID", sample_rows["S1"])
 
     def test_phenotype_strips_only_leading_na_prefix(self):
         path = self._write(
@@ -1177,9 +1185,17 @@ class PermissiveSampleTableTests(unittest.TestCase):
         # Only the leading 'NA; ' is removed (matches the build), not the inner one.
         self.assertEqual(sample_rows["S1"]["phenotype_description"], "seizures; NA; ataxia")
 
+    def test_values_the_build_rejects_are_rejected(self):
+        # The same file is forwarded to the build, which refuses an unknown status or sex.
+        with self.assertRaises(ValueError):
+            results_server.load_sample_table(self._write("sample_id\taffected_status\nS1\tmaybe\n"))
+        with self.assertRaises(ValueError):
+            results_server.load_sample_table(self._write("sample_id\tsex\nS1\tF\n"))
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_analysis_status_codes_and_blanks_are_normalized(self):
+        path = self._write("sample_id\tanalysis_status\nS1\tRNCC\nS2\ts_kgfp\nS3\tNA\n")
+        _rows, _affected, analysis_lookup = results_server.load_sample_table(path)
+        self.assertEqual(analysis_lookup, {"S1": "unsolved", "S2": "solved", "S3": "unknown"})
 
 
 class _QueryRecordingConnection:
@@ -1275,8 +1291,8 @@ class ExportPhenotypeScoreQueryCountTests(unittest.TestCase):
         return [sql for sql in recorded_queries if "per_outlier_phenotype_scores" in sql]
 
     def test_expansion_hunter_export_reads_the_score_table_once(self):
-        # The enrichment branch used to call build_sample_details without phenotype_scores, so
-        # every locus ran its own "WHERE locus_id = ?" query (plus a table listing).
+        # The scores are loaded in one query for the whole export, not with a
+        # "WHERE locus_id = ?" query per locus.
         recorded_queries = _record_queries(self)
         response = self.client.get("/api/v1/export?outlier_type=all&format=expansion_hunter")
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
@@ -1300,7 +1316,6 @@ class ExportPhenotypeScoreQueryCountTests(unittest.TestCase):
             {"sampleC": 0.5})
 
     def test_json_export_reads_the_score_table_once(self):
-        # The path the expansion_hunter export was brought back into line with.
         recorded_queries = _record_queries(self)
         response = self.client.get("/api/v1/export?outlier_type=all&format=json")
         # The body is gzipped, so it is not decodable as text for an assertion message.
@@ -1310,16 +1325,36 @@ class ExportPhenotypeScoreQueryCountTests(unittest.TestCase):
         self.assertEqual(len(self._score_queries(recorded_queries)), 1)
 
     def test_only_the_exported_loci_scores_are_loaded(self):
-        # A score table can hold millions of rows, so loading every locus's scores made even a
-        # one-locus export slow.
+        # A score table can hold millions of rows, so only the exported loci's scores are loaded.
         conn = duckdb_compat.connect(self.db_path, read_only=True)
         try:
-            scores = results_server.fetch_phenotype_scores_of_exported_loci(
+            scores = results_server.fetch_per_outlier_phenotype_scores_of_loci(
                 conn, "SELECT * FROM loci WHERE LocusId = ? ORDER BY LocusId", ["chr2-200-209-AAG"])
         finally:
             conn.close()
         self.assertEqual(set(scores), {"chr2-200-209-AAG"})
-        self.assertEqual(scores["chr2-200-209-AAG"]["per_outlier"]["AllAlleles"][0]["sample_id"], "sampleC")
+        self.assertEqual(scores["chr2-200-209-AAG"]["AllAlleles"][0]["sample_id"], "sampleC")
+
+    def test_the_exports_do_not_read_the_aggregate_score_table(self):
+        # The exports list per-outlier scores only, so the per-locus aggregates are not loaded.
+        for export_format in ("json", "expansion_hunter"):
+            recorded_queries = _record_queries(self)
+            response = self.client.get(f"/api/v1/export?outlier_type=all&format={export_format}")
+            self.assertEqual(response.status_code, 200)
+            response.get_data()
+            self.assertFalse([sql for sql in recorded_queries if "per_locus_phenotype_scores" in sql],
+                             export_format)
+
+    def test_the_locus_detail_page_carries_both_kinds_of_score(self):
+        scores = self.client.get("/api/v1/loci/chr1-100-110-AT").get_json()["phenotype_scores"]
+        self.assertEqual([s["sample_id"] for s in scores["per_outlier"]["AllAlleles"]], ["sampleA"])
+        self.assertEqual(scores["per_outlier"]["AllAlleles"][0]["gene_phenotype_similarity"], 0.75)
+        self.assertEqual(scores["per_locus"]["AllAlleles"]["max_gene_phenotype_similarity"], 0.75)
+        self.assertEqual(scores["per_locus"]["AllAlleles"]["qualifying_sample_ids"], "sampleA")
+        # A locus with per-outlier scores and no aggregate row still gets both keys
+        scores = self.client.get("/api/v1/loci/chr2-200-209-AAG").get_json()["phenotype_scores"]
+        self.assertEqual(scores["per_locus"], {})
+        self.assertIsNone(scores["per_outlier"]["AllAlleles"][0]["pairwise_similarity_to_next"])
 
     def test_a_filtered_json_export_carries_its_loci_scores(self):
         response = self.client.get("/api/v1/export?outlier_type=all&format=json&gene_symbol=GENE1")
@@ -1533,7 +1568,7 @@ def _load_results_server_without_locus_annotations():
 
 
 class DegradedModeFallbackTests(unittest.TestCase):
-    """The ImportError stubs must classify affected status the way locus_annotations does."""
+    """The ImportError stubs must treat blank statuses the way locus_annotations does."""
 
     @classmethod
     def setUpClass(cls):
@@ -1541,19 +1576,293 @@ class DegradedModeFallbackTests(unittest.TestCase):
 
     def test_the_fallback_really_is_a_stub(self):
         # If this fails the import did not raise and the assertions below would be testing the
-        # real locus_annotations functions rather than the fallbacks.
+        # real locus_annotations values rather than the fallbacks.
         self.assertEqual(self.degraded.load_known_disease_loci("ignored"), ({}, {}, {}))
 
-    def test_every_blank_spelling_normalizes_to_none(self):
-        # Mapping only "nan" left an "NA" cell classified as the status "na", so the locus-detail
-        # page showed "Na" instead of "Unknown" whenever the fallback was in use.
-        for value in ("", "nan", "none", "na", "n/a", "null", "NA", " N/A ", "Null"):
-            self.assertIsNone(self.degraded.normalize_affected_status_for_logic(value), value)
+    def test_the_fallback_blank_spellings_agree_with_locus_annotations(self):
+        self.assertEqual(self.degraded.BLANK_STATUS_VALUES, locus_annotations.BLANK_STATUS_VALUES)
 
-    def test_the_fallback_agrees_with_locus_annotations(self):
-        for value in ("", "nan", "none", "na", "n/a", "null", "NA", " N/A ", "Null", None,
-                      float("nan"), "Affected", "Possibly Affected", " UNAFFECTED "):
-            self.assertEqual(
-                self.degraded.normalize_affected_status_for_logic(value),
-                locus_annotations.normalize_affected_status_for_logic(value),
-                repr(value))
+    def test_every_blank_status_displays_as_unknown(self):
+        # An "NA" cell is no status, so the locus-detail page shows "Unknown" rather than "Na".
+        for value in ("", "nan", "none", "na", "n/a", "null", "NA", " N/A ", "Null"):
+            described = self.degraded.describe_sample("S1", {"S1": {"affected_status": value}}, {}, {})
+            self.assertEqual(described["affected_status"], "Unknown", repr(value))
+
+    def test_a_locus_matches_no_known_disease_locus(self):
+        lookups = {"locus": {}, "disease_trees": {}, "strchive_trees": {}}
+        row = {"LocusId": "chr1-100-110-AT", "Chrom": "chr1", "Start0Based": 100, "End1Based": 110, "Motif": "AT"}
+        self.assertIsNone(self.degraded.compute_known_disease_info(row, lookups))
+        self.assertIsNone(self.degraded.known_disease_pathogenic_min("chr1", 100, 110, "AT", {}, {}))
+
+
+class MinimalDatabaseTestCase(unittest.TestCase):
+    """Points the server at the _build_minimal_db fixture, and restores app.config afterwards."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
+        _build_minimal_db(cls.db_path)
+        cls._saved_config = dict(results_server.app.config)
+        results_server.configure_app(cls.db_path, annotations_db=os.path.join(cls.tmpdir, "annotations.duckdb"))
+        results_server.app.config["TESTING"] = True
+        cls.client = results_server.app.test_client()
+
+    @classmethod
+    def tearDownClass(cls):
+        results_server.app.config.clear()
+        results_server.app.config.update(cls._saved_config)
+
+
+class RequestCheckTests(MinimalDatabaseTestCase):
+    """No response carries CORS headers, and the Host check stops DNS rebinding while bound to
+    loopback without getting in the way of a server bound to another address."""
+
+    def _set_bind_host(self, bind_host):
+        self.addCleanup(results_server.app.config.pop, "BIND_HOST", None)
+        results_server.app.config["BIND_HOST"] = bind_host
+
+    def test_no_response_carries_cors_headers(self):
+        response = self.client.get("/api/v1/loci?outlier_type=all", headers={"Origin": "https://other.example"})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("Access-Control-Allow-Origin", response.headers)
+        preflight = self.client.options("/api/v1/loci", headers={
+            "Origin": "https://other.example", "Access-Control-Request-Method": "GET"})
+        self.assertNotIn("Access-Control-Allow-Origin", preflight.headers)
+
+    def test_loopback_host_names_are_answered(self):
+        for bind_host in ("127.0.0.1", "localhost", "::1"):
+            self._set_bind_host(bind_host)
+            for host in ("localhost", "localhost:5050", "LOCALHOST:5050", "127.0.0.1:5050", "[::1]:5050"):
+                for path in ("/", "/api/v1/schema"):
+                    response = self.client.get(path, base_url=f"http://{host}")
+                    self.assertEqual(response.status_code, 200, (bind_host, host, path))
+
+    def test_another_host_name_is_refused_while_bound_to_loopback(self):
+        # A page whose own domain was pointed at 127.0.0.1 sends that domain as the Host, and as
+        # the Origin of a write, so the two match and only the Host check refuses it. Without a
+        # recorded bind address the server's default, 127.0.0.1, applies.
+        for bind_host in (None, "127.0.0.1", "localhost", "::1"):
+            if bind_host is None:
+                results_server.app.config.pop("BIND_HOST", None)
+            else:
+                self._set_bind_host(bind_host)
+            response = self.client.get("/api/v1/schema", base_url="http://rebound.example:5050")
+            self.assertEqual(response.status_code, 403, bind_host)
+            self.assertNotIn("sample_ids", response.get_json())
+            write = self.client.put("/api/v1/annotations/chr2-200-209-AAG/note", json={"note_text": "rebound"},
+                                    base_url="http://rebound.example:5050",
+                                    headers={"Origin": "http://rebound.example:5050"})
+            self.assertEqual(write.status_code, 403, bind_host)
+            self.assertNotIn("chr2-200-209-AAG", results_server.app.config["ANNOTATIONS"]["notes"])
+
+    def test_any_host_name_is_answered_when_bound_to_another_address(self):
+        # Other machines reach the server under whatever name or address they know this one by.
+        for bind_host in ("0.0.0.0", "192.168.1.5"):
+            self._set_bind_host(bind_host)
+            for host in ("myhost.example:5050", "192.168.1.5:5050", "localhost:5050"):
+                response = self.client.get("/api/v1/schema", base_url=f"http://{host}")
+                self.assertEqual(response.status_code, 200, (bind_host, host))
+            # Writes from another machine are still refused, by restrict_writes
+            write = self.client.put("/api/v1/annotations/chr2-200-209-AAG/note", json={"note_text": "remote"},
+                                    base_url="http://myhost.example:5050",
+                                    environ_overrides={"REMOTE_ADDR": "192.168.1.9"})
+            self.assertEqual(write.status_code, 403, bind_host)
+            self.assertIn("non-loopback address", write.get_json()["detail"])
+
+    def test_filters_applied_is_the_same_in_the_list_and_the_json_export(self):
+        query = ("outlier_type=all&min_pli=0.5&motif_size=2&search=GENE1&reference_region=chr1:100-110"
+                 "&sort_by=size&source=TRails")
+        expected = {"min_pli": 0.5, "motif_size": "2", "search": "GENE1", "reference_region": "chr1:100-110"}
+        self.assertEqual(self.client.get(f"/api/v1/loci?{query}").get_json()["filters_applied"], expected)
+        export = self.client.get(f"/api/v1/export?{query}&format=json")
+        self.assertEqual(json.loads(gzip.decompress(export.get_data()))["metadata"]["filters_applied"], expected)
+
+
+class SwimPlotFilterTests(MinimalDatabaseTestCase):
+    """The swim plot reads its parameters the way /api/v1/loci does.
+
+    Its locus filters keep the rows of exactly the loci the results table returns, while the
+    sample-level filters and SWIM_PLOT_ALLELE_LEVEL_FILTERS pick rows: each row is one allele.
+    """
+
+    def _swim_rows(self, query):
+        response = self.client.get(f"/api/v1/swim_plot_data?outlier_type=all&{query}")
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return {(entry["LocusId"], entry["sample_id"]) for entry in response.get_json()["data"]}
+
+    def _loci(self, query):
+        response = self.client.get(f"/api/v1/loci?outlier_type=all&{query}")
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return {r["LocusId"] for r in response.get_json()["results"]}
+
+    def test_locus_filters_keep_the_loci_the_results_table_returns(self):
+        self.client.post("/api/v1/annotations/chr2-200-209-AAG/tags", json={"tag": "swim"})
+        self.addCleanup(self.client.delete, "/api/v1/annotations/chr2-200-209-AAG/tags/swim")
+        for query in ("gene_regions=cds", "exclude_gene_regions=cds", "motif=TA", "motif=GAA", "motif_size=3",
+                      "motif_size=-2", "mendelian_genes_only=true", "known_motifs_only=1", "min_pli=0.5",
+                      "gene_symbol=GENE2", "gene_id=GENE1", "locus_id=chr1-100-110-AT", "chrom=chr2",
+                      "reference_region=chr1:100-110", "search=GENE2", "search=chr1:105", "search=nothing",
+                      "search=CHR2-200-209-aag", "tag=swim", "tag=no_such_tag", "known_loci_only=true",
+                      "max_variation_cluster_size_diff=5", "min_repeats_threshold=5"):
+            self.assertEqual({locus_id for locus_id, _ in self._swim_rows(query)}, self._loci(query), query)
+
+    def test_mendelian_only_is_another_name_for_mendelian_genes_only(self):
+        self.assertEqual(self._swim_rows("mendelian_only=1"), {("chr2-200-209-AAG", "sampleC")})
+
+    def test_invalid_values_are_rejected_as_by_the_results_table(self):
+        for query in ("gene_regions=foo", "exclude_gene_regions=foo", "motif=AXT", "motif_size=a-b",
+                      "min_pli=high", "min_sigma_percentile=2", "max_variation_cluster_size_diff=abc",
+                      "min_expansion=-1", "require_above_population=some", "population_metric=mean",
+                      "search=chr1:200-100"):
+            for path in ("/api/v1/swim_plot_data", "/api/v1/loci"):
+                response = self.client.get(f"{path}?outlier_type=all&{query}")
+                self.assertEqual(response.status_code, 400, (path, query))
+        self.assertEqual(self.client.get("/api/v1/swim_plot_data").status_code, 400)
+
+    def test_sample_level_filters_keep_the_rows_of_the_matching_samples(self):
+        # The results table keeps the locus; the swim plot draws only that sample's allele there.
+        self.assertEqual(self._loci("sample_id_keyword=sampleB"), {"chr1-100-110-AT"})
+        self.assertEqual(self._swim_rows("sample_id_keyword=SAMPLEB"), {("chr1-100-110-AT", "sampleB")})
+        self.assertEqual(self._swim_rows("sample_id_like=ple_"), set())
+        self.assertEqual(self._swim_rows("sample_id_like=pleC"), {("chr2-200-209-AAG", "sampleC")})
+        self.assertEqual(self._swim_rows("phenotype_keyword=SEIZ"), {("chr1-100-110-AT", "sampleA")})
+
+    def test_the_pathogenic_threshold_compares_each_allele(self):
+        # chr1's largest affected allele (6) reaches the minimum, so the results table keeps the
+        # locus, but sampleB's 5 does not, so the swim plot drops that allele.
+        saved = results_server.app.config["KNOWN_DISEASE_LOCUS_THRESHOLDS"]
+        self.addCleanup(results_server.app.config.__setitem__, "KNOWN_DISEASE_LOCUS_THRESHOLDS", saved)
+        results_server.app.config["KNOWN_DISEASE_LOCUS_THRESHOLDS"] = {"chr1-100-110-AT": 6}
+        self.assertEqual(self._loci("apply_pathogenic_threshold=true"), {"chr1-100-110-AT"})
+        self.assertEqual(self._swim_rows("apply_pathogenic_threshold=1"), {("chr1-100-110-AT", "sampleA")})
+
+    def test_require_affected_above_unaffected(self):
+        # sampleB is unaffected, and sampleC has no unaffected allele to be compared with.
+        for value in ("1", "true"):
+            self.assertEqual(self._swim_rows(f"require_affected_above_unaffected={value}"),
+                             {("chr1-100-110-AT", "sampleA"), ("chr2-200-209-AAG", "sampleC")})
+
+    def test_the_matching_loci_are_looked_up_once_per_request(self):
+        recorded_queries = _record_queries(self)
+        self._swim_rows("gene_regions=cds&search=GENE1")
+        self.assertEqual(len([sql for sql in recorded_queries if "FROM loci" in sql]), 1)
+        recorded_queries.clear()
+        self._swim_rows("")
+        self.assertFalse([sql for sql in recorded_queries if "FROM loci" in sql])
+
+
+def _build_db_with_population_percentiles(path, population_gate_cohorts):
+    """One locus whose only outlier, an affected 20, is above HPRC256 and AoU1027 but not TenK10K.
+
+    Args:
+        path: Where to write the database.
+        population_gate_cohorts: The cohorts to record as the build's population gate, or None to
+            record none, which reads back as the default long-read cohorts.
+    """
+    conn = duckdb_compat.connect(path)
+    conn.execute("""CREATE TABLE loci (
+        LocusId TEXT, Chrom TEXT, Start0Based INTEGER, End1Based INTEGER, Motif TEXT, MotifSize INTEGER,
+        OutlierSampleIds_AllAlleles TEXT, OutlierSampleIds_ShortAlleles TEXT,
+        HPRC256_99thPercentile DOUBLE, AoU1027_99thPercentile DOUBLE, TenK10K_99thPercentile DOUBLE)""")
+    conn.execute("INSERT INTO loci VALUES ('chr1-100-110-AT', 'chr1', 100, 110, 'AT', 2, '20x:sampleA', '', "
+                 "10, 12, 30)")
+    if population_gate_cohorts:
+        result_database.write_population_gate_cohorts(conn, population_gate_cohorts)
+    conn.commit()
+    conn.close()
+
+
+class ExportPopulationGateTests(unittest.TestCase):
+    """The exports' outlier lists and read-visualization thresholds use the build's population gate."""
+
+    def setUp(self):
+        self._saved_config = dict(results_server.app.config)
+        self.addCleanup(results_server.app.config.update, self._saved_config)
+        self.addCleanup(results_server.app.config.clear)
+        self.tmpdir = tempfile.mkdtemp()
+        self.sample_table = os.path.join(self.tmpdir, "samples.tsv")
+        with open(self.sample_table, "w") as output_file:
+            output_file.write("sample_id\taffected_status\tanalysis_status\nsampleA\taffected\tunsolved\n")
+
+    def _exports(self, population_gate_cohorts):
+        """Return the JSON export's locus and the ExpansionHunter export's entry under a gate."""
+        db_path = os.path.join(self.tmpdir, f"results_{len(population_gate_cohorts or ())}.duckdb")
+        _build_db_with_population_percentiles(db_path, population_gate_cohorts)
+        results_server.configure_app(db_path, sample_table=self.sample_table,
+                                     annotations_db=os.path.join(self.tmpdir, "annotations.duckdb"))
+        client = results_server.app.test_client()
+        json_export = client.get("/api/v1/export?outlier_type=all&format=json")
+        self.assertEqual(json_export.status_code, 200)
+        expansion_hunter_export = client.get("/api/v1/export?outlier_type=all&format=expansion_hunter")
+        self.assertEqual(expansion_hunter_export.status_code, 200)
+        return (json.loads(gzip.decompress(json_export.get_data()))["loci"][0],
+                json.loads(expansion_hunter_export.get_data())[0])
+
+    def test_the_default_long_read_gate(self):
+        locus, catalog_entry = self._exports(None)
+        self.assertEqual([s["Sample ID"] for s in locus["Samples"]["AllAlleleOutliers"]], ["sampleA"])
+        self.assertEqual(catalog_entry["PlotReadVisualization"], [{"If": "LongAllele", "Is": ">=", "Threshold": 20}])
+
+    def test_a_gate_that_includes_tenk10k(self):
+        # The build left the allele out of #Aff and the phenotype scores, so the exports leave it
+        # out too.
+        locus, catalog_entry = self._exports(("HPRC256", "AoU1027", "TenK10K"))
+        self.assertNotIn("Samples", locus)
+        self.assertNotIn("PlotReadVisualization", catalog_entry)
+
+
+class KnownDiseaseMatchTests(unittest.TestCase):
+    """The locus-detail page and the pathogenic-threshold filter take the same match and minimum."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp()
+        catalog_path = os.path.join(cls.tmpdir, "catalog.json")
+        with open(catalog_path, "w") as output_file:
+            json.dump([
+                {"LocusId": "ZERO_MIN", "MainReferenceRegion": "chr1:101-110", "RepeatUnit": "AT",
+                 "Diseases": [{"Name": "D1", "PathogenicMin": 0}, {"Name": "D2", "PathogenicMin": 40}]},
+                {"LocusId": "NO_MIN", "MainReferenceRegion": "chr3:301-310", "RepeatUnit": "CAG",
+                 "Diseases": [{"Name": "D3"}]},
+            ], output_file)
+        strchive_path = os.path.join(cls.tmpdir, "STRchive-loci.json")
+        with open(strchive_path, "w") as output_file:
+            json.dump(STRCHIVE_TEST_LOCI, output_file)
+        cls.disease_trees, cls.strchive_trees, cls.locus_lookup = locus_annotations.load_known_disease_loci(
+            catalog_path, strchive_filepath=strchive_path, build_locus_lookup=True)
+
+    def _detail(self, chrom, start, end, motif):
+        lookups = {"locus": {}, "disease_trees": self.disease_trees, "strchive_trees": self.strchive_trees}
+        return results_server.compute_known_disease_info(
+            {"LocusId": "query", "Chrom": chrom, "Start0Based": start, "End1Based": end, "Motif": motif}, lookups)
+
+    def _pathogenic_min(self, chrom, start, end, motif):
+        return results_server.known_disease_pathogenic_min(chrom, start, end, motif, self.disease_trees,
+                                                           self.strchive_trees)
+
+    def test_a_pathogenic_minimum_of_zero_is_kept_by_both(self):
+        self.assertEqual(self._detail("chr1", 100, 110, "TA")["pathogenic_min"], 0)
+        self.assertEqual(self._pathogenic_min("chr1", 100, 110, "TA"), 0)
+
+    def test_a_catalog_match_without_a_minimum_hides_the_strchive_fallback_from_both(self):
+        # STRchive's TEST_REFERENCE has a minimum of 50 at the same locus, but the catalog matched.
+        detail = self._detail("chr3", 300, 310, "CAG")
+        self.assertEqual((detail["locus_id"], detail["source"], detail["pathogenic_min"]),
+                         ("NO_MIN", "variant_catalog", None))
+        self.assertIsNone(self._pathogenic_min("chr3", 300, 310, "CAG"))
+
+    def test_a_strchive_only_locus_matches_through_its_pathogenic_motif(self):
+        detail = self._detail("chr9", 100, 110, "AAGGG")
+        self.assertEqual((detail["locus_id"], detail["source"], detail["pathogenic_min"]),
+                         ("TEST_PATHOGENIC", "STRchive", 60))
+        self.assertEqual(self._pathogenic_min("chr9", 100, 110, "AAGGG"), 60)
+
+    def test_too_little_overlap_matches_nothing(self):
+        # [100, 110) against [100, 125) has a Jaccard index of 0.4
+        self.assertIsNone(self._detail("chr1", 100, 125, "AT"))
+        self.assertIsNone(self._pathogenic_min("chr1", 100, 125, "AT"))
+
+
+if __name__ == "__main__":
+    unittest.main()

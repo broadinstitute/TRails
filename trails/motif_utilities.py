@@ -1,17 +1,9 @@
-"""Standalone tandem-repeat motif primitives for TRails.
+"""Tandem-repeat motif helpers for TRails.
 
-This module reimplements the small set of motif-handling helpers that the
-original pipeline borrowed from the ``str_analysis`` package, so that TRails has
-no external dependency on ``str_analysis`` and inserts nothing onto ``sys.path``.
-
-The behavior here is a faithful port of:
-  * ``str_analysis/utils/canonical_repeat_unit.py`` (the doubling-rotation +
-    reverse-complement-minimum canonicalization algorithm), and
-  * ``str_analysis/utils/misc_utils.py`` (``reverse_complement`` and the full
-    IUPAC ``COMPLEMENT`` table).
-
-Plus a small TRails-specific helper (``generate_all_canonical_motifs``) used
-elsewhere in the build pipeline.
+  * ``reverse_complement`` over the full IUPAC ``COMPLEMENT`` table,
+  * ``compute_canonical_motif``: the alphabetically first rotation of the motif or
+    (optionally) of its reverse complement, and
+  * ``generate_all_canonical_motifs``: the set of all canonical motifs up to a length.
 
 All functions are pure: they take their inputs as arguments and return values
 without mutating shared state.
@@ -20,9 +12,8 @@ without mutating shared state.
 import itertools
 
 
-# Full IUPAC complement table (matches str_analysis.utils.misc_utils.COMPLEMENT
-# exactly, including the ambiguity codes). Used by reverse_complement, which is
-# in turn used by compute_canonical_motif.
+# Full IUPAC complement table, including the ambiguity codes. Used by
+# reverse_complement, which is in turn used by compute_canonical_motif.
 COMPLEMENT = {
     "A": "T",
     "C": "G",
@@ -46,8 +37,7 @@ def reverse_complement(dna):
     """Return the reverse complement of a DNA string.
 
     Uses the full IUPAC complement table, so ambiguity codes (e.g. ``Y``, ``R``)
-    are complemented just as in the original ``str_analysis`` implementation. A
-    base not present in the table raises ``KeyError`` (matching the original).
+    are complemented too. A base not present in the table raises ``KeyError``.
 
     Args:
         dna: A string of DNA bases such as ``"GAA"``.

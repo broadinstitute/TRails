@@ -1,91 +1,43 @@
 """Trio Mendelian-violation QC computed directly from the in-memory genotype matrix.
 
-This module ports the Mendelian-violation analysis of the original
-``compute_mendelian_violations.py``. The only change versus the original is the
-*data source*: rather than loading one locus-per-sample (LPS) genotype file per
-trio member from disk/GCS, TRails reads the genotypes straight out of the
-in-memory repeat-copy-numbers matrix (the ``locus_rows`` produced by
-``input_tables.read_repeat_copy_numbers``) plus the trio relationships from the
-sample-metadata table.
+The genotypes come straight out of the in-memory repeat-copy-numbers matrix (the
+``locus_rows`` produced by ``input_tables.read_repeat_copy_numbers``) and the trio
+relationships from the sample-metadata lookup. Each complete trio is compared at
+every locus whose motif is made of A, C, G and T only:
 
-Everything else -- ``allele_matches_any``, ``get_chrom_category``,
-``get_motif_size_category``, ``MOTIF_SIZE_CATEGORIES``, the per-chromosome
-dispatch (chrY uses child+father, chrM and a hemizygous chrX child use
-child+mother, autosome/diploid chrX uses all three), the "require at least 2
-distinct allele sizes" filter, and the two output-table schemas -- is a faithful,
-verbatim port of the original behavior.
+  * Each matrix cell is parsed by ``allele_histograms.parse_genotype``. A no-call
+    (empty, ``.``, ``./.``) or malformed cell of a member that the comparison needs
+    skips the locus for that trio.
+  * The per-chromosome dispatch (``_process_trio``): chrY compares the child with the
+    father, chrM and a hemizygous (single-allele) chrX child compare the child with
+    the mother, and the autosomes and a diploid chrX child compare the child with
+    both parents (``check_violation``). A single-allele child call on an autosome may
+    have come from either parent; only on chrX must it come from the mother.
+  * A locus counts only when the compared members carry at least 2 distinct allele
+    sizes. The filter is skipped for a haploid comparison (one allele on each side,
+    as on chrY or chrM), where it would mean "the two disagree", would leave only
+    discordant loci in the denominator, and would make ``chrY_violations /
+    chrY_total`` something other than a violation rate.
 
-Three TRails-specific deviations. Two handle the fact that a matrix cell can be a
-no-call (the per-sample LPS files never were):
-  * ``parse_genotype`` returns ``None`` for empty / ``.`` / ``./.`` cells (and
-    for malformed cells), and such loci are skipped for the affected member.
-  * The matrix is the single source of genotypes, so the "filter mother to loci
-    present in the child" step of the original is automatic (we iterate the
-    child's genotypes per locus).
-
-The third is in ``check_violation``: the original required a single-allele child
-call to come from the mother, which is right for a hemizygous son on chrX but
-wrong on an autosome, where a one-allele call may have come from either parent.
-It therefore takes a ``chrom_category`` argument and applies the mother-only rule
-only for chrX. The dispatch follows: a hemizygous chrX child is compared against
-the mother alone, so the locus is evaluated even when the father has no call.
-
-A fourth: the "at least 2 distinct allele sizes" filter is not applied to a
-haploid chrY (or chrM) comparison, where it would mean "the two disagree" and
-would leave only discordant loci in the denominator, making
-``chrY_violations / chrY_total`` something other than a violation rate.
+Violations and totals are tallied by chromosome, by motif-size category and by
+canonical 1-6 bp motif into the two output tables (``per_sample_columns`` and
+``per_motif_columns``).
 
 All functions are pure -- they take their inputs as arguments and return values
 without mutating shared module state.
 """
 
-from collections import Counter
-
+from allele_histograms import parse_genotype
+from locus_annotations import BLANK_STATUS_VALUES
 from motif_utilities import compute_canonical_motif, generate_all_canonical_motifs
 
 
-# Motif size categories, in display/column order (verbatim from the source).
+# Motif size categories, in display/column order.
 MOTIF_SIZE_CATEGORIES = ["1bp", "2bp", "3bp", "4bp", "5bp", "6bp", "7-24bp", "25+bp"]
 
 # All canonical motifs of size 1-6bp, sorted for deterministic column ordering
-# in the per-motif output table. (The source generated this as a sorted list;
-# generate_all_canonical_motifs here returns a set, so we sort it once.)
+# in the per-motif output table (generate_all_canonical_motifs returns a set).
 ALL_CANONICAL_MOTIFS = sorted(generate_all_canonical_motifs(6))
-
-
-def parse_genotype(cell):
-    """Parse a matrix genotype cell into a tuple of integer allele sizes.
-
-    Reproduces the LPS parse rule from the original ``load_lps_file``: the cell
-    is split on ``,``; a 2-element split is a diploid call (a 2-tuple), a
-    1-element split is a hemizygous call (a 1-tuple), and anything else is
-    skipped. As a TRails addition, no-call cells (empty, ``.``, ``./.``) and
-    cells that fail to parse as integers are skipped as well (the matrix can
-    contain no-calls; the per-sample LPS files could not).
-
-    Args:
-        cell: The raw genotype string for one sample at one locus, e.g.
-            ``"12,40"`` (diploid), ``"21"`` (hemizygous), or ``""`` / ``"."`` /
-            ``"./."`` (no-call).
-
-    Returns:
-        A tuple of ints -- ``(short, long)`` for a diploid call or
-        ``(allele,)`` for a hemizygous call -- or ``None`` for a no-call or
-        malformed cell.
-    """
-    if cell is None:
-        return None
-    text = str(cell).strip()
-    if text in ("", ".", "./."):
-        return None
-
-    allele_parts = text.split(",")
-    if len(allele_parts) not in (1, 2):
-        return None
-    try:
-        return tuple(int(part) for part in allele_parts)
-    except ValueError:
-        return None
 
 
 def allele_matches_any(allele, genotype, threshold):
@@ -119,7 +71,7 @@ def check_violation(child_genotype, mother_genotype, father_genotype, threshold,
         mother.
       * Hemizygous father on chrX: a daughter inherits his single allele.
     (chrY and chrM are handled by the per-chromosome dispatch in
-    ``compute_mendelian_violations`` and never reach this function.)
+    ``_process_trio`` and never reach this function.)
 
     A single-allele child call on an autosome means something different: the
     caller only reported one allele, and it could have come from either parent,
@@ -148,58 +100,18 @@ def check_violation(child_genotype, mother_genotype, father_genotype, threshold,
         return not (allele_matches_any(child_genotype[0], mother_genotype, threshold)
                     or allele_matches_any(child_genotype[0], father_genotype, threshold))
 
-    # Case 2: the child is diploid.
+    # Case 2: the child is diploid. One allele must come from the mother and the
+    # other from the father, in either assignment. allele_matches_any compares
+    # against every allele a parent has, so the same rule covers a hemizygous
+    # parent (e.g. the father on chrX for a daughter) and a diploid one.
     first_child_allele, second_child_allele = child_genotype
-
-    # Mother hemizygous (unusual, but handle it): the child must get the
-    # mother's single allele, the other from the father.
-    if len(mother_genotype) == 1:
-        mother_allele = mother_genotype[0]
-        return not (
-            (abs(first_child_allele - mother_allele) < threshold
-             and allele_matches_any(second_child_allele, father_genotype, threshold))
-            or
-            (abs(second_child_allele - mother_allele) < threshold
-             and allele_matches_any(first_child_allele, father_genotype, threshold))
-        )
-
-    # Father hemizygous (e.g. chrX in a daughter): the child must get the
-    # father's single allele, the other from the mother.
-    if len(father_genotype) == 1:
-        father_allele = father_genotype[0]
-        return not (
-            (abs(first_child_allele - father_allele) < threshold
-             and allele_matches_any(second_child_allele, mother_genotype, threshold))
-            or
-            (abs(second_child_allele - father_allele) < threshold
-             and allele_matches_any(first_child_allele, mother_genotype, threshold))
-        )
-
-    # Case 3: all diploid (autosomal / female chrX).
-    first_mother_allele, second_mother_allele = mother_genotype
-    first_father_allele, second_father_allele = father_genotype
-
-    # Assignment 1: first child allele from mother, second from father.
-    if (
-        (abs(first_child_allele - first_mother_allele) < threshold
-         or abs(first_child_allele - second_mother_allele) < threshold)
-        and
-        (abs(second_child_allele - first_father_allele) < threshold
-         or abs(second_child_allele - second_father_allele) < threshold)
-    ):
-        return False
-
-    # Assignment 2: first child allele from father, second from mother.
-    if (
-        (abs(first_child_allele - first_father_allele) < threshold
-         or abs(first_child_allele - second_father_allele) < threshold)
-        and
-        (abs(second_child_allele - first_mother_allele) < threshold
-         or abs(second_child_allele - second_mother_allele) < threshold)
-    ):
-        return False
-
-    return True
+    return not (
+        (allele_matches_any(first_child_allele, mother_genotype, threshold)
+         and allele_matches_any(second_child_allele, father_genotype, threshold))
+        or
+        (allele_matches_any(first_child_allele, father_genotype, threshold)
+         and allele_matches_any(second_child_allele, mother_genotype, threshold))
+    )
 
 
 def get_chrom_category(trid):
@@ -207,7 +119,7 @@ def get_chrom_category(trid):
 
     The chromosome is taken from the first ``_``-delimited field of the trid, or
     the first ``-``-delimited field if there is no underscore, or the whole
-    string otherwise (matching the original).
+    string otherwise.
 
     Args:
         trid: Locus id, expected to start with a chromosome name (e.g.
@@ -249,64 +161,44 @@ def get_motif_size_category(motif):
     return "25+bp"
 
 
-def find_trios(sample_lookup_or_df):
-    """Identify complete trios from the sample set.
+def find_trios(sample_lookup):
+    """Identify complete trios from the sample metadata.
 
     A complete trio is a child sample for which both the maternal_id and the
     paternal_id are non-blank and also present as sample_ids in the sample set.
-
-    Accepts either the ``sample_lookup`` dict (sample_id -> metadata dict) or the
-    cleaned ``sample_df`` DataFrame produced by
-    ``input_tables.read_sample_metadata``; both expose ``maternal_id`` and
-    ``paternal_id`` fields when present.
+    ``sample_lookup`` holds one entry per sample_id, so a child appears in at most
+    one trio.
 
     Args:
-        sample_lookup_or_df: Either a dict mapping sample_id to a metadata dict,
-            or a pandas DataFrame with ``sample_id`` plus optional
-            ``maternal_id`` / ``paternal_id`` columns.
+        sample_lookup: Mapping of sample_id -> metadata dict (as returned by
+            ``input_tables.read_sample_metadata``), with optional ``maternal_id`` /
+            ``paternal_id`` fields.
 
     Returns:
         A list of ``(child_id, mother_id, father_id)`` tuples, one per complete
-        trio, in the order the children appear in the input.
-
-    Raises:
-        ValueError: If any child_id would appear in more than one trio.
+        trio, in the order the children appear in ``sample_lookup``.
     """
-    rows = _iter_sample_rows(sample_lookup_or_df)
-
-    sample_ids = set(row["sample_id"] for row in rows)
     trios = []
-    for row in rows:
+    for sample_id, row in sample_lookup.items():
         maternal_id = _blank_to_empty(row.get("maternal_id"))
         paternal_id = _blank_to_empty(row.get("paternal_id"))
         if not maternal_id or not paternal_id:
             continue
-        if maternal_id in sample_ids and paternal_id in sample_ids:
-            trios.append((row["sample_id"], maternal_id, paternal_id))
-
-    duplicate_child_ids = sorted(
-        child_id for child_id, count in Counter(trio[0] for trio in trios).items() if count > 1
-    )
-    if duplicate_child_ids:
-        raise ValueError(f"Child ID(s) appear in multiple trios: {set(duplicate_child_ids)}")
-
+        if maternal_id in sample_lookup and paternal_id in sample_lookup:
+            trios.append((sample_id, maternal_id, paternal_id))
     return trios
 
 
-def _iter_sample_rows(sample_lookup_or_df):
-    """Normalize a sample_lookup dict or sample_df into a list of row dicts."""
-    if isinstance(sample_lookup_or_df, dict):
-        return list(sample_lookup_or_df.values())
-    # Assume a pandas DataFrame.
-    return sample_lookup_or_df.to_dict(orient="records")
-
-
 def _blank_to_empty(value):
-    """Return a stripped string for ``value``, treating missing/NaN as ``""``."""
+    """Return a stripped string for ``value``.
+
+    None and the BLANK_STATUS_VALUES spellings (which include a NaN's ``"nan"``)
+    become ``""``.
+    """
     if value is None:
         return ""
     text = str(value).strip()
-    if text.lower() in ("", "nan", "none", "na", "n/a", "null"):
+    if text.lower() in BLANK_STATUS_VALUES:
         return ""
     return text
 
@@ -331,9 +223,11 @@ def _keep_genotyped_trios(trios, locus_rows):
 
     The sample metadata can describe families whose samples were never
     genotyped. Such a trio is not comparable at any locus, so it would yield a
-    per-sample row of zeros that reads as a clean trio. Dropping it here keeps
-    genuinely clean trios (genotyped, zero violations over a non-zero
-    denominator) as the only zero-violation rows in the output.
+    per-sample row of zeros that reads as a clean trio. Only column presence is
+    checked: a trio whose three members are genotype columns is kept even when
+    none of its loci can be compared (e.g. every call is a no-call), and its row
+    then has ``total_loci == 0``, which tells it apart from a clean trio (zero
+    violations over a non-zero ``total_loci``).
 
     Args:
         trios: List of ``(child_id, mother_id, father_id)`` tuples.
@@ -512,7 +406,7 @@ def _tally(stats, per_motif_stats, chrom_category, motif_size_category, canonica
 def per_sample_columns():
     """Return the ordered column names of the per-sample Mendelian-violation table.
 
-    The layout matches the original ``write_output`` header: ``sample_id``, then
+    The layout is ``sample_id``, then
     ``{cat}_violations`` / ``{cat}_total`` for each of autosome, chrX, chrY,
     chrM, then ``motif_{safecat}_violations`` / ``motif_{safecat}_total`` for
     each motif-size category (with ``-`` -> ``_`` and ``+`` -> ``plus`` so
@@ -538,9 +432,8 @@ def per_sample_columns():
 def per_motif_columns():
     """Return the ordered column names of the per-motif Mendelian-violation table.
 
-    The layout matches the original ``write_per_motif_output`` header:
-    ``sample_id``, then ``mv_{motif}`` / ``total_{motif}`` for each canonical
-    1-6bp motif (in sorted order).
+    The layout is ``sample_id``, then ``mv_{motif}`` / ``total_{motif}`` for each
+    canonical 1-6bp motif (in sorted order).
 
     Returns:
         A list of column-name strings.
@@ -552,24 +445,25 @@ def per_motif_columns():
     return columns
 
 
-def compute_mendelian_violations(locus_rows, sample_lookup, sample_df, threshold=2):
+def compute_mendelian_violations(locus_rows, sample_lookup, threshold=2):
     """Compute per-sample and per-motif Mendelian-violation rows for all trios.
 
     Drives the computation entirely from the in-memory matrix (``locus_rows``)
     and the trio relationships in the sample metadata. Trios whose child or
     parents are not genotype columns of the matrix are dropped (the metadata can
-    describe samples the matrix does not carry), so every returned row comes from
-    a trio that was actually compared. Returns ``([], [])`` when no genotyped
-    complete trio exists, so the caller can skip writing the Mendelian tables.
+    describe samples the matrix does not carry). A trio whose members are all
+    genotype columns is kept even when none of its loci could be compared; its
+    row then has ``total_loci == 0`` (see ``_keep_genotyped_trios``). Returns
+    ``([], [])`` when no genotyped complete trio exists, so the caller can skip
+    writing the Mendelian tables.
 
     Args:
         locus_rows: The in-memory matrix rows from
             ``input_tables.read_repeat_copy_numbers`` (each with ``trid``,
             ``motif`` and a ``genotypes`` dict).
-        sample_lookup: The sample_id -> metadata-dict lookup. Used as the trio
-            source when ``sample_df`` is None; ``find_trios`` accepts either shape.
-        sample_df: The cleaned sample-metadata DataFrame used by ``find_trios`` to
-            discover trios. When None, ``sample_lookup`` is used instead.
+        sample_lookup: The sample_id -> metadata-dict lookup from
+            ``input_tables.read_sample_metadata``, from which ``find_trios`` reads
+            the trios.
         threshold: Alleles match if they differ by strictly fewer than this many
             repeats. Defaults to 2. The "match" test is strict
             (``abs(a - b) < threshold``), so a difference of exactly ``threshold``
@@ -581,8 +475,7 @@ def compute_mendelian_violations(locus_rows, sample_lookup, sample_df, threshold
         ``per_sample_columns`` and ``per_motif_columns`` respectively. Both lists
         are empty when there are no trios.
     """
-    trios = find_trios(sample_df if sample_df is not None else sample_lookup)
-    trios = _keep_genotyped_trios(trios, locus_rows)
+    trios = _keep_genotyped_trios(find_trios(sample_lookup), locus_rows)
     if not trios:
         return [], []
 

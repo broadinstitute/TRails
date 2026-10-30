@@ -1,12 +1,15 @@
 """Unit tests for phenotype_scoring.
 
-All tests force the Jaccard fallback by monkeypatching
-``phenotype_scoring.ensure_ontology`` to return False, so no pyhpo ontology is
-built and the tests are deterministic regardless of whether pyhpo is installed.
+The ForceJaccardTestCase subclasses monkeypatch ``phenotype_scoring.ensure_ontology``
+to return False, so they use the Jaccard fallback and give the same results whether
+or not pyhpo is installed. CombinedICTests uses fake terms and needs no ontology.
+PyhpoUnknownTermTests builds and uses the real pyhpo ontology, and is skipped when
+pyhpo is not installed.
 """
 
 import unittest
 
+import analysis_columns
 import phenotype_scoring
 from phenotype_scoring import (
     OUTLIER_TYPE_INHERITANCE,
@@ -110,16 +113,9 @@ GENE_DISEASE_DATA = {
 
 
 class ScorePatientVsGeneTests(ForceJaccardTestCase):
-    def test_unknown_gene_has_no_annotation(self):
-        result = score_patient_vs_gene_filtered({"HP:A"}, "NOPE", GENE_DISEASE_DATA, {"AD"})
-        self.assertFalse(result["has_annotation"])
-        self.assertEqual(result["n_matching_diseases"], 0)
-        self.assertEqual(result["best_similarity"], 0.0)
-
     def test_inheritance_filter_selects_dominant_disease(self):
         # AD allowed -> only OMIM:1 (HP:A,HP:B) reachable; patient {HP:A,HP:B} -> 1.0
         result = score_patient_vs_gene_filtered({"HP:A", "HP:B"}, "GENEX", GENE_DISEASE_DATA, {"AD"})
-        self.assertTrue(result["has_annotation"])
         self.assertEqual(result["n_matching_diseases"], 1)
         self.assertEqual(result["best_disease"], "OMIM:1")
         self.assertEqual(result["best_similarity"], 1.0)
@@ -135,7 +131,6 @@ class ScorePatientVsGeneTests(ForceJaccardTestCase):
 
     def test_annotated_gene_no_matching_inheritance(self):
         result = score_patient_vs_gene_filtered({"HP:A"}, "GENEX", GENE_DISEASE_DATA, {"XR"})
-        self.assertTrue(result["has_annotation"])
         self.assertEqual(result["n_matching_diseases"], 0)
         self.assertIsNone(result["best_disease"])
 
@@ -147,8 +142,8 @@ class ScorePatientVsGeneTests(ForceJaccardTestCase):
 
 class GetQualifyingSamplesTests(ForceJaccardTestCase):
     def _base_row(self, outlier_value):
-        # No unaffected sample and no population percentiles -> gates 2 and 3
-        # depend only on allele_size > 0 and "no cohort data -> include".
+        # No population percentiles, so only the affected/unaffected statuses and the HPO
+        # terms decide which samples qualify.
         return {
             "LocusId": "chr1-100-110-AC",
             "OutlierSampleIds_AllAlleles": outlier_value,
@@ -159,7 +154,7 @@ class GetQualifyingSamplesTests(ForceJaccardTestCase):
         affected = {"s_affected": "affected", "s_unaffected": "unaffected"}
         analysis = {"s_affected": "unsolved", "s_unaffected": "unaffected"}
         hpo = {"s_affected": {"HP:A"}, "s_unaffected": {"HP:B"}}
-        qualifying = get_qualifying_samples(row, "AllAlleles", affected, analysis, hpo)
+        qualifying = get_qualifying_samples(row, affected, analysis, hpo)["AllAlleles"]
         self.assertEqual([entry[0] for entry in qualifying], ["s_affected"])
 
     def test_gate_requires_hpo(self):
@@ -167,17 +162,16 @@ class GetQualifyingSamplesTests(ForceJaccardTestCase):
         affected = {"s1": "affected", "s2": "affected"}
         analysis = {"s1": "unsolved", "s2": "unsolved"}
         hpo = {"s1": {"HP:A"}}  # s2 has no HPO terms
-        qualifying = get_qualifying_samples(row, "AllAlleles", affected, analysis, hpo)
+        qualifying = get_qualifying_samples(row, affected, analysis, hpo)["AllAlleles"]
         self.assertEqual([entry[0] for entry in qualifying], ["s1"])
 
     def test_gate_above_unaffected(self):
-        row = self._base_row("40x:s_big,20x:s_small")
-        row["FirstUnaffectedAlleleSize_AllAlleles"] = 30
-        affected = {"s_big": "affected", "s_small": "affected"}
-        analysis = {"s_big": "unsolved", "s_small": "unsolved"}
+        row = self._base_row("40x:s_big,30x:s_unaffected,20x:s_small")
+        affected = {"s_big": "affected", "s_unaffected": "unaffected", "s_small": "affected"}
+        analysis = {"s_big": "unsolved", "s_unaffected": "unaffected", "s_small": "unsolved"}
         hpo = {"s_big": {"HP:A"}, "s_small": {"HP:B"}}
-        qualifying = get_qualifying_samples(row, "AllAlleles", affected, analysis, hpo)
-        # only the 40 allele exceeds the unaffected threshold of 30
+        qualifying = get_qualifying_samples(row, affected, analysis, hpo)["AllAlleles"]
+        # only the 40 allele exceeds the unaffected sample's 30
         self.assertEqual([entry[0] for entry in qualifying], ["s_big"])
 
     def test_gate_above_population_p99(self):
@@ -186,7 +180,7 @@ class GetQualifyingSamplesTests(ForceJaccardTestCase):
         affected = {"s_big": "affected", "s_small": "affected"}
         analysis = {"s_big": "unsolved", "s_small": "unsolved"}
         hpo = {"s_big": {"HP:A"}, "s_small": {"HP:B"}}
-        qualifying = get_qualifying_samples(row, "AllAlleles", affected, analysis, hpo)
+        qualifying = get_qualifying_samples(row, affected, analysis, hpo)["AllAlleles"]
         self.assertEqual([entry[0] for entry in qualifying], ["s_big"])
 
     def test_gate_uses_the_population_gate_cohorts(self):
@@ -196,10 +190,10 @@ class GetQualifyingSamplesTests(ForceJaccardTestCase):
         affected = {"s_big": "affected", "s_small": "affected"}
         analysis = {"s_big": "unsolved", "s_small": "unsolved"}
         hpo = {"s_big": {"HP:A"}, "s_small": {"HP:B"}}
-        qualifying = get_qualifying_samples(row, "AllAlleles", affected, analysis, hpo)
+        qualifying = get_qualifying_samples(row, affected, analysis, hpo)["AllAlleles"]
         self.assertEqual([entry[0] for entry in qualifying], ["s_big", "s_small"])
-        qualifying = get_qualifying_samples(row, "AllAlleles", affected, analysis, hpo,
-                                            ("HPRC256", "AoU1027", "TenK10K"))
+        qualifying = get_qualifying_samples(row, affected, analysis, hpo,
+                                            ("HPRC256", "AoU1027", "TenK10K"))["AllAlleles"]
         self.assertEqual([entry[0] for entry in qualifying], ["s_big"])
 
     def test_descending_order_and_dedup_keep_largest(self):
@@ -208,12 +202,41 @@ class GetQualifyingSamplesTests(ForceJaccardTestCase):
         affected = {"s_dup": "affected", "s_other": "affected"}
         analysis = {"s_dup": "unsolved", "s_other": "unsolved"}
         hpo = {"s_dup": {"HP:A"}, "s_other": {"HP:B"}}
-        qualifying = get_qualifying_samples(row, "AllAlleles", affected, analysis, hpo)
+        qualifying = get_qualifying_samples(row, affected, analysis, hpo)["AllAlleles"]
         self.assertEqual([(e[0], e[1]) for e in qualifying], [("s_dup", 50), ("s_other", 45)])
 
     def test_missing_outlier_value_returns_empty(self):
         self.assertEqual(get_qualifying_samples({"OutlierSampleIds_AllAlleles": ""},
-                                                "AllAlleles", {}, {}, {"x": {"HP:A"}}), [])
+                                                {}, {}, {"x": {"HP:A"}}),
+                         {"AllAlleles": [], "ShortAlleles": [], "HemizygousAlleles": []})
+
+    def test_qualifying_samples_are_the_counted_samples_that_have_hpo_terms(self):
+        # The phenotype scores and the NumAffectedUnsolved* counts must select the same
+        # samples: a tie with the unaffected sample is not above it, the population gate
+        # applies, and only the HPO filter is specific to phenotype scoring.
+        record = {
+            "LocusId": "chr1-100-110-AC",
+            "OutlierSampleIds_AllAlleles": "60x:a1,50x:a2,45x:a3,40x:a4,40x:u1,30x:a5",
+            "OutlierSampleIds_ShortAlleles": "45x:a3,40x:a4",
+            "OutlierSampleIds_HemizygousAlleles": "",
+            "AoU1027_99thPercentile": 44,
+        }
+        affected = {"a1": "affected", "a2": "unknown", "a3": "affected", "a4": "affected",
+                    "a5": "affected", "u1": "unaffected"}
+        analysis = {"a1": "unsolved", "a2": "unknown", "a3": "partially solved",
+                    "a4": "unsolved", "a5": "unsolved", "u1": "unsolved"}
+        hpo = {"a1": {"HP:A"}, "a2": {"HP:B"}, "a4": {"HP:C"}, "a5": {"HP:D"}}
+        counted_rows = analysis_columns.add_all_outlier_columns(
+            [dict(record)], {}, affected, analysis)
+        qualifying = get_qualifying_samples(record, affected, analysis, hpo)
+        for outlier_type in analysis_columns.OUTLIER_TYPES:
+            counted_sample_ids_with_hpo_terms = {
+                row["sample_id"] for row in counted_rows
+                if row["outlier_type"] == outlier_type and row["sample_id"] in hpo}
+            self.assertEqual({entry[0] for entry in qualifying[outlier_type]},
+                             counted_sample_ids_with_hpo_terms, outlier_type)
+        self.assertEqual([entry[0] for entry in qualifying["AllAlleles"]], ["a1", "a2"])
+        self.assertEqual(qualifying["ShortAlleles"], [])
 
 
 class ComputePhenotypeScoresTests(ForceJaccardTestCase):
@@ -332,9 +355,9 @@ class PyhpoUnknownTermTests(unittest.TestCase):
     """With pyhpo installed, an unknown HPO id must not zero a whole score.
 
     pyhpo's HPOSet.from_queries raises for the entire set when any single term is
-    unknown, so a retired or misspelled id used to make the whole similarity 0.0.
-    These tests use the real ontology (HP:0001250 Seizure, HP:0001263 Global
-    developmental delay) and skip when pyhpo is not installed.
+    unknown, so a retired or misspelled id is dropped on its own and the remaining
+    terms are still scored. These tests use the real ontology (HP:0001250 Seizure,
+    HP:0001263 Global developmental delay) and skip when pyhpo is not installed.
     """
 
     @classmethod

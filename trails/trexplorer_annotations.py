@@ -3,16 +3,18 @@
 trails_setup downloads TRExplorer's annotated hg38 catalog table once and keeps only the columns
 TRails uses, in a small DuckDB database (build_trexplorer_annotations_database). The build then
 gives each locus of the repeat-copy-numbers table the annotations of its TRExplorer locus
-(add_trexplorer_annotations), matched the way the analysis code's add_trexplorer_columns.py
-matches them:
+(add_trexplorer_annotations), chosen as follows:
 
-  * a TRExplorer locus is a candidate when its interval overlaps the locus with a Jaccard
-    similarity (intersection over union) of at least MIN_JACCARD_SIMILARITY and its motif
-    matches: the same canonical motif for motifs of 1-6 bp, the same motif length for motifs of
-    7 bp or more;
+  * a TRExplorer locus is a candidate when it is on the same chromosome, its interval overlaps
+    the locus with a Jaccard similarity (intersection over union) of at least
+    MIN_JACCARD_SIMILARITY, and its motif matches: the same canonical motif when both motifs
+    are 1-6 bp, the same motif length when the locus's motif is 7 bp or more;
   * the candidate with the locus's own id wins (chr prefixes ignored);
-  * otherwise the candidate with the largest HPRC256 standard deviation wins, then the largest
-    AoU1027 one, then the purest reference repeat, then the last locus id in sort order.
+  * otherwise each candidate is ranked by the first of these it has: its HPRC256 standard
+    deviation, its AoU1027 standard deviation, its reference repeat purity. A candidate ranked
+    by an earlier one of the three beats a candidate ranked by a later one or by none, and
+    between two candidates ranked by the same one, the larger value wins;
+  * a tie that is left goes to the candidate with the last locus id in sort order.
 """
 
 import os
@@ -26,8 +28,8 @@ MIN_JACCARD_SIMILARITY = 0.66
 
 TREXPLORER_LOCI_TABLE = "trexplorer_loci"
 
-# Columns copied from the matched TRExplorer locus onto the TRails locus: {TRails column:
-# TRExplorer column}. A value the repeat-copy-numbers table already supplies for a column is kept.
+# Columns copied from the matched TRExplorer locus onto the TRails locus: {TRExplorer column:
+# TRails column}. A value the repeat-copy-numbers table already supplies for a column is kept.
 TRAILS_COLUMN_BY_TREXPLORER_COLUMN = {
     "LocusId": "TRExplorerLocusId",
     "Motif": "TRExplorerMotif",
@@ -135,8 +137,8 @@ def _match_loci(locus_records, annotations_database_path):
     })
     overlap = "(LEAST(u.End1Based, t.End1Based) - GREATEST(u.Start0Based, t.Start0Based))"
     union = f"((u.End1Based - u.Start0Based) + (t.End1Based - t.Start0Based) - {overlap})"
-    # The analysis code's tie-break: a tier for which value is compared (HPRC256 stdev, then
-    # AoU1027 stdev, then reference purity), then that value, then the locus id.
+    # The tie-break of the module docstring: the tier says which value a candidate is ranked by
+    # (HPRC256 stdev, then AoU1027 stdev, then reference purity), then that value, then the locus id.
     tier = ("CASE WHEN t.HPRC256_Stdev IS NOT NULL THEN 2 WHEN t.AoU1027_Stdev IS NOT NULL THEN 1 "
             "WHEN t.ReferenceRepeatPurity IS NOT NULL THEN 0 ELSE -1 END")
     tier_value = "COALESCE(t.HPRC256_Stdev, t.AoU1027_Stdev, t.ReferenceRepeatPurity, 0)"

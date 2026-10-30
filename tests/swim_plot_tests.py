@@ -236,6 +236,17 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
         rows = generate_swim_plot_table(records, sample_lookup, affected_lookup, analysis_lookup)
         self.assertIsNone(rows[0]["phenotype_description"])
 
+    def test_blank_metadata_cells_become_none(self):
+        # read_sample_metadata keeps an empty cell as '', which must be stored as NULL like the
+        # family_id of the affected_unsolved_outliers_above_unaffected table.
+        sample_lookup, affected_lookup, analysis_lookup = self._lookups()
+        sample_lookup["S9"] = {"family_id": "", "sex": " ", "phenotype_description": ""}
+        records = [_make_record(OutlierSampleIds_AllAlleles="40x:S9")]
+        row = generate_swim_plot_table(records, sample_lookup, affected_lookup, analysis_lookup)[0]
+        self.assertIsNone(row["family_id"])
+        self.assertIsNone(row["sex"])
+        self.assertIsNone(row["phenotype_description"])
+
 
 if __name__ == "__main__":
     unittest.main()

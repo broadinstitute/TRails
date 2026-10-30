@@ -1,10 +1,8 @@
-"""Regression tests for the HTML template findings (W15-W18, X13-X17, Y6, Y19-Y22, Z4, Z12-Z15,
-V1, V13-V15) from the code review, and for the page features ported from the analysis code
-afterwards (Group Results By, the Min Δpop filter, the #Fam column, the TRExplorer link columns).
+"""Tests that pin the source text of the results server's page templates.
 
 The templates are Jinja + JavaScript, so there is no Python harness that can execute them.
-These tests pin the template source text instead, which is enough to catch a silent revert of
-each fix.
+These tests pin the template source text instead, which is enough to catch a silent change to
+the behavior each test describes.
 """
 
 import os
@@ -96,7 +94,7 @@ def js_object_body(text, signature):
 
 
 class TagFilterRestoreTests(unittest.TestCase):
-    """Z4: the saved tag must be selected in a dropdown whose menu already exists.
+    """The saved tag must be selected in a dropdown whose menu already exists.
 
     applyStateToUI selects the tag by value, and Semantic UI silently ignores a 'set selected'
     for a value the menu does not hold yet, so the Search and Export handlers (which re-read the
@@ -120,14 +118,14 @@ class TagFilterRestoreTests(unittest.TestCase):
 
     def test_search_and_export_still_read_the_tag_off_the_dropdown(self):
         # This is what makes the ordering matter, so pin it: if these ever stopped reading the
-        # dropdown the fix above would no longer be load bearing.
+        # dropdown the startup ordering above would no longer be load bearing.
         self.assertIn("currentState.tag = $('#tag-filter').dropdown('get value') || '';", self.template)
         for handler in ("$('#search-button').on('click', function() {", "async function performExport(format) {"):
             self.assertIn("readStateFromUI();", self.template[self.template.index(handler):][:2000])
 
 
 class SortIconTests(unittest.TestCase):
-    """Z12: every sortable column header needs the span the active-sort styling colors."""
+    """Every sortable column header needs the span the active-sort styling colors."""
 
     def test_all_sortable_headers_carry_a_sort_icon(self):
         template = read_template("index_page_template.html")
@@ -143,11 +141,11 @@ class SortIconTests(unittest.TestCase):
 
 
 class ActiveSortClassTests(unittest.TestCase):
-    """W15: the sort indicator class must not claim a direction the server does not apply.
+    """The sort indicator class must not claim a direction the server does not apply.
 
     A header click only adds or removes the field from the sort list; each field's direction is
-    fixed in results_server.build_api_order_by's SORT_MAPPING, and Region sorts ascending. The
-    old markup styled `sorted-desc` for every sorted column and left `sorted-asc` unmatched.
+    fixed in results_server.build_api_order_by's SORT_MAPPING, and Region sorts ascending, so one
+    direction-free class marks every sorted column.
     """
 
     def test_no_template_uses_a_direction_named_sort_class(self):
@@ -167,17 +165,17 @@ class ActiveSortClassTests(unittest.TestCase):
         self.assertEqual(["sorted-active"], styled)
 
     def test_the_server_still_sorts_the_region_column_ascending(self):
-        # This is what made a single "sorted-desc" class wrong for every sorted column.
+        # This is why a single direction-named class would be wrong for every sorted column.
         self.assertIn('"region": ("gene_region_rank", "ASC")', read_template("results_server.py"))
 
 
 class DetailRowCellSpecificityTests(unittest.TestCase):
-    """W16: the detail-row cell rule must not reach the tables nested inside that cell.
+    """The detail-row cell rule must not reach the tables nested inside that cell.
 
-    `#results-table tbody tr.locus-detail-row td` (1 id, 1 class, 3 types) out-specified
-    `#results-table .sample-subtable td` (1,1,1), `.threshold-marker` (0,1,0) and
-    `.invisible-table td` (0,1,1), so every sample cell got the outer cell's 40px indent,
-    #fafafa background and 2px bottom border.
+    A descendant selector, `#results-table tbody tr.locus-detail-row td` (1 id, 1 class, 3 types),
+    would out-specify `#results-table .sample-subtable td` (1,1,1), `.threshold-marker` (0,1,0) and
+    `.invisible-table td` (0,1,1), giving every sample cell the outer cell's 40px indent, #fafafa
+    background and 2px bottom border.
     """
 
     def setUp(self):
@@ -204,26 +202,49 @@ class DetailRowCellSpecificityTests(unittest.TestCase):
         self.assertIn("#results-table .sample-subtable td { padding: 2px 6px;", self.header)
 
 
-class AnnotationErrorCommentTests(unittest.TestCase):
-    """W17 / V13: the comment must name the hook that actually returns the read-only-server 403.
+class AnnotationWriteHelperTests(unittest.TestCase):
+    """The results page and the swim plot share one set of annotation write helpers.
 
-    The comment is copied into both pages that write annotations, and W17 corrected only the
-    results page, so V13 found the swim page still naming a function that does not exist.
+    They are defined once, in header_template.html, which both pages include, and every write
+    failure surfaces the server's own explanation from the response body instead of a bare status.
     """
 
-    TEMPLATES_WITH_THE_COMMENT = ("index_page_template.html", "swim_plot_template.html")
+    PAGES_THAT_WRITE_ANNOTATIONS = ("index_page_template.html", "swim_plot_template.html")
+    HELPER_SIGNATURES = ("async function saveNote(", "async function deleteNote(",
+                         "async function addTag(", "async function removeTag(")
 
-    def test_the_comment_names_an_existing_server_function(self):
-        for name in self.TEMPLATES_WITH_THE_COMMENT:
+    def setUp(self):
+        self.header = read_template("header_template.html")
+
+    def test_both_pages_use_the_one_shared_copy(self):
+        for name in self.PAGES_THAT_WRITE_ANNOTATIONS:
             template = read_template(name)
-            self.assertIn("(the results_server.restrict_writes before_request hook)", template, name)
-            self.assertNotIn("require_local_writes", template, name)
+            self.assertIn('{% include "header_template.html" %}', template, name)
+            for signature in self.HELPER_SIGNATURES + ("async function annotationError(",):
+                self.assertIn(signature, self.header)
+                self.assertNotIn(signature, template, name)
+            for call in ("saveNote(", "addTag(", "removeTag("):
+                self.assertIn(call, template, name)
+
+    def test_the_write_helpers_read_the_response_body(self):
+        for signature in self.HELPER_SIGNATURES:
+            body = js_function_body(self.header, signature)
+            self.assertIn("throw await annotationError(response);", body, signature)
+            self.assertNotIn("new Error(`HTTP ${response.status}`)", body, signature)
+        helper = js_function_body(self.header, "async function annotationError(")
+        self.assertIn("await response.json().catch(() => ({}))", helper)
+        self.assertIn("body.detail || body.error || `HTTP ${response.status}`", helper)
+
+    def test_the_comment_names_the_hook_that_returns_the_read_only_server_403(self):
+        self.assertIn("(the results_server.restrict_writes before_request hook)", self.header)
 
     def test_no_template_names_a_server_symbol_that_does_not_exist(self):
         # Every `results_server.<name>` a comment cites has to be findable in the server.
         server = read_template("results_server.py")
-        for name in self.TEMPLATES_WITH_THE_COMMENT:
-            for symbol in set(re.findall(r"results_server\.([a-zA-Z_][a-zA-Z_0-9]*)", read_template(name))):
+        for name in sorted(os.listdir(CODE_DIRECTORY)):
+            if not name.endswith(".html"):
+                continue
+            for symbol in set(re.findall(r"results_server\.(?!py\b)([a-zA-Z_][a-zA-Z_0-9]*)", read_template(name))):
                 self.assertTrue(re.search(r"^(def %s\(|%s = )" % (symbol, symbol), server, re.MULTILINE),
                                 "%s cites results_server.%s, which does not exist" % (name, symbol))
 
@@ -235,11 +256,17 @@ class AnnotationErrorCommentTests(unittest.TestCase):
         self.assertIn('"detail": "This server is bound to a non-loopback address', hook)
         self.assertIn("403", hook)
 
+    def test_the_server_still_sends_the_fields_the_helpers_read(self):
+        server = read_template("results_server.py")
+        self.assertIn('"error": "annotation changes are limited to this machine"', server)
+        self.assertIn('"detail": "This server is bound to a non-loopback address', server)
+        self.assertIn('{"error": "note_text is required and cannot be empty"}', server)
+
 
 class QC2OutlierWarningTests(unittest.TestCase):
-    """W18: the per-source outlier map is gone from the QC2 page, which could never read it."""
+    """The QC2 page leaves out the per-source outlier map, which it never reads."""
 
-    def test_the_page_no_longer_serializes_the_map(self):
+    def test_qc2_page_does_not_serialize_outlier_warnings(self):
         template = read_template("qc2_template.html")
         self.assertNotIn("OUTLIER_WARNINGS_BY_SOURCE", template)
         self.assertNotIn("outlier_warnings_by_source", template)
@@ -251,7 +278,7 @@ class QC2OutlierWarningTests(unittest.TestCase):
         self.assertEqual(["item.sample_id"], calls)
 
     def test_the_shared_helper_tolerates_the_missing_const(self):
-        # Deleting the const is only safe because the helper short-circuits on a falsy source and
+        # Leaving the const out is only safe because the helper short-circuits on a falsy source and
         # guards the lookup with typeof.
         self.assertIn("const outlierMap = (source && typeof OUTLIER_WARNINGS_BY_SOURCE !== 'undefined')",
                       read_template("qc_shared_js.html"))
@@ -261,49 +288,8 @@ class QC2OutlierWarningTests(unittest.TestCase):
             self.assertIn("const OUTLIER_WARNINGS_BY_SOURCE =", read_template(name), name)
 
 
-class DeadSearchResultsGlobalTests(unittest.TestCase):
-    """Z13: performSearch must not stash the response payload in a global nothing reads."""
-
-    def test_no_template_writes_a_search_results_global(self):
-        for name in sorted(os.listdir(CODE_DIRECTORY)):
-            if name.endswith(".html"):
-                self.assertNotIn("searchResults", read_template(name), name)
-
-
-class AnnotationErrorBodyTests(unittest.TestCase):
-    """Z14: annotation write failures must surface the server's own explanation."""
-
-    def test_index_write_helpers_read_the_response_body(self):
-        template = read_template("index_page_template.html")
-        for signature in ("async function saveNote(", "async function deleteNote(",
-                          "async function addTag(", "async function removeTag("):
-            body = js_function_body(template, signature)
-            self.assertIn("throw await annotationError(response);", body, signature)
-            self.assertNotIn("new Error(`HTTP ${response.status}`)", body, signature)
-        helper = js_function_body(template, "async function annotationError(")
-        self.assertIn("await response.json().catch(() => ({}))", helper)
-        self.assertIn("body.detail || body.error || `HTTP ${response.status}`", helper)
-
-    def test_swim_plot_write_helpers_read_the_response_body(self):
-        template = read_template("swim_plot_template.html")
-        for signature in ("async function swimSaveNote(", "async function swimDeleteNote(",
-                          "async function swimAddTag(", "async function swimRemoveTag("):
-            body = js_function_body(template, signature)
-            self.assertIn("throw await swimAnnotationError(response);", body, signature)
-            self.assertNotIn("new Error('HTTP ' + response.status)", body, signature)
-        helper = js_function_body(template, "async function swimAnnotationError(")
-        self.assertIn("await response.json().catch(() => ({}))", helper)
-        self.assertIn("body.detail || body.error || `HTTP ${response.status}`", helper)
-
-    def test_the_server_still_sends_the_fields_the_helpers_read(self):
-        server = read_template("results_server.py")
-        self.assertIn('"error": "annotation changes are limited to this machine"', server)
-        self.assertIn('"detail": "This server is bound to a non-loopback address', server)
-        self.assertIn('{"error": "note_text is required and cannot be empty"}', server)
-
-
 class ClipboardFallbackTests(unittest.TestCase):
-    """Z15: the copy button must survive an unavailable or refused clipboard API."""
+    """The copy button must survive an unavailable or refused clipboard API."""
 
     def setUp(self):
         self.handler = read_template("index_page_template.html")
@@ -324,7 +310,7 @@ class ClipboardFallbackTests(unittest.TestCase):
 
 
 class ExpandHandlerScopeTests(unittest.TestCase):
-    """X13: the expand/collapse handler must not fire for the table's header cell."""
+    """The expand/collapse handler must not fire for the table's header cell."""
 
     def test_handler_is_bound_to_table_cells_only(self):
         template = read_template("index_page_template.html")
@@ -337,7 +323,7 @@ class ExpandHandlerScopeTests(unittest.TestCase):
 
 
 class TagAttributeReadTests(unittest.TestCase):
-    """X16/X17: a tag named "true" or "1" must survive being read back off the badge.
+    """A tag named "true" or "1" must survive being read back off the badge.
 
     jQuery's .data() converts such attribute values to a boolean or a number, which then fails
     the strict comparison against the active tag filter, so the page never reloads.
@@ -354,13 +340,8 @@ class TagAttributeReadTests(unittest.TestCase):
         self.assertNotIn(".data('tag')", template)
 
 
-class SampleQCSourceSelectorTests(unittest.TestCase):
-    """X14: the unreachable database-source selector and its machinery are gone."""
-
-    def test_selector_and_its_machinery_are_removed(self):
-        template = read_template("sample_qc_template.html")
-        for removed in ("qc-source-select", "qcRequestSeq", "sourceSelect", "db_labels"):
-            self.assertNotIn(removed, template)
+class SampleQCSourceTests(unittest.TestCase):
+    """The Sample QC page loads its data for the server's default source."""
 
     def test_data_is_fetched_for_the_page_default_source(self):
         template = read_template("sample_qc_template.html")
@@ -368,7 +349,7 @@ class SampleQCSourceSelectorTests(unittest.TestCase):
 
 
 class SharedJsHeaderTests(unittest.TestCase):
-    """X15: qc_shared_js.html's header comment must match what the file defines and who uses it."""
+    """qc_shared_js.html's header comment must match what the file defines and who uses it."""
 
     def setUp(self):
         self.shared_js = read_template("qc_shared_js.html")
@@ -390,7 +371,7 @@ class SharedJsHeaderTests(unittest.TestCase):
 
 
 class UnknownMotifBinTests(unittest.TestCase):
-    """Y6: the 'Unknown' motif-size bin the server emits must reach the charts and the popup."""
+    """The 'Unknown' motif-size bin the server emits must reach the charts and the popup."""
 
     def test_the_server_still_emits_an_unknown_bin(self):
         self.assertIn("Unknown", server_motif_bins())
@@ -414,25 +395,47 @@ class UnknownMotifBinTests(unittest.TestCase):
                          set(server_motif_bins()))
 
 
-class SampleQCChartCleanupTests(unittest.TestCase):
-    """Y21: the chart-destruction bookkeeping is gone now that nothing re-renders a container."""
+class QCPageSharedCodeTests(unittest.TestCase):
+    """The Sample QC and QC2 pages share their stylesheet and their per-bin chart code.
 
-    def test_section_charts_bookkeeping_is_removed(self):
-        template = read_template("sample_qc_template.html")
-        self.assertNotIn("sectionCharts", template)
-        self.assertNotIn("destroy()", template)
+    The .qc-* rules are in header_template.html and the per-bin card and box-plot chart builders
+    in qc_shared_js.html, which both pages include, so each page keeps only its own chart data and
+    options.
+    """
+
+    QC_PAGES = ("sample_qc_template.html", "qc2_template.html")
+
+    def test_the_qc_styles_are_in_the_shared_header(self):
+        self.assertIn(".qc-chart-canvas-wrapper {", read_template("header_template.html"))
+        for name in self.QC_PAGES:
+            self.assertNotIn("<style>", read_template(name), name)
+
+    def test_every_bin_chart_goes_through_the_shared_builders(self):
+        for name in self.QC_PAGES:
+            template = read_template(name)
+            self.assertIn('{% include "qc_shared_js.html" %}', template, name)
+            self.assertIn("appendQCBinCard(container, idx, bin, ", template, name)
+            self.assertIn("return createSingleBinBoxPlotChart(canvasId, ", template, name)
+            self.assertNotIn("new Chart(", template, name)
+            self.assertNotIn("document.createElement(", template, name)
+
+    def test_the_shared_builder_hands_the_box_plot_plugin_its_statistics(self):
+        builder = js_function_body(read_template("qc_shared_js.html"), "function createSingleBinBoxPlotChart(")
+        self.assertIn("chart.config._boxStats = computeBoxStats(values);", builder)
+        self.assertIn("p95: computePercentile(sortedValues, 95),", builder)
+        self.assertIn("p99: computePercentile(sortedValues, 99)", builder)
 
 
-class SourceSelectorRemovalTests(unittest.TestCase):
-    """Y22: the multi-database source selector is gone from the index and swim-plot pages."""
+class DefaultSourceTests(unittest.TestCase):
+    """No page renders a database-source selector; every page queries the server's default source."""
 
-    def test_no_template_still_renders_a_source_selector(self):
+    def test_no_page_renders_a_source_selector(self):
         for name in ("index_page_template.html", "swim_plot_template.html", "sample_qc_template.html"):
             template = read_template(name)
-            for removed in ("db_labels", 'name="source"', "swim_source", "available_sources"):
-                self.assertNotIn(removed, template, name)
+            for selector_markup in ("db_labels", 'name="source"', "swim_source", "available_sources"):
+                self.assertNotIn(selector_markup, template, name)
 
-    def test_index_state_functions_no_longer_read_or_write_the_source_radio(self):
+    def test_index_state_functions_keep_the_default_source(self):
         template = read_template("index_page_template.html")
         self.assertNotIn("'require_above_population', 'source'", template)
         self.assertNotIn("currentState.source = ", template)
@@ -445,14 +448,16 @@ class SourceSelectorRemovalTests(unittest.TestCase):
 
 
 class PopulationDataFilterGatingTests(unittest.TestCase):
-    """Y19: include_loci_without_population_data only counts when require_above_population is set."""
+    """include_loci_without_population_data only counts when require_above_population is set."""
 
-    def test_both_endpoints_gate_the_flag(self):
+    def test_the_results_query_gates_the_flag(self):
         template = read_template("index_page_template.html")
         sends = list(re.finditer(r"params\.set\('include_loci_without_population_data'", template))
-        # One send to /loci (buildApiUrl) and one to /export (performExport), each under a
+        # One send, in buildApiUrl, whose query both /loci and the locus export use, under a
         # require_above_population test in the statement that encloses it.
-        self.assertEqual(2, len(sends))
+        self.assertEqual(1, len(sends))
+        self.assertIn("params.set('include_loci_without_population_data'",
+                      js_function_body(template, "function buildApiUrl("))
         for send in sends:
             # The enclosing statement starts after the previous statement or block ends.
             statement = template[max(template.rfind(";", 0, send.start()),
@@ -468,8 +473,40 @@ class PopulationDataFilterGatingTests(unittest.TestCase):
         self.assertNotIn("if (key === 'population_metric'", js_function_body(template, "function updateActiveFiltersBar("))
 
 
+class LocusExportUrlTests(unittest.TestCase):
+    """The locus export sends the results query (buildApiUrl) to /export, every row rather than a page.
+
+    Building it from buildApiUrl keeps every filter, and the way each one is spelled, the same in
+    the results and in the export.
+    """
+
+    def setUp(self):
+        self.template = read_template("index_page_template.html")
+
+    def test_the_export_url_is_built_from_the_results_query(self):
+        export_url = js_function_body(self.template, "function buildLocusExportUrl(")
+        self.assertIn("new URL(buildApiUrl())", export_url)
+        self.assertIn("url.pathname.replace(/\\/loci$/, '/export')", export_url)
+        for name in ("page", "page_size"):
+            self.assertIn("url.searchParams.delete('%s');" % name, export_url)
+        self.assertIn("url.searchParams.set('format', format);", export_url)
+
+    def test_the_export_sets_no_filter_of_its_own(self):
+        export = js_function_body(self.template, "async function performExport(")
+        self.assertIn("? buildLocusExportUrl(format) : buildGroupedExportUrl(format);", export)
+        self.assertNotIn("params.set(", export)
+
+    def test_the_server_parses_the_export_query_like_the_results_query(self):
+        server = read_template("results_server.py")
+        for route in ('@app.route("/api/v1/loci")\ndef get_loci():', '@app.route("/api/v1/export")\ndef export_loci():'):
+            body = server[server.index(route):]
+            body = body[:body.index("\n@app.")]
+            self.assertIn("validate_params()", body, route)
+            self.assertIn("build_api_query(params)", body, route)
+
+
 class VariationClusterHelpTextTests(unittest.TestCase):
-    """Y20: the size-diff help popup must not contradict the checkbox help below it."""
+    """The size-diff help popup must not contradict the checkbox help below it."""
 
     def test_missing_cluster_is_described_as_unknown_not_as_absent(self):
         template = read_template("index_page_template.html")
@@ -479,12 +516,12 @@ class VariationClusterHelpTextTests(unittest.TestCase):
 
 
 class SwimNoteEditingGuardTests(unittest.TestCase):
-    """V1: the swim plot's Edit Note button must stay off until the stored note is known.
+    """The swim plot's Edit Note button must stay off until the stored note is known.
 
     showDotDetail opens the modal over a loading indicator and only then fetches the locus
     detail, and the footer handler takes the note's current text out of the rendered content.
-    A click while the fetch was in flight therefore opened an empty editor over an existing
-    note, and saving replaced that note with whatever was typed.
+    A click while the fetch is in flight would therefore open an empty editor over an existing
+    note, and saving would replace that note with whatever was typed.
     """
 
     def setUp(self):
@@ -527,13 +564,18 @@ class SwimNoteEditingGuardTests(unittest.TestCase):
         # The guard has to precede the read of the rendered note and the save.
         self.assertLess(handler.index("!swimDetailLoaded"), handler.index(".note-text"))
 
+    def test_show_dot_detail_itself_records_the_item_the_modal_acts_on(self):
+        self.assertTrue(self.show_dot_detail.startswith("function showDotDetail(item) {\n"
+                                                        "    _currentModalItem = item;\n"))
+        self.assertNotIn("showDotDetail = ", self.template)
+
 
 class ResultsPageNoteLoadFailureTests(unittest.TestCase):
-    """V1: the results page must not open an empty note editor when the load failed.
+    """The results page must not open an empty note editor when the load failed.
 
     The results page fetches the note before opening the modal, so it has no click-while-loading
-    window, but it used to treat both a non-ok response and a thrown request as "no note" and
-    open an empty textarea. Saving that would have replaced the stored note the same way.
+    window, but treating a non-ok response or a thrown request as "no note" would open an empty
+    textarea, and saving that would replace the stored note the same way.
     """
 
     def setUp(self):
@@ -556,11 +598,11 @@ class ResultsPageNoteLoadFailureTests(unittest.TestCase):
 
 
 class VariationClusterDetailPanelTests(unittest.TestCase):
-    """V14: the detail panel's variation-cluster line must show the same three states as the row.
+    """The detail panel's variation-cluster line must show the same three states as the row.
 
     A locus whose variation cluster was computed and then filtered out carries a filter reason
-    and a NULL size difference, so gating the whole line on the size difference made the panel
-    read as "no variation cluster" for exactly the loci whose VC cell shows a crossed-out icon.
+    and a NULL size difference, so gating the whole line on the size difference would make the
+    panel read as "no variation cluster" for exactly the loci whose VC cell shows a crossed-out icon.
     """
 
     def setUp(self):
@@ -592,19 +634,19 @@ class VariationClusterDetailPanelTests(unittest.TestCase):
 
 
 class DetailRowOuterCellTests(unittest.TestCase):
-    """V15: the detail row's own cell, never the hundreds of cells nested inside it.
+    """Detail-row lookups target the row's own cell, never the hundreds of cells nested inside it.
 
     The rendered detail holds a per-sample sub-table plus the threshold, phenotype-score and
-    affected-unsolved tables, so `.find('td')` on the row matched every one of those cells.
-    refreshDetailPanel assigned the whole detail string to each, and the collapse handlers
-    wrapped and animated each, firing their slideUp callback once per element.
+    affected-unsolved tables, so `.find('td')` on the row would match every one of those cells:
+    refreshDetailPanel would assign the whole detail string to each, and the collapse handlers
+    would wrap and animate each, firing their slideUp callback once per element.
     """
 
     def setUp(self):
         self.template = read_template("index_page_template.html")
 
     def test_no_detail_row_lookup_uses_a_descendant_selector(self):
-        # Comment lines are allowed to name the old selector; code lines are not.
+        # Comment lines may name the descendant selector; code lines may not.
         for number, line in enumerate(self.template.split("\n"), start=1):
             if line.strip().startswith("//"):
                 continue
@@ -625,17 +667,11 @@ class DetailRowOuterCellTests(unittest.TestCase):
         self.assertIn("$td.wrapInner('<div class=\"slide-wrapper\"></div>');\n"
                       "    $td.children('.slide-wrapper').slideUp(200, function() {", self.template)
 
-    def test_the_detail_row_still_has_exactly_one_direct_cell(self):
-        # .children('td') is only equivalent to the intended target because the row is built
-        # with a single colspan cell that the detail HTML is dropped into.
-        self.assertIn('<tr class="locus-detail-row"><td colspan="${$row.children(\'td\').length}"', self.template)
-        self.assertEqual(1, self.template.count('<tr class="locus-detail-row">'))
-
 
 class ResultsTableColumnCountTests(unittest.TestCase):
     """The results table's colspans follow its columns instead of a hard-coded count.
 
-    Adding the #Fam column took the locus table from 18 to 19 columns, and a grouped view shows a
+    The locus table's column count changes whenever a column is added, and a grouped view shows a
     header of its own, so every colspan that spans the results table is computed. The per-sample
     sub-table's colspans use its own ${colCount}.
     """
@@ -695,8 +731,8 @@ class MinDeltaPopFilterTests(unittest.TestCase):
     """The Min Δpop input (min_repeats_above_population) goes through every state function.
 
     A control missing from any one of them is silently lost: on reload (readStateFromUrl only keeps
-    DEFAULT_STATE keys), on Search (readStateFromUI), in the request (buildApiUrl), in the export
-    (performExport), on Back or a chip removal (applyStateToUI), or from the active filter chips.
+    DEFAULT_STATE keys), on Search (readStateFromUI), in the request and the export (buildApiUrl),
+    on Back or a chip removal (applyStateToUI), or from the active filter chips.
     """
 
     def setUp(self):
@@ -710,8 +746,6 @@ class MinDeltaPopFilterTests(unittest.TestCase):
                       js_object_body(self.template, "const DEFAULT_STATE = {"))
         for signature in ("function applyStateToUI(", "function readStateFromUI(", "function buildApiUrl("):
             self.assertIn("'min_repeats_above_population'", js_function_body(self.template, signature), signature)
-        self.assertIn("params.set('min_repeats_above_population', currentState.min_repeats_above_population);",
-                      js_function_body(self.template, "async function performExport("))
         self.assertIn("min_repeats_above_population: 'Min Δpop'",
                       js_function_body(self.template, "function updateActiveFiltersBar("))
 
@@ -719,9 +753,8 @@ class MinDeltaPopFilterTests(unittest.TestCase):
         # The filter compares against the 99th % / max choice, so 'max' has to reach the API with it.
         self.assertIn("currentState.min_repeats_above_population",
                       js_function_body(self.template, "function populationMetricAffectsResults("))
-        for signature in ("function buildApiUrl(", "async function performExport("):
-            self.assertIn("populationMetricAffectsResults() && currentState.population_metric === 'max'",
-                          js_function_body(self.template, signature), signature)
+        self.assertIn("populationMetricAffectsResults() && currentState.population_metric === 'max'",
+                      js_function_body(self.template, "function buildApiUrl("))
 
     def test_the_delta_pop_column_compares_against_the_cohorts_the_server_filters_on(self):
         # The filter is a minimum on the Δpop column, so the column has to use the population
@@ -737,9 +770,8 @@ class MinDeltaPopFilterTests(unittest.TestCase):
         self.assertIn('POPULATION_DATASETS = LONG_READ_POPULATION_DATASETS + ("TenK10K",)', server)
         self.assertIn('"short-read": ("TenK10K",),', server)
 
-    def test_it_replaces_the_min_pli_filter(self):
-        # The page no longer has a Min pLI filter (only a comment names it); the server still
-        # accepts min_pli.
+    def test_the_page_has_no_min_pli_filter(self):
+        # Only a comment on the page names min_pli; the server still accepts it.
         for line in self.template.split("\n"):
             if "min_pli" in line:
                 self.assertTrue(line.strip().startswith("//"), line)
@@ -769,7 +801,7 @@ class GroupResultsByTests(unittest.TestCase):
 
     def test_every_grouped_column_has_a_width(self):
         # In the table's fixed layout an unsized column only gets the space the sized ones leave,
-        # which left Phenotype zero pixels wide at 1280px
+        # which leaves Phenotype zero pixels wide at 1280px
         header = read_template("header_template.html")
         for column_class in set(re.findall(r"'(col-group-[a-z-]+)", self.template)):
             self.assertRegex(header, r"#results-table \." + column_class + r"[ ,][^}]*width:", column_class)
@@ -932,9 +964,51 @@ class SwimPlotMarkerTests(unittest.TestCase):
         self.assertNotIn("style = 'star';", template)
         self.assertIn('<span style="margin-left: 8px;">&#9650;</span> True/Candidate', template)
 
+    def test_only_a_whole_true_or_candidate_tag_gets_the_triangle(self):
+        # item.tags is the locus's tag list, so includes() compares whole tags, and a tag such as
+        # 'not a candidate' keeps the circle.
+        template = read_template("swim_plot_template.html")
+        self.assertIn("const tags = (item.tags || []).map(tag => String(tag).trim().toLowerCase());", template)
+        self.assertIn("if (tags.includes('true') || tags.includes('candidate')) {", template)
+
     def test_the_cap_note_matches_the_server_limit(self):
         self.assertIn("const SWIM_PLOT_MAX_ALLELES_PER_MOTIF_SIZE = 500;", read_template("swim_plot_template.html"))
         self.assertIn("ORDER BY allele_size DESC, LocusId, sample_id LIMIT 500", read_template("results_server.py"))
+
+
+class TagListRequestTests(unittest.TestCase):
+    """Each page fills its tag filter menu and its cached tag list from one /annotations/tags request."""
+
+    def test_the_results_page_requests_the_tags_in_one_place(self):
+        template = read_template("index_page_template.html")
+        self.assertEqual(1, template.count("/annotations/tags`"))
+        self.assertIn("window._allTagsList = data.tags || [];",
+                      js_function_body(template, "async function populateTagDropdown("))
+
+    def test_the_swim_plot_requests_the_tags_in_one_place(self):
+        template = read_template("swim_plot_template.html")
+        self.assertEqual(1, template.count("'/annotations/tags'"))
+        self.assertIn("window._allTagsList = d.tags || [];",
+                      js_function_body(template, "function refreshSwimTags("))
+
+
+class CdnIntegrityTests(unittest.TestCase):
+    """Every CDN file the pages load names an exact version and carries a Subresource Integrity hash."""
+
+    CDN_TAG_PATTERN = r"<(?:script|link)\b[^>]*\b(?:src|href)=\"https?://[^>]*>"
+
+    def test_every_cdn_tag_in_the_header_is_pinned_and_hashed(self):
+        tags = re.findall(self.CDN_TAG_PATTERN, read_template("header_template.html"))
+        self.assertEqual(4, len(tags))
+        for tag in tags:
+            self.assertRegex(tag, r'integrity="sha384-[A-Za-z0-9+/]{64}"')
+            self.assertIn('crossorigin="anonymous"', tag)
+            self.assertRegex(tag, r"[@/-]\d+\.\d+\.\d+[/.]")
+
+    def test_no_other_template_loads_a_cdn_file(self):
+        for name in sorted(os.listdir(CODE_DIRECTORY)):
+            if name.endswith(".html") and name != "header_template.html":
+                self.assertNotRegex(read_template(name), self.CDN_TAG_PATTERN, name)
 
 
 class DetailPanelMotifTests(unittest.TestCase):

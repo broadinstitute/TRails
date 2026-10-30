@@ -91,14 +91,14 @@ class ReadSampleMetadataTests(unittest.TestCase):
             os.unlink(path)
 
     def test_case_insensitive_columns_and_minimal(self):
-        sample_lookup, affected, analysis, df = self._read(
+        sample_lookup, affected, analysis = self._read(
             [["S1"], ["S2"]], ["Sample_ID"]
         )
-        self.assertIn("S1", sample_lookup)
-        self.assertEqual(set(df.columns), {"sample_id"})
+        self.assertEqual(list(sample_lookup), ["S1", "S2"])
+        self.assertEqual(sample_lookup["S1"], {"sample_id": "S1"})
 
     def test_analysis_status_remap(self):
-        _, _, analysis, _ = self._read(
+        _, _, analysis = self._read(
             [["S1", "rncc"], ["S2", "rcpc"], ["S3", "s_kgfp"], ["S4", ""]],
             ["sample_id", "analysis_status"],
         )
@@ -108,7 +108,7 @@ class ReadSampleMetadataTests(unittest.TestCase):
         self.assertEqual(analysis["S4"], "unknown")
 
     def test_affected_status_possibly_affected_maps_to_affected(self):
-        _, affected, _, _ = self._read(
+        _, affected, _ = self._read(
             [["S1", "Possibly Affected"], ["S2", "Unaffected"]],
             ["sample_id", "affected_status"],
         )
@@ -120,15 +120,15 @@ class ReadSampleMetadataTests(unittest.TestCase):
             self._read([["S:1"]], ["sample_id"])
 
     def test_dedup_keep_first(self):
-        sample_lookup, _, _, df = self._read(
+        sample_lookup, _, _ = self._read(
             [["S1", "male"], ["S1", "female"]],
             ["sample_id", "sex"],
         )
-        self.assertEqual(len(df), 1)
+        self.assertEqual(len(sample_lookup), 1)
         self.assertEqual(sample_lookup["S1"]["sex"], "male")
 
     def test_phenotype_na_prefix_stripped(self):
-        sample_lookup, _, _, _ = self._read(
+        sample_lookup, _, _ = self._read(
             [["S1", "NA; seizures"]],
             ["sample_id", "phenotype_description"],
         )
@@ -139,7 +139,7 @@ class ReadSampleMetadataTests(unittest.TestCase):
             self._read([["S1", "intersex"]], ["sample_id", "sex"])
 
     def test_full_metadata_lookup_fields(self):
-        sample_lookup, _, _, _ = self._read(
+        sample_lookup, _, _ = self._read(
             [["S1", "male", "F1", "M1", "P1", "ataxia", "affected", "unsolved"]],
             ["sample_id", "sex", "family_id", "maternal_id", "paternal_id",
              "phenotype_description", "affected_status", "analysis_status"],
@@ -225,7 +225,7 @@ def _write(text, suffix=".tsv"):
 
 
 class CoerceAnnotationValueTests(unittest.TestCase):
-    """DP1: '.'/'NA'-style missing markers must not survive as strings."""
+    """'.'/'NA'-style missing markers must not survive as strings."""
 
     def test_missing_markers_become_none(self):
         for marker in ("", ".", "NA", "N/A", "NaN", "nan", "none", "NULL", " . "):
@@ -249,7 +249,7 @@ class CoerceAnnotationValueTests(unittest.TestCase):
 
 
 class InheritanceHPOTermsTests(unittest.TestCase):
-    """DP3: non-Mendelian inheritance HPO terms must not enter the inheritance set."""
+    """Inheritance HPO terms without a Mendelian code enter neither the inheritance set nor the phenotypes."""
 
     def test_unmapped_inheritance_term_dropped(self):
         path = _write(
@@ -265,9 +265,24 @@ class InheritanceHPOTermsTests(unittest.TestCase):
         self.assertNotIn("HP:0001426", entry["inheritance"])
         self.assertEqual(entry["phenotypes"], {"HP:0004972"})
 
+    def test_inheritance_qualifiers_are_not_disease_phenotypes(self):
+        # The ATXN3 rows of genes_to_phenotype.txt (v2025-05-06) list genetic anticipation
+        # alongside the mode of inheritance; both are descendants of HP:0000005 Mode of
+        # inheritance, so only the ataxia remains a phenotype to compare patients against.
+        path = _write(
+            "ncbi_gene_id\tgene_symbol\thpo_id\thpo_name\tfrequency\tdisease_id\n"
+            "4287\tATXN3\tHP:0000006\tAutosomal dominant inheritance\t-\tOMIM:109150\n"
+            "4287\tATXN3\tHP:0003743\tGenetic anticipation\t-\tOMIM:109150\n"
+            "4287\tATXN3\tHP:0001251\tAtaxia\t57/57\tOMIM:109150\n",
+            suffix=".txt")
+        self.addCleanup(os.remove, path)
+        entry = input_tables.read_gene_disease_phenotypes(path)["ATXN3"]["OMIM:109150"]
+        self.assertEqual(entry["inheritance"], {"AD"})
+        self.assertEqual(entry["phenotypes"], {"HP:0001251"})
+
 
 class AnnotationColumnPrefixTests(unittest.TestCase):
-    """DP4: a sample column named like a cohort must not be swallowed as annotation."""
+    """A sample column named like a cohort must not be swallowed as annotation."""
 
     def test_bare_cohort_sample_ids_are_samples(self):
         self.assertIsNone(input_tables._is_annotation_column("AoU_0001"))

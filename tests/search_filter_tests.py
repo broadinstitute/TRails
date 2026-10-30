@@ -1,7 +1,7 @@
 """Unit tests for the merged Search box, the variation cluster filters and the population filters.
 
-The Search box replaced four separate filters (Gene Symbol(s), Gene ID, Locus Id(s) and
-Reference Region), so the two things worth pinning down are:
+The Search box takes gene symbols, gene ids, locus ids and reference regions in one field, so
+the two things worth pinning down are:
 
   * classify_search_term(), which decides what each comma-separated term is from its shape, and
   * the WHERE clause build_api_query() produces, where terms OR together rather than AND.
@@ -107,8 +107,9 @@ class ClassifySearchTermTests(unittest.TestCase):
             self.assertEqual((kind, value), ("gene_symbol", term), term)
 
     def test_gene_id_normalization_helper(self):
-        # The legacy ?gene_id= parameter runs through the same normalization as a search term, so
-        # both paths match the stored spelling rather than one silently returning nothing.
+        # The ?gene_id= parameter, for direct API callers, runs through the same normalization as a
+        # search term, so both paths match the stored spelling rather than one silently returning
+        # nothing.
         self.assertEqual(results_server.normalize_gene_id("ensg00000102081"), "ENSG00000102081")
         self.assertEqual(results_server.normalize_gene_id("ENSG00000102081.5"), "ENSG00000102081")
         self.assertEqual(results_server.normalize_gene_id("  ENSG00000102081  "), "ENSG00000102081")
@@ -172,15 +173,14 @@ class SearchQueryTests(unittest.TestCase):
         self.assertEqual(self._search("chrX"), {"X-300-310-CCG"})
 
     def test_terms_of_different_kinds_are_ored(self):
-        # The whole point of the merged box: a locus matching any one term is kept, where the
-        # four separate filters would have required a locus to satisfy all of them at once.
+        # A locus matching any one term is kept: terms of different kinds are ORed, not ANDed.
         self.assertEqual(
             self._search("FMR1, ENSG00000197386"),
             {"1-100-110-AT", "1-500-600-CAG"})
         self.assertEqual(
             self._search("FMR1, chr2:200-201, X-300-310-CCG"),
             {"1-100-110-AT", "2-200-209-AAG", "X-300-310-CCG"})
-        # Terms that would have ANDed to nothing under the old filters.
+        # Terms no single locus satisfies together.
         self.assertEqual(
             self._search("HTT, chr2"),
             {"1-500-600-CAG", "2-200-209-AAG"})
@@ -523,8 +523,8 @@ class VariationClusterSortTests(unittest.TestCase):
             ["1-100-110-AT", "2-200-209-AAG", "3-700-712-AGGG", "X-300-310-CCG"])
 
     def test_sort_is_skipped_when_the_database_lacks_the_column(self):
-        # An older database has no such column; the sort key drops out rather than producing
-        # SQL that names a column the database does not have.
+        # A database without the column gets no such sort key, rather than SQL that names a
+        # column the database does not have.
         results_server.app.config["DB_COLUMNS_SET"] = (
             results_server.app.config["DB_COLUMNS_SET"] - {"VariationClusterSizeDiff"})
         order_by = results_server.build_api_order_by(
@@ -541,10 +541,10 @@ class VariationClusterTypeTests(unittest.TestCase):
 
     result_database.infer_column_types declares VariationClusterSizeDiff BIGINT when every value
     the build saw was an integer, which is the ordinary case, and VARCHAR as soon as one is not.
-    The fixture above hand-writes the column VARCHAR, so it never exercised the BIGINT case,
-    where comparing the column to '' raised a ConversionException and 500'd every search using
-    the filter. These tests go through result_database.write_loci_table so the declared type is
-    the one the real build chooses, and run the query build_api_query actually emits.
+    The fixture above hand-writes the column VARCHAR, so these tests cover the BIGINT column too,
+    where comparing the column to '' would raise a ConversionException. They go through
+    result_database.write_loci_table so the declared type is the one the real build chooses, and
+    run the query build_api_query actually emits.
     """
 
     COLUMNS = ["LocusId", "Chrom", "Start0Based", "End1Based", "CanonicalMotif",
@@ -707,9 +707,9 @@ class BlankFilterValueTests(EndpointConfigTestCase):
     """A filter whose value strips down to nothing must not become an empty SQL list.
 
     Each of these parameters is a comma-separated list. A value like "," is truthy as a request
-    string but parses to no entries, and emitting "LocusId IN ()" or an empty "()" for it is a
-    DuckDB syntax error, so the request 500'd. An empty list carries no information, so the
-    filter is dropped instead and the search comes back unfiltered.
+    string but parses to no entries, and "LocusId IN ()" or an empty "()" for it would be a
+    DuckDB syntax error. An empty list is treated as no filter, so the search comes back
+    unfiltered.
     """
 
     ALL_LOCUS_IDS = {locus[0] for locus in ENDPOINT_LOCI}
@@ -760,8 +760,8 @@ class VariationClusterFilterWithoutTheColumnTests(EndpointConfigTestCase):
 
     The clause keeps a locus whose variation cluster size is unknown, so a database with no
     VariationClusterSizeDiff column at all is that same situation for every locus and the filter
-    adds no clause. The swim-plot endpoint used to append "1=0" instead, which emptied the chart
-    for a request whose results table returned every locus.
+    adds no clause. Both endpoints build it with build_locus_filter_clauses, so the chart keeps
+    every locus whenever the results table does.
     """
 
     def _swim_sample_ids(self, query):
@@ -783,19 +783,15 @@ class VariationClusterFilterWithoutTheColumnTests(EndpointConfigTestCase):
         self.assertEqual(self._swim_sample_ids("max_variation_cluster_size_diff=20"),
                          {"sampleA", "sampleC"})
 
-    def test_an_unparseable_maximum_is_still_rejected(self):
-        # Dropping the "1=0" branch must not drop the 400 for a value that is not an integer.
+    def test_an_unparseable_maximum_is_rejected(self):
+        # A maximum that is not an integer is a 400 even though the column is missing.
         response = self.client.get(
             "/api/v1/swim_plot_data?outlier_type=all&max_variation_cluster_size_diff=abc")
         self.assertEqual(response.status_code, 400)
 
 
 class DiseaseCatalogStartupTests(unittest.TestCase):
-    """Either disease catalog is enough on its own.
-
-    configure_app used to load both only when the Broad variant catalog was supplied, so a
-    STRchive-only server silently had no disease details at all.
-    """
+    """Either disease catalog is enough on its own: a STRchive file alone loads the fallback."""
 
     @classmethod
     def setUpClass(cls):
@@ -937,8 +933,8 @@ class SearchEndToEndTests(unittest.TestCase):
         return {entry["LocusId"] for entry in response.get_json()["data"]}
 
     def test_a_lowercase_locus_id_is_found(self):
-        # The stored id spells its motif in lower case, which is what the input matrix wrote.
-        # Upper-casing the motif before comparing made this search return nothing at all.
+        # The stored id spells its motif in lower case, which is what the input matrix wrote, and
+        # that stored spelling is found.
         self.assertEqual(self._loci("chr1-1-10-cag"), {"chr1-1-10-cag"})
         self.assertEqual(self._swim_locus_ids("chr1-1-10-cag"), {"chr1-1-10-cag"})
 

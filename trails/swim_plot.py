@@ -7,34 +7,32 @@ exactly one row per outlier entry, per outlier type, enriched with the sample's
 metadata (family / sex / affected status / analysis status / phenotype / purity /
 methylation) and a fixed set of locus-level passthrough columns.
 
-This is a faithful, standalone port of ``generate_swim_plot_table`` in the
-reference ``analyze_results.py``. The reference iterated a pandas DataFrame; here
-the input is the in-memory list of locus dicts produced by the earlier build
-stages, so there is no pandas dependency.
-
-Two behaviors carried over verbatim from the reference:
+The input is the in-memory list of locus dicts produced by the earlier build
+stages, so there is no pandas dependency. Per row:
 
   * ``outlier_rank`` is 1-based in the order ``parse_outlier_entries`` yields,
     which is DESCENDING by allele size — so rank 1 is the largest allele.
   * ``motif_category`` bins motif size as ``"{size}bp"`` for sizes <= 24, else
     ``"25+bp"``; a missing motif size becomes ``"Unknown"``.
-
-The reference re-split the raw outlier entry to recover purity/methylation; here
-``parse_outlier_entries`` already returns them as the 3rd/4th tuple fields (with a
-literal ``"."`` mapped to None), so this module consumes them directly.
+  * ``purity`` and ``methylation`` are the 3rd/4th fields ``parse_outlier_entries``
+    returns for each entry (None when absent or a literal ``"."``), as floats.
+  * A blank family_id, sex or phenotype_description is stored as NULL, as in the
+    other tables (``analysis_columns.blank_to_none``).
 """
 
 from locus_annotations import BLANK_STATUS_VALUES
 from analysis_columns import (
     OUTLIER_TYPES,
+    blank_to_none,
+    get_family_id,
     is_above_unaffected,
     is_missing_outlier_value,
+    is_none_or_nan,
     parse_outlier_entries,
 )
 
 
-# Locus-level columns copied verbatim onto every swim-plot row (matching the
-# reference's locus_columns list, in order).
+# Locus-level columns copied verbatim onto every swim-plot row, in order.
 SWIM_PLOT_LOCUS_COLUMNS = [
     "LocusId",
     "Motif",
@@ -69,11 +67,6 @@ SWIM_PLOT_COLUMNS = [
 ] + SWIM_PLOT_LOCUS_COLUMNS
 
 
-def _is_missing(value):
-    """Return True if value is None or a float NaN (NaN is never equal to itself)."""
-    return value is None or (isinstance(value, float) and value != value)
-
-
 def _compute_motif_category(motif_size):
     """Bin a motif size into the swim-plot motif_category label.
 
@@ -89,7 +82,7 @@ def _compute_motif_category(motif_size):
     queries only ``1bp``..``24bp``, ``25+bp`` and ``Unknown``, so it would never
     ask for them.
     """
-    if _is_missing(motif_size) or int(motif_size) <= 0:
+    if is_none_or_nan(motif_size) or int(motif_size) <= 0:
         return "Unknown"
     if int(motif_size) <= 24:
         return f"{int(motif_size)}bp"
@@ -106,7 +99,7 @@ def _normalize_affected_status(raw_affected):
         "Affected"/"Unaffected" for those exact (case-insensitive) values,
         otherwise the Title-cased value, or "Unknown" when missing/blank.
     """
-    if _is_missing(raw_affected):
+    if is_none_or_nan(raw_affected):
         return "Unknown"
     normalized = str(raw_affected).strip().lower()
     if normalized == "affected":
@@ -130,7 +123,7 @@ def _normalize_analysis_status(raw_analysis):
         "Solved"/"Unsolved"/"Unaffected" for those exact (case-insensitive)
         values, otherwise the Title-cased value, or "Unknown" when missing/blank.
     """
-    if _is_missing(raw_analysis):
+    if is_none_or_nan(raw_analysis):
         return "Unknown"
     normalized = str(raw_analysis).strip().lower()
     if normalized == "solved":
@@ -157,7 +150,7 @@ def _parse_stat_value(raw_value):
     Returns:
         The float value, or None if missing / non-numeric.
     """
-    if raw_value is None or raw_value == ".":
+    if raw_value is None:
         return None
     try:
         return float(raw_value)
@@ -202,25 +195,20 @@ def generate_swim_plot_table(records, sample_lookup, affected_lookup, analysis_l
             motif_category = _compute_motif_category(record.get("MotifSize"))
 
             first_unaffected = record.get(f"FirstUnaffectedAlleleSize_{outlier_type}")
-            first_unaffected = None if _is_missing(first_unaffected) else int(first_unaffected)
+            first_unaffected = None if is_none_or_nan(first_unaffected) else int(first_unaffected)
 
             for rank, (allele_size, sample_id, purity, methylation) in enumerate(
                 parse_outlier_entries(outlier_value, locus_id=record.get("LocusId"), column=column),
                 start=1,
             ):
                 sample_row = sample_lookup.get(sample_id)
-                phenotype_description = sample_row.get("phenotype_description") if sample_row else None
-                if _is_missing(phenotype_description) or (isinstance(phenotype_description, str) and not phenotype_description.strip()):
-                    # read_sample_metadata uses keep_default_na=False, so a blank
-                    # cell arrives as '' (never None/NaN); normalize it to NULL.
-                    phenotype_description = None
 
                 # Prefer the raw sample-row affected_status so "possibly affected" is
                 # preserved for display; affected_lookup collapses it to "affected"
                 # (that collapsed value is only for analysis logic). Fall back to
                 # affected_lookup when the sample row or its field is missing.
                 raw_affected = sample_row.get("affected_status") if sample_row else None
-                if _is_missing(raw_affected):
+                if is_none_or_nan(raw_affected):
                     raw_affected = affected_lookup.get(sample_id)
 
                 row = {
@@ -230,11 +218,12 @@ def generate_swim_plot_table(records, sample_lookup, affected_lookup, analysis_l
                     "SourceDb": record.get("Source"),
                     "allele_size": allele_size,
                     "sample_id": sample_id,
-                    "family_id": sample_row.get("family_id") if sample_row else None,
+                    "family_id": get_family_id(sample_id, sample_lookup),
                     "affected_status": _normalize_affected_status(raw_affected),
                     "analysis_status": _normalize_analysis_status(analysis_lookup.get(sample_id)),
-                    "sex": sample_row.get("sex") if sample_row else None,
-                    "phenotype_description": phenotype_description,
+                    "sex": blank_to_none(sample_row.get("sex")) if sample_row else None,
+                    "phenotype_description": (
+                        blank_to_none(sample_row.get("phenotype_description")) if sample_row else None),
                     "purity": _parse_stat_value(purity),
                     "methylation": _parse_stat_value(methylation),
                     "FirstUnaffectedAlleleSize": first_unaffected,

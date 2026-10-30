@@ -26,13 +26,12 @@ class ParseGenotypeTests(unittest.TestCase):
         self.assertEqual(parse_genotype("  10,11 "), (10, 11))
 
     def test_no_call_values_return_none(self):
-        for cell in ("", ".", "./.", "nan", "NaN", "NA", None):
+        for cell in ("", ".", "./.", "  ", None):
             self.assertIsNone(parse_genotype(cell), msg=cell)
 
     def test_unparseable_returns_none(self):
-        self.assertIsNone(parse_genotype("abc"))
-        self.assertIsNone(parse_genotype("1,2,3"))
-        self.assertIsNone(parse_genotype("1.5"))
+        for cell in ("abc", "1,2,3", "1.5", "12,x", "nan", "NaN", "NA"):
+            self.assertIsNone(parse_genotype(cell), msg=cell)
 
 
 class HistogramStringTests(unittest.TestCase):
@@ -50,21 +49,21 @@ class HistogramStringTests(unittest.TestCase):
 class AccumulateLocusTests(unittest.TestCase):
 
     def test_diploid_10_11(self):
-        """Blueprint worked example: diploid 10,11."""
+        """A diploid 10,11 adds both alleles to All, the short one to Short, nothing to Hemizygous."""
         all_pair, short_pair, hemizygous_pair = accumulate_locus({"s1": "10,11"})
         self.assertEqual(convert_counts_to_histogram_string(all_pair[0]), "10x:1,11x:1")
         self.assertEqual(convert_counts_to_histogram_string(short_pair[0]), "10x:1")
         self.assertEqual(convert_counts_to_histogram_string(hemizygous_pair[0]), "")
 
     def test_hemizygous_3(self):
-        """Blueprint worked example: hemizygous 3 -> all three histograms 3x:1."""
+        """A hemizygous 3 gives 3x:1 in all three histograms."""
         all_pair, short_pair, hemizygous_pair = accumulate_locus({"s1": "3"})
         self.assertEqual(convert_counts_to_histogram_string(all_pair[0]), "3x:1")
         self.assertEqual(convert_counts_to_histogram_string(short_pair[0]), "3x:1")
         self.assertEqual(convert_counts_to_histogram_string(hemizygous_pair[0]), "3x:1")
 
     def test_homozygous_double_counts_in_all_and_short_single(self):
-        """Reference docstring example: 2,2 -> All '2x:2', Short '2x:1'."""
+        """A homozygous 2,2 gives All '2x:2' and Short '2x:1'."""
         all_pair, short_pair, hemizygous_pair = accumulate_locus({"s1": "2,2"})
         self.assertEqual(convert_counts_to_histogram_string(all_pair[0]), "2x:2")
         self.assertEqual(convert_counts_to_histogram_string(short_pair[0]), "2x:1")

@@ -6,27 +6,37 @@ fetches TRExplorer's population statistics and locus annotations, and genelookup
 (without OMIM's licensed columns, which genelookup does not export). Your own (class-C) tables
 are never fetched here.
 
-CLI:
-    python3 trails/trails_setup.py [fetch] [--dir reference_data] [--remote] [--force]
+CLI, from the TRails directory (the TRExplorer step needs the packages in .venv/):
+    .venv/bin/python trails/trails_setup.py [fetch] [--dir reference_data] [--remote] [--force]
 """
 
 import argparse
 import gzip
 import json
 import os
+import urllib.parse
 import urllib.request
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # reference_data/ sits in the TRails directory, one level above this trails/ code directory
 DEFAULT_REFERENCE_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "reference_data")
 
-# Pinned public sources — bump these versions deliberately. Every URL below resolves to an
-# immutable ref (a release tag or a commit sha) so that two installs made at different times build
-# the same database from the same cohort; a "main" URL would silently change the annotations.
+# Pinned public sources: bump these versions deliberately. Every URL below except genelookup's
+# resolves to an immutable ref (a release tag or a commit sha), so that two installs made at
+# different times build the same database from the same cohort; a "main" URL would silently change
+# the annotations. genelookup's gene table is not versioned (see below), so it is the one input
+# that can differ between two installs.
 HPO_RELEASE = "v2025-05-06"   # Human Phenotype Ontology annotation release tag
 STR_ANALYSIS_COMMIT = "15c642927de66703dcaf5ec92fb08ee8249dc745"   # broadinstitute/str-analysis
 STRCHIVE_COMMIT = "d7961b2c3bbc13cbcb256c19ddbf8779f7e76ca6"       # dashnowlab/STRchive
 TREXPLORER_CATALOG_VERSION = "v2.1"   # TRExplorer repeat catalog release (gs://tandem-repeat-catalog)
+
+# The format of the database trexplorer_annotations.build_trexplorer_annotations_database builds
+# from TRExplorer's table. Bump it whenever a change to trexplorer_annotations.py changes which
+# columns that database keeps or how it builds them. It is part of the source the
+# reference-versions manifest records for the database, so a bump makes existing installs rebuild
+# their copy instead of reading columns it does not have.
+TREXPLORER_ANNOTATIONS_DATABASE_FORMAT_VERSION = 1
 
 TREXPLORER_ANNOTATIONS_TSV_URL = (
     f"https://storage.googleapis.com/tandem-repeat-catalog/{TREXPLORER_CATALOG_VERSION}/"
@@ -53,15 +63,18 @@ def _download(url, dest):
     os.replace(tmp, dest)
 
 
-def _download_trexplorer_annotations(url, dest):
+def _download_trexplorer_annotations(source, dest):
     """Download TRExplorer's annotated catalog table and keep the columns TRails uses in dest.
 
-    The table is about 900 MB; only the much smaller database built from it is kept.
+    The table is about 900 MB; only the much smaller database built from it is kept. source is
+    the table's URL plus a "#database_format=N" fragment, which only the reference-versions
+    manifest uses; it is dropped before downloading.
     """
     # Imported here so that the rest of this module, and --remote, work before the Python
     # dependencies (duckdb, pandas) are installed.
     import trexplorer_annotations
 
+    url = urllib.parse.urldefrag(source).url
     downloaded_table = dest + ".download.tsv.gz"
     print(f"    downloading {url} (about 900 MB) ...")
     try:
@@ -107,19 +120,22 @@ REFERENCE_FILES = [
     ("STRchive-loci.json",
      f"https://raw.githubusercontent.com/dashnowlab/STRchive/{STRCHIVE_COMMIT}/data/STRchive-loci.json",
      _download),
-    (TREXPLORER_ANNOTATIONS_DATABASE_NAME, TREXPLORER_ANNOTATIONS_TSV_URL, _download_trexplorer_annotations),
+    (TREXPLORER_ANNOTATIONS_DATABASE_NAME,
+     f"{TREXPLORER_ANNOTATIONS_TSV_URL}#database_format={TREXPLORER_ANNOTATIONS_DATABASE_FORMAT_VERSION}",
+     _download_trexplorer_annotations),
     (GENELOOKUP_GENE_TABLE_NAME, GENELOOKUP_GENE_TABLE_SQL, _export_genelookup_gene_table),
 ]
 
 
-# Records which URL each cached reference file came from. Without it, bumping a pin above would
-# leave every existing install on its old copy (the filenames do not change), which is exactly the
-# reproducibility the pins are meant to provide.
+# Records which source each cached reference file came from (for TRExplorer's database, the table
+# URL plus the database format). Without it, bumping a pin above would leave every existing install
+# on its old copy (the filenames do not change), which is exactly the reproducibility the pins are
+# meant to provide.
 CACHE_MANIFEST_NAME = ".reference_versions.json"
 
 
 def _read_cache_manifest(dest_dir):
-    """Return {filename: source url} for the cached reference files, or {} if unknown."""
+    """Return {filename: source} for the cached reference files, or {} if unknown."""
     try:
         with open(os.path.join(dest_dir, CACHE_MANIFEST_NAME)) as f:
             return json.load(f)

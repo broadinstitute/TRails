@@ -1,4 +1,4 @@
-"""TRails tests. Run from the TRails directory with: python3 -m unittest discover -p '*tests.py'
+"""TRails tests. Run from the TRails directory with: .venv/bin/python -m unittest discover -p '*tests.py'
 
 The code lives in ../trails/ and its modules import each other by bare name, so it goes on the
 import path here, before any test module is loaded.

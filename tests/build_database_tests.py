@@ -135,7 +135,7 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
                 loci_columns,
                 [c for c in analysis_columns.OUTPUT_COLUMNS if c in set(loci_columns)])
 
-            # Core Tier-A columns must be present and populated.
+            # Core locus columns must be present and populated.
             for required_column in ["LocusId", "Motif", "CanonicalMotif",
                                     "AllAlleleHistogram", "OutlierSampleIds_AllAlleles",
                                     "Chrom", "Start0Based", "End1Based"]:
@@ -286,7 +286,7 @@ class AffectedUnsolvedOutliersTableTests(unittest.TestCase):
             connection.close()
 
     def assert_table_agrees_with_counts(self, stored_counts, counts_implied_by_table):
-        """Checks every (locus, outlier type), the way add_affected_unsolved_outliers_table.py does."""
+        """Checks that every (locus, outlier type) count matches the rows of the outlier table."""
         self.assertEqual(len(stored_counts), 3 * len(analysis_columns.OUTLIER_TYPES))
         for key, (sample_count, family_count) in stored_counts.items():
             # A NULL count (no outlier list) and a count of 0 both mean no rows.
@@ -328,6 +328,45 @@ class AffectedUnsolvedOutliersTableTests(unittest.TestCase):
             ("chr1-1000-1030-CAG", "AllAlleles", "A4", None, 45),
             ("chr1-1000-1030-CAG", "AllAlleles", "GHOST", None, 58),
         ])
+
+
+class StrchiveOnlyCatalogTests(unittest.TestCase):
+    """A STRchive catalog on its own, with no known-loci catalog, still annotates known loci."""
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.matrix_path = os.path.join(self.directory, "matrix.tsv")
+        self.metadata_path = os.path.join(self.directory, "samples.tsv")
+        self.strchive_path = os.path.join(self.directory, "strchive.json")
+        self.db_path = os.path.join(self.directory, "result.duckdb")
+
+        _write_tsv(self.matrix_path, ["trid", "motif", "S1", "S2"],
+                   [["chr2-499-530-CAG", "CAG", "10,11", "10,12"]])
+        _write_tsv(self.metadata_path, ["sample_id", "sex", "affected_status"],
+                   [["S1", "male", "affected"], ["S2", "female", "unaffected"]])
+        with open(self.strchive_path, "w") as handle:
+            handle.write(
+                '[{"locus_id": "STR_A", "disease": "DiseaseA", "chrom": "chr2", '
+                '"start_hg38": 500, "stop_hg38": 530, '
+                '"reference_motif_reference_orientation": ["CAG"]}]')
+
+    def tearDown(self):
+        for name in os.listdir(self.directory):
+            os.remove(os.path.join(self.directory, name))
+        os.rmdir(self.directory)
+
+    def test_a_locus_in_the_strchive_catalog_gets_its_known_disease_locus(self):
+        build_database.build(
+            self.matrix_path, self.metadata_path, self.db_path,
+            strchive_loci_json=self.strchive_path)
+        connection = duckdb_compat.connect(self.db_path)
+        try:
+            value = connection.execute(
+                "SELECT KnownDiseaseLocus FROM loci WHERE LocusId = 'chr2-499-530-CAG'"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(value, "STR_A")
 
 
 if __name__ == "__main__":

@@ -61,7 +61,7 @@ def build_test_database(directory, with_outliers_table=True, population_gate_coh
         directory: Directory to write the database and the sample table into.
         with_outliers_table: Whether to write AFFECTED_UNSOLVED_OUTLIERS_TABLE.
         population_gate_cohorts: Cohorts to record as the build's population gate, or None to
-            record none, as a database built before the gate was recorded.
+            record none, which reads back as the default long-read cohorts.
 
     Returns:
         Tuple (database path, sample table path).
@@ -101,7 +101,7 @@ def build_test_database(directory, with_outliers_table=True, population_gate_coh
     with open(sample_table_path, "w") as f:
         f.write("sample_id\tfamily_id\tsex\taffected_status\tanalysis_status\tphenotype_description\n")
         for sample_id, (family_id, affected, analysis, phenotype) in SAMPLES.items():
-            f.write(f"{sample_id}\t{family_id}\tF\t{affected}\t{analysis}\t{phenotype}\n")
+            f.write(f"{sample_id}\t{family_id}\tfemale\t{affected}\t{analysis}\t{phenotype}\n")
     return db_path, sample_table_path
 
 
@@ -159,7 +159,7 @@ class GroupedViewTests(GroupedViewTestCase):
         self.assertEqual(rows["S1"]["best_gene_phenotype_similarity"], 0.8)
         self.assertIsNone(rows["S2"]["best_gene_phenotype_similarity"])
         self.assertEqual((rows["S6"]["affected_status"], rows["S6"]["analysis_status"]), ("Affected", "Unknown"))
-        self.assertEqual((rows["S1"]["family_id"], rows["S1"]["sex"]), ("F1", "F"))
+        self.assertEqual((rows["S1"]["family_id"], rows["S1"]["sex"]), ("F1", "female"))
         self.assertEqual(data["motif_counts"], {"AGC": 2, "AT": 1, "CCG": 1})
         self.assertEqual(data["gene_region_counts"], {"CDS": 3, "intron": 1})
 
@@ -293,7 +293,7 @@ class GroupedViewTests(GroupedViewTestCase):
         self.assertIn("3_families", response.headers["Content-Disposition"])
         f1 = rows[0]
         self.assertEqual((f1["family_id"], f1["num_samples"], f1["num_loci"]), ("F1", "2", "3"))
-        self.assertEqual(f1["samples"], "S1 (F, Affected/Unsolved); S2 (F, Affected/Unsolved)")
+        self.assertEqual(f1["samples"], "S1 (female, Affected/Unsolved); S2 (female, Affected/Unsolved)")
         self.assertEqual(f1["phenotypes"], "seizures, ataxia | ataxia")
 
     def test_export_one_row_per_sample_and_locus(self):

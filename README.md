@@ -209,8 +209,8 @@ python3 -m venv .venv
 - `trails/`: the code: the database build (`build_database.py` and the modules it imports),
   the results server (`results_server.py`) and its page templates (`*_template.html`), and the
   reference-data download (`trails_setup.py`).
-- `tests/`: unit tests. Run them from the TRails directory with
-  `python3 -m unittest discover -p '*tests.py'`.
+- `tests/`: unit tests. Run them from the TRails directory, with the Python of the virtual
+  environment that holds the dependencies: `.venv/bin/python -m unittest discover -p '*tests.py'`.
 - `docs/INPUT_FORMATS.md`: input and database schemas.
 - `install.sh`: the installer. `reference_data/` and `.venv/` are created by the install.
 

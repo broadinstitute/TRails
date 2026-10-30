@@ -10,15 +10,10 @@ samples those counts count. It also adds the gene-derived ``pLI`` /
 ``inheritance`` columns, and exposes the exact 131-name ordered
 ``OUTPUT_COLUMNS`` list that defines the loci table.
 
-It is a faithful, standalone port of the corresponding logic in the reference
-``analyze_results.py`` (parse_outlier_entries, is_unaffected_or_solved_status,
-collect_samples_single_pass, the NumAffectedUnsolved* helpers, the population
-gate, list_affected_unsolved_outliers, add_gene_columns, add_all_outlier_columns,
-OUTPUT_COLUMNS). The reference operated on a pandas
-DataFrame; here the in-memory representation is a list of dicts (one dict per
-locus), so there is no pandas dependency and the algorithms are dict-native.
+The in-memory representation is a list of dicts (one dict per locus), so there is
+no pandas dependency and the algorithms are dict-native.
 
-Two behaviors worth calling out, both load-bearing and matching the reference:
+Two behaviors worth calling out, both load-bearing:
 
   * ``parse_outlier_entries`` sorts entries DESCENDING by allele size, so the
     "First" affected/unaffected sample is the one carrying the LARGEST allele.
@@ -39,7 +34,7 @@ OUTLIER_TYPES = ["AllAlleles", "ShortAlleles", "HemizygousAlleles"]
 MISSING_OUTLIER_STRINGS = {"", "NA", "N/A", "nan", "NaN", "None", "null"}
 
 # The cohorts whose 99th percentiles gate the NumAffectedUnsolved* counts and the phenotype
-# scores by default (get_population_p99_threshold, is_above_population_p99): the long-read
+# scores by default (get_population_p99_threshold): the long-read
 # ones, the same cohorts as the server's long-read above-population filter.
 # build_database --population-gate-cohorts replaces it for one build, e.g. to add TenK10K
 # (short-read ExpansionHunter calls) for a short-read callset. The build records the cohorts
@@ -57,9 +52,27 @@ def _is_nan(value):
     return isinstance(value, float) and value != value
 
 
-def _is_missing(value):
+def is_none_or_nan(value):
     """Return True if value is None or a float NaN."""
     return value is None or _is_nan(value)
+
+
+def blank_to_none(value):
+    """Return None for a missing or blank value, else the value unchanged.
+
+    read_sample_metadata reads with keep_default_na=False, so an empty metadata cell
+    arrives as '' rather than None or NaN. This maps all three, and a whitespace-only
+    string, to None, so every table stores a blank metadata field as NULL.
+
+    Args:
+        value: A metadata value (a string, None, or a float NaN).
+
+    Returns:
+        None for None, a float NaN, or a string that is empty after stripping; otherwise value.
+    """
+    if is_none_or_nan(value) or (isinstance(value, str) and not value.strip()):
+        return None
+    return value
 
 
 def is_missing_outlier_value(value):
@@ -72,7 +85,7 @@ def is_missing_outlier_value(value):
         True for None, a float NaN, or a string that (stripped) is one of the
         recognized missing markers (``""``, ``"."``, ``"NA"``, ``"nan"``, ...).
     """
-    if _is_missing(value):
+    if is_none_or_nan(value):
         return True
     if isinstance(value, str) and value.strip() in MISSING_OUTLIER_STRINGS:
         return True
@@ -171,32 +184,6 @@ def is_unaffected_or_solved_status(affected_status, analysis_status):
     }
 
 
-def is_affected_unsolved(sample_id, affected_lookup, analysis_lookup):
-    """Return True if a sample is affected AND not solved.
-
-    Exact logical complement of ``is_unaffected_or_solved_status`` so the
-    phenotype-scoring path and the outlier-count/ranking paths share the same
-    affected/unsolved membership. Any sample that is not explicitly "unaffected"
-    and not solved is treated as affected/unsolved — including
-    affected_status="unknown" samples.
-
-    Args:
-        sample_id: The sample identifier to look up.
-        affected_lookup: Mapping of sample_id -> affected_status.
-        analysis_lookup: Mapping of sample_id -> analysis_status.
-
-    Returns:
-        bool: True if the sample is affected and unsolved.
-    """
-    affected_normalized = str(affected_lookup.get(sample_id, "")).strip().lower()
-    analysis_normalized = str(analysis_lookup.get(sample_id, "")).strip().lower()
-    if affected_normalized == "unaffected":
-        return False
-    if analysis_normalized in ("solved", "probably solved", "unaffected"):
-        return False
-    return True
-
-
 def parse_population_gate_cohorts(comma_separated_cohorts):
     """Split a --population-gate-cohorts value into the cohort names it lists.
 
@@ -237,7 +224,7 @@ def get_population_p99_threshold(row, population_gate_cohorts=POPULATION_P99_GAT
         float/int or None: The maximum p99 threshold, or None if unavailable.
     """
     candidate_values = [row.get(f"{cohort}_99thPercentile") for cohort in population_gate_cohorts]
-    valid_values = [value for value in candidate_values if not _is_missing(value)]
+    valid_values = [value for value in candidate_values if not is_none_or_nan(value)]
     if not valid_values:
         return None
     return max(valid_values)
@@ -259,32 +246,28 @@ def is_above_unaffected(allele_size, row, outlier_type):
         bool: True if the allele exceeds the first (largest) unaffected allele.
     """
     first_unaffected = row.get(f"FirstUnaffectedAlleleSize_{outlier_type}")
-    if _is_missing(first_unaffected):
+    if is_none_or_nan(first_unaffected):
         return allele_size > 0
     return allele_size > first_unaffected
 
 
-def is_above_population_p99(allele_size, row, population_gate_cohorts=POPULATION_P99_GATE_COHORTS):
-    """Return True if allele_size exceeds every available cohort's 99th percentile.
-
-    If no cohort has data, the sample is included (returns True). Otherwise the
-    allele must strictly exceed each available cohort's 99th percentile.
+def parse_outlier_entries_by_type(record):
+    """Parse each of a locus record's three OutlierSampleIds_* strings.
 
     Args:
-        allele_size: The outlier's allele size.
-        row: A locus record dict carrying the *_99thPercentile columns.
-        population_gate_cohorts: The cohorts whose 99th percentiles the allele must
-            exceed (see ``get_population_p99_threshold``).
+        record: A locus record dict carrying OutlierSampleIds_* and LocusId.
 
     Returns:
-        bool: True if the allele exceeds the population p99 thresholds (or no
-        data is available).
+        dict: outlier_type -> the ``parse_outlier_entries`` list for that type's column.
     """
-    candidate_values = [row.get(f"{cohort}_99thPercentile") for cohort in population_gate_cohorts]
-    valid_values = [value for value in candidate_values if not _is_missing(value)]
-    if not valid_values:
-        return True
-    return all(allele_size > value for value in valid_values)
+    return {
+        outlier_type: parse_outlier_entries(
+            record.get(f"OutlierSampleIds_{outlier_type}"),
+            locus_id=record.get("LocusId"),
+            column=f"OutlierSampleIds_{outlier_type}",
+        )
+        for outlier_type in OUTLIER_TYPES
+    }
 
 
 def find_affected_unsolved_samples_above_unaffected(row, affected_lookup, analysis_lookup, parsed_by_type,
@@ -292,9 +275,8 @@ def find_affected_unsolved_samples_above_unaffected(row, affected_lookup, analys
     """Find the affected/unsolved samples above any unaffected/solved sample, per outlier type.
 
     For each outlier type, walking the entries largest-allele-first:
-      1. Collect affected/unsolved sample ids per allele size (a set, so a
-         diploid/homozygous sample that appears at two allele sizes is not
-         double-counted), stopping at the FIRST unaffected/solved sample.
+      1. Collect affected/unsolved sample ids per allele size, in the order the
+         entries list them, stopping at the FIRST unaffected/solved sample.
       2. Keep the affected sample ids over allele sizes from largest to smallest,
          stopping when an allele has an unaffected/solved sample (a tie is NOT
          "above") OR when the allele size is <= the population p99 threshold. A
@@ -305,7 +287,7 @@ def find_affected_unsolved_samples_above_unaffected(row, affected_lookup, analys
     ``count_affected_unsolved_samples_and_families``). The
     affected_unsolved_outliers_above_unaffected table lists them (see
     ``list_affected_unsolved_outliers``), so the results server can group loci by
-    sample or family.
+    sample or family, and phenotype_scoring scores the ones that have HPO terms.
 
     Args:
         row: A locus record dict carrying OutlierSampleIds_* and the percentile
@@ -319,28 +301,29 @@ def find_affected_unsolved_samples_above_unaffected(row, affected_lookup, analys
 
     Returns:
         list: [AllAlleles, ShortAlleles, HemizygousAlleles], each a dict mapping
-        sample_id to the sample's largest allele size above the thresholds, or None
-        when that outlier column is missing.
+        sample_id to the sample's largest allele size above the thresholds, in
+        descending allele order (samples sharing an allele size in the order the
+        entries list them), or None when that outlier column is missing.
     """
     samples_for_each_outlier_type = [None, None, None]
     population_p99_threshold = get_population_p99_threshold(row, population_gate_cohorts)
 
     for outlier_type_index, outlier_type in enumerate(OUTLIER_TYPES):
-        column = f"OutlierSampleIds_{outlier_type}"
-        if is_missing_outlier_value(row.get(column)) or not row.get(column):
+        if is_missing_outlier_value(row.get(f"OutlierSampleIds_{outlier_type}")):
             continue
 
-        allele_size_to_affected_unsolved_samples = collections.defaultdict(set)
+        # The inner dicts are ordered sets (values unused), so samples that share an allele
+        # size keep the entries' order and the result does not depend on set iteration order.
+        allele_size_to_affected_unsolved_samples = collections.defaultdict(dict)
         allele_size_to_unaffected_or_solved_sample_count = collections.Counter()
 
         for allele_size, outlier_sample_id, _, _ in parsed_by_type[outlier_type]:
             if is_unaffected_or_solved_status(
-                str(affected_lookup.get(outlier_sample_id, "") or ""),
-                str(analysis_lookup.get(outlier_sample_id, "") or ""),
+                affected_lookup.get(outlier_sample_id), analysis_lookup.get(outlier_sample_id),
             ):
                 allele_size_to_unaffected_or_solved_sample_count[allele_size] += 1
                 break
-            allele_size_to_affected_unsolved_samples[allele_size].add(outlier_sample_id)
+            allele_size_to_affected_unsolved_samples[allele_size][outlier_sample_id] = None
 
         sample_to_allele_size = {}
         for allele_size, sample_ids in sorted(
@@ -366,13 +349,11 @@ def get_family_id(sample_id, sample_lookup):
         sample_lookup: Mapping of sample_id -> sample row dict.
 
     Returns:
-        The family_id, or None for a sample with no metadata row or a blank/NaN family_id.
+        The family_id, or None for a sample with no metadata row or a blank/NaN family_id
+        (see ``blank_to_none``).
     """
     sample_row = sample_lookup.get(sample_id)
-    family_id = sample_row.get("family_id") if sample_row else None
-    if not family_id or _is_missing(family_id):
-        return None
-    return family_id
+    return blank_to_none(sample_row.get("family_id")) if sample_row else None
 
 
 def count_affected_unsolved_samples_and_families(samples_for_each_outlier_type, sample_lookup):
@@ -466,12 +447,11 @@ def collect_samples_single_pass(outlier_entries, sample_lookup, affected_lookup,
         sample_row = sample_lookup.get(sample_id) or {}
         family_id = sample_row.get("family_id")
         phenotype = sample_row.get("phenotype_description")
-        if _is_missing(phenotype):
+        if is_none_or_nan(phenotype):
             phenotype = ""
 
         category = "unaffected" if is_unaffected_or_solved_status(
-            str(affected_lookup.get(sample_id, "") or ""),
-            str(analysis_lookup.get(sample_id, "") or ""),
+            affected_lookup.get(sample_id), analysis_lookup.get(sample_id),
         ) else "affected"
         max_needed = 2 if category == "unaffected" else 3
 
@@ -487,7 +467,7 @@ def collect_samples_single_pass(outlier_entries, sample_lookup, affected_lookup,
             if len(results["sample_id"][category]) < max_needed:
                 results["sample_id"][category].append(entry)
 
-        if family_id and not _is_missing(family_id):
+        if family_id and not is_none_or_nan(family_id):
             if family_id not in seen_family_ids[category]:
                 seen_family_ids[category].add(family_id)
                 if len(results["family_id"][category]) < max_needed:
@@ -550,14 +530,7 @@ def add_all_outlier_columns(records, sample_lookup, affected_lookup, analysis_lo
         for name in column_names:
             record[name] = None
 
-        parsed_by_type = {
-            ot: parse_outlier_entries(
-                record.get(f"OutlierSampleIds_{ot}"),
-                locus_id=record.get("LocusId"),
-                column=f"OutlierSampleIds_{ot}",
-            )
-            for ot in OUTLIER_TYPES
-        }
+        parsed_by_type = parse_outlier_entries_by_type(record)
 
         # Find the samples NumAffectedUnsolved{Samples,Families}AboveUnaffected count, once for
         # all outlier types, and record them for the affected_unsolved_outliers_above_unaffected table
@@ -575,8 +548,7 @@ def add_all_outlier_columns(records, sample_lookup, affected_lookup, analysis_lo
             record[f"NumAffectedUnsolvedSamplesAboveUnaffected_{outlier_type}"] = num_affected_samples[outlier_type_index]
             record[f"NumAffectedUnsolvedFamiliesAboveUnaffected_{outlier_type}"] = num_affected_families[outlier_type_index]
 
-            column = f"OutlierSampleIds_{outlier_type}"
-            if is_missing_outlier_value(record.get(column)) or not record.get(column):
+            if is_missing_outlier_value(record.get(f"OutlierSampleIds_{outlier_type}")):
                 continue
 
             collected = collect_samples_single_pass(
@@ -653,7 +625,7 @@ def add_gene_columns(records, gene_lookup):
     """
     for record in records:
         gene_id = record.get("gene_id")
-        gene_row = gene_lookup.get(gene_id) if gene_lookup and not _is_missing(gene_id) else None
+        gene_row = gene_lookup.get(gene_id) if gene_lookup and not is_none_or_nan(gene_id) else None
 
         if gene_row is None:
             record["pLI"] = None
@@ -664,11 +636,11 @@ def add_gene_columns(records, gene_lookup):
 
         pli_v2 = gene_row.get("pLI_v2")
         pli_v4 = gene_row.get("pLI_v4")
-        if not _is_missing(pli_v4) and not _is_missing(pli_v2):
+        if not is_none_or_nan(pli_v4) and not is_none_or_nan(pli_v2):
             record["pLI"] = max(float(pli_v4), float(pli_v2))
-        elif not _is_missing(pli_v4):
+        elif not is_none_or_nan(pli_v4):
             record["pLI"] = float(pli_v4)
-        elif not _is_missing(pli_v2):
+        elif not is_none_or_nan(pli_v2):
             record["pLI"] = float(pli_v2)
         else:
             record["pLI"] = None
@@ -677,19 +649,19 @@ def add_gene_columns(records, gene_lookup):
         # NaN. Normalize it the same way pLI above and the GeneTable* columns below do, otherwise
         # a NaN reaches the loci table in a column everything else treats as string-or-None.
         inheritance = gene_row.get("inheritance")
-        record["inheritance"] = None if _is_missing(inheritance) else inheritance
+        record["inheritance"] = None if is_none_or_nan(inheritance) else inheritance
 
         # Populate the 10 GeneTable* output columns from the gene row so they
         # exist in the loci table (the server filters/selects them directly).
         for source_field, column in GENE_TABLE_COLUMN_BY_SOURCE_FIELD.items():
             value = gene_row.get(source_field)
-            record[column] = None if _is_missing(value) else value
+            record[column] = None if is_none_or_nan(value) else value
 
     return records
 
 
-# The exact 131-name ordered loci-table column list. The population-distribution-
-# stat columns are added afterward by enrichment, not part of OUTPUT_COLUMNS.
+# The ordered 131-name loci-table schema. Other per-locus annotation columns the matrix
+# supplies (e.g. HPRC256_Mode) are appended after these by result_database.write_loci_table.
 OUTPUT_COLUMNS = [
     # Core locus info
     "LocusId",

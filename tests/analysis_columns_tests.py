@@ -8,13 +8,13 @@ from analysis_columns import (
     OUTPUT_COLUMNS,
     add_all_outlier_columns,
     add_gene_columns,
+    blank_to_none,
     collect_samples_single_pass,
     count_affected_unsolved_samples_and_families,
     find_affected_unsolved_samples_above_unaffected,
+    get_family_id,
     get_population_p99_threshold,
-    is_above_population_p99,
     is_above_unaffected,
-    is_affected_unsolved,
     is_missing_outlier_value,
     is_unaffected_or_solved_status,
     list_affected_unsolved_outliers,
@@ -87,24 +87,21 @@ class StatusTruthTableTests(unittest.TestCase):
         self.assertFalse(is_unaffected_or_solved_status("unknown", "unsolved"))
         self.assertFalse(is_unaffected_or_solved_status(None, None))
 
-    def test_is_affected_unsolved_is_exact_complement(self):
-        affected_lookup = {
-            "u": "unaffected", "solved": "affected", "ps": "affected",
-            "unk": "unknown", "aff": "affected",
-        }
-        analysis_lookup = {
-            "u": "unsolved", "solved": "solved", "ps": "partially solved",
-            "unk": "unknown", "aff": "unsolved",
-        }
-        for sample_id in affected_lookup:
-            self.assertEqual(
-                is_affected_unsolved(sample_id, affected_lookup, analysis_lookup),
-                not is_unaffected_or_solved_status(
-                    affected_lookup[sample_id], analysis_lookup[sample_id]),
-                sample_id,
-            )
-        # Spot check the partially-solved-affected case is treated as affected/unsolved.
-        self.assertTrue(is_affected_unsolved("ps", affected_lookup, analysis_lookup))
+
+class BlankMetadataValueTests(unittest.TestCase):
+
+    def test_blank_to_none(self):
+        for blank in (None, float("nan"), "", "   "):
+            self.assertIsNone(blank_to_none(blank), repr(blank))
+        self.assertEqual(blank_to_none("F1"), "F1")
+        self.assertEqual(blank_to_none(" F1 "), " F1 ")
+
+    def test_get_family_id(self):
+        sample_lookup = {"a": {"family_id": "F1"}, "b": {"family_id": ""},
+                         "c": {"family_id": " "}, "d": {}}
+        self.assertEqual(get_family_id("a", sample_lookup), "F1")
+        for sample_id in ("b", "c", "d", "no_metadata_row"):
+            self.assertIsNone(get_family_id(sample_id, sample_lookup), sample_id)
 
 
 class PopulationThresholdTests(unittest.TestCase):
@@ -118,13 +115,6 @@ class PopulationThresholdTests(unittest.TestCase):
         self.assertIsNone(get_population_p99_threshold(
             {"HPRC256_99thPercentile": None, "AoU1027_99thPercentile": float("nan")}))
 
-    def test_is_above_population_p99(self):
-        row = {"HPRC256_99thPercentile": 30, "AoU1027_99thPercentile": 45}
-        self.assertFalse(is_above_population_p99(45, row))
-        self.assertTrue(is_above_population_p99(46, row))
-        # No cohort data -> include.
-        self.assertTrue(is_above_population_p99(1, {}))
-
     def test_population_gate_cohorts_choose_the_columns_read(self):
         row = {"HPRC256_99thPercentile": 30, "AoU1027_99thPercentile": 45,
                "TenK10K_99thPercentile": 60}
@@ -132,9 +122,6 @@ class PopulationThresholdTests(unittest.TestCase):
         self.assertEqual(get_population_p99_threshold(row), 45)
         self.assertEqual(get_population_p99_threshold(row, ("HPRC256",)), 30)
         self.assertEqual(get_population_p99_threshold(row, ("HPRC256", "AoU1027", "TenK10K")), 60)
-        self.assertTrue(is_above_population_p99(50, row))
-        self.assertFalse(is_above_population_p99(50, row, ("HPRC256", "AoU1027", "TenK10K")))
-        self.assertTrue(is_above_population_p99(31, row, ("HPRC256",)))
 
     def test_parse_population_gate_cohorts(self):
         self.assertEqual(parse_population_gate_cohorts("HPRC256,AoU1027"), ("HPRC256", "AoU1027"))
@@ -293,6 +280,17 @@ class NumAffectedUnsolvedSamplesTests(unittest.TestCase):
             row, affected_lookup, analysis_lookup, self._parsed(row))
         self.assertEqual(samples[0], {"a1": 50})
         self.assertEqual(self._counts(row, affected_lookup, analysis_lookup)[0][0], 1)
+
+    def test_samples_are_ordered_by_allele_then_entry_order(self):
+        # phenotype_scoring compares consecutive samples in this order, so samples that share
+        # an allele size must keep the order the outlier string lists them in.
+        sample_ids = [f"s{index}" for index in range(8)]
+        row = {"OutlierSampleIds_AllAlleles": make_outlier_string(
+            [(40, "z")] + [(30, sample_id) for sample_id in sample_ids])}
+        affected_lookup = {sample_id: "affected" for sample_id in sample_ids + ["z"]}
+        samples = find_affected_unsolved_samples_above_unaffected(
+            row, affected_lookup, {}, self._parsed(row))
+        self.assertEqual(list(samples[0]), ["z"] + sample_ids)
 
     def test_families_dedup_by_family(self):
         # a1 and a2 share F1 -> two samples but one distinct family above unaffected.
@@ -482,8 +480,8 @@ class OutputColumnsTests(unittest.TestCase):
         self.assertEqual(len(set(OUTPUT_COLUMNS)), 131)
 
     def test_anchor_positions(self):
-        # Spot-check load-bearing positions from the blueprint's numbered schema.
-        # Blueprint numbers are 1-based; subtract 1 for the list index.
+        # Spot-check fixed positions in OUTPUT_COLUMNS (the trailing comments give 1-based
+        # column numbers).
         self.assertEqual(OUTPUT_COLUMNS[0], "LocusId")
         self.assertEqual(OUTPUT_COLUMNS[32], "pLI")  # col 33
         self.assertEqual(OUTPUT_COLUMNS[33], "inheritance")  # col 34

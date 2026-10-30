@@ -17,8 +17,8 @@ In order, this:
 Only --repeat-copy-numbers-tsv and --sample-metadata-tsv are required; the phenotype table is
 optional and skipped when absent. See docs/INPUT_FORMATS.md.
 
-Note: this orchestrates build_database.build() — the ported analysis engine that reads the
-TSVs and populates the DB directly, with no intermediate files — and results_server.py (serve).
+Note: this orchestrates build_database.build(), which reads the TSVs and populates the DB
+directly, with no intermediate files, and results_server.py (serve).
 """
 
 import argparse
@@ -110,10 +110,10 @@ def ensure_running_in_trails_virtual_environment():
 def ensure_dependencies():
     """pip-install the runtime dependencies if any are missing.
 
-    The required set is installed with check=True: without it nothing can run. The optional set
-    lives in its own requirements file and is installed with check=False, because pip fails the
-    whole invocation if any listed package cannot be built, which would turn a soft dependency
-    into a hard one.
+    The required set is installed from requirements.txt with check=True: without it nothing can
+    run. The optional set is installed separately, by name, with check=False: pip fails the whole
+    invocation if any listed package cannot be built, so installing it with the required set, or
+    checking its result, would turn a soft dependency into a hard one.
     """
     if not all(_has_module(m) for m in REQUIRED_MODULES):
         print("Installing Python dependencies (requirements.txt) ...")
@@ -250,7 +250,10 @@ def build_flags(args):
 
 
 def build_manifest(inputs, flags):
-    """Return the build manifest: input sha256s + build flags + the TRails commit.
+    """Return the build manifest, which needs_rebuild compares to tell whether the DB is stale.
+
+    It holds the input sha256s, the build flags, the phenotype-scoring backend and a fingerprint
+    of the build's source files (trails_code_version).
 
     Args:
         inputs: {label: path} for every file whose contents affect the built DB.

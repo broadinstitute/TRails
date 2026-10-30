@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Thin DuckDB wrapper shaped like the sqlite3 module TRails used to run on.
+"""Thin DuckDB wrapper exposing a sqlite3-style DB-API.
 
 TRails is a local app: a user installs it, builds a results database from their own TSVs,
 and browses it in the results server. That database is DuckDB, and this module is the only
 place in TRails that imports ``duckdb``. Everything else (``build_database``,
-``result_database``, ``results_server`` and the tests) keeps calling the sqlite3 DB-API it
-was written against, and this module presents that surface on top of DuckDB so three things
-stay in one place:
+``result_database``, ``results_server`` and the tests) calls the sqlite3-style surface this
+module presents on top of DuckDB, so three things stay in one place:
 
   1. Row objects addressable by both column name and position, the way ``sqlite3.Row`` is.
      DuckDB returns plain tuples, and the query code reads columns by name.
-  2. The NULL sort order. DuckDB defaults to NULLS LAST in both directions; SQLite puts
-     NULLs first on ASC and last on DESC. Every ORDER BY in TRails was written against the
-     SQLite order, so connect() sets default_null_order to match it.
+  2. The NULL sort order. DuckDB defaults to NULLS LAST in both directions, but TRails'
+     ORDER BY clauses expect NULLs first on ASC and last on DESC, so connect() sets
+     default_null_order accordingly.
   3. Read-only connections to the same file, which the results server opens once per
      request. DuckDB keeps one instance per file, so those share a cached connection and get
      an independent cursor each, which is DuckDB's supported way to query from threads.
@@ -35,14 +34,12 @@ caller needs is how this module grows a second, subtly different DB-API, so the 
     ``column in row.keys()`` to test for an optional column.
   - ``list_tables``, ``table_columns``, ``insert_rows``, ``find_leftover_write_files``.
 
-Two SQL dialect differences are NOT hidden here, because hiding them would mean parsing
-SQL. They are fixed at each call site instead:
+Two SQL dialect rules are NOT hidden here, because hiding them would mean parsing SQL.
+Each call site follows them instead:
 
-  - LIKE is case-insensitive in SQLite and case-sensitive in DuckDB. Every
-    "LIKE ? COLLATE NOCASE" became ILIKE.
-  - CAST('abc' AS INTEGER) is 0 in SQLite and an error in DuckDB. Every cast of a text
-    column that can hold non-numeric text became TRY_CAST, wrapped in COALESCE(..., 0)
-    where the SQLite zero was load-bearing.
+  - LIKE is case-sensitive in DuckDB, so a case-insensitive match uses ILIKE.
+  - CAST('abc' AS INTEGER) is an error in DuckDB, so a cast of a text column that can hold
+    non-numeric text uses TRY_CAST, wrapped in COALESCE(..., 0) where a zero is needed.
 """
 
 import itertools
@@ -54,12 +51,12 @@ import pandas as pd
 
 # duckdb raises a different subclass per problem (BinderException for an unknown column,
 # CatalogException for an unknown table, ConversionException for a bad cast), all under
-# duckdb.Error. TRails only ever catches "the query did not run", so the callers that used
-# to catch sqlite3.OperationalError catch this.
+# duckdb.Error. TRails only ever catches "the query did not run", so both DB-API names,
+# Error and OperationalError, are that base class.
 Error = duckdb.Error
 OperationalError = duckdb.Error
 
-# Applied to every connection. "nulls_first_on_asc_last_on_desc" is SQLite's ordering.
+# Applied to every connection (item 2 of the module docstring).
 CONNECTION_CONFIG = {"default_null_order": "nulls_first_on_asc_last_on_desc"}
 
 # Cells (rows x columns) per bulk INSERT in insert_rows, and the name the chunk is
@@ -74,11 +71,11 @@ _ITERATION_BATCH_ROWS = 2048
 
 
 def _bound_value(value):
-    """Map a NaN parameter to NULL, the way sqlite3 binds it.
+    """Map a NaN parameter to NULL.
 
-    Rows reaching the database writer carry missing numbers as NaN. sqlite3 stored that as
-    NULL; DuckDB stores an actual NaN, which is not NULL, is counted by COUNT(col), and
-    compares as LARGER than every real number. A locus whose population statistic is missing
+    Rows reaching the database writer carry missing numbers as NaN. Bound as it is, DuckDB
+    stores an actual NaN, which is not NULL, is counted by COUNT(col), and compares as LARGER
+    than every real number. A locus whose population statistic is missing
     would then pass an "affected allele > population 99th percentile" gate as though it had
     data.
 
@@ -90,11 +87,10 @@ def _bound_value(value):
 def _bound_params(params):
     """Return the rows of parameters as a list, each row's NaNs mapped to NULL.
 
-    ``params`` may be any iterable, including a generator, but the result is materialized:
-    duckdb 1.0.x rejects a generator with "executemany requires a list of parameter sets to
-    be provided", and requirements.txt allows duckdb 1.0. The callers are the test fixtures,
-    which pass a handful of rows each, so holding them all costs nothing. The bulk loads go
-    through insert_rows, which streams a chunk at a time and never comes through here.
+    ``params`` may be any iterable, including a generator. The result is a list because duckdb
+    documents executemany as taking a list of parameter sets. The callers are the test
+    fixtures, which pass a handful of rows each, so holding them all costs nothing. The bulk
+    loads go through insert_rows, which streams a chunk at a time and never comes through here.
     """
     return [[_bound_value(value) for value in row] for row in params]
 
@@ -235,8 +231,8 @@ class Connection:
         self._connection.unregister(name)
 
     def commit(self):
-        # DuckDB autocommits each statement outside an explicit BEGIN, so there is nothing
-        # to flush here. Kept so the build code reads the same as it did on sqlite3.
+        # No-op: DuckDB autocommits each statement outside an explicit BEGIN, so there is
+        # nothing to flush. It exists because the DB-API callers mark their commit points.
         pass
 
     def close(self):
@@ -270,7 +266,7 @@ def connect(path, read_only=False):
 
 
 def list_tables(conn):
-    """Return the set of table names in the database (SQLite's sqlite_master query)."""
+    """Return the set of table names in the database."""
     return {row[0] for row in conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()}
 
 
@@ -341,8 +337,7 @@ def insert_rows(conn, table_name, column_order, rows):
     "not_available" marker would then be typed INT32 off its first rows, and raise on the
     marker or silently round a later 5.5 to 6. Typing the column also keeps a float out of
     an int: left to itself pandas widens a column of ints holding a None to float64, and an
-    int written into a VARCHAR column would land as "1.0" instead of the "1" executemany
-    wrote.
+    int written into a VARCHAR column would land as "1.0" instead of "1".
 
     Args:
         conn: An open read-write Connection.

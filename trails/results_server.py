@@ -3,8 +3,7 @@
 
 Serves data from a single pre-computed DuckDB database of locus-level outlier
 statistics, enriched with sample metadata, gene-disease associations, and known
-disease loci. This is the single-database TRails server: there is no source
-selector, no read-visualization (readviz) integration, and no cloud dependency.
+disease loci.
 
 The server tolerates optional tables being absent. The ``loci`` table is the only
 hard requirement (see ``REQUIRED_COLUMNS``); ``swim_plot``, the phenotype-score
@@ -22,6 +21,7 @@ import re
 import sys
 import threading
 import traceback
+from urllib.parse import urlsplit
 import zlib
 
 import flask
@@ -33,7 +33,10 @@ import numpy as np
 # The only module that imports duckdb; everything here goes through its sqlite3-shaped API.
 import duckdb_compat
 
-# Standalone motif primitive (no str_analysis dependency, no sys.path insertion).
+# get_population_p99_threshold, the build's population bar, which the exports apply too
+import analysis_columns
+
+# Canonical motifs, and the bases they are defined for
 from motif_utilities import COMPLEMENT, compute_canonical_motif
 
 # The number of samples the database was built from and the cohorts that gated its #Aff / #Fam
@@ -46,17 +49,16 @@ from result_database import AFFECTED_UNSOLVED_OUTLIERS_TABLE, read_population_ga
 # makes reverse_complement raise KeyError, so the "motif" query parameter is validated against it.
 VALID_MOTIF_PATTERN = re.compile(f"^[{''.join(sorted(COMPLEMENT))}]+$", re.IGNORECASE)
 
-# Known-disease-locus matching and affected-status normalization live in the ported
-# locus_annotations module. Import them defensively so the server stays importable
-# even when that optional module is not present alongside it; the locus-detail page's
-# known-disease annotations simply degrade to "no match" in that case.
+# Known-disease-locus matching and the blank spellings of a sample status live in the
+# locus_annotations module, which needs intervaltree. Import them defensively so the server
+# stays importable without it; the locus-detail page's known-disease annotations simply
+# degrade to "no match" in that case.
 try:
     from locus_annotations import (
         BLANK_STATUS_VALUES,
         compute_jaccard,
         load_known_disease_loci,
         motifs_match,
-        normalize_affected_status_for_logic,
         strchive_locus_motifs,
     )
 except ImportError as import_error:
@@ -64,56 +66,20 @@ except ImportError as import_error:
     # drifted, which would otherwise disable the known-disease annotations without a word.
     print(f"WARNING: falling back to the built-in known-disease stubs: {import_error}")
 
+    # The same spellings as in locus_annotations, so a status cell reading "NA" still shows as
+    # "Unknown" rather than as the status "Na"
     BLANK_STATUS_VALUES = {"", "nan", "none", "na", "n/a", "null"}
-
-    def normalize_affected_status_for_logic(value):
-        """Lowercase + collapse 'possibly affected' to 'affected' (fallback)."""
-        if value is None:
-            return None
-        if isinstance(value, float) and value != value:  # NaN
-            return None
-        normalized = str(value).strip().lower()
-        # Every blank spelling maps to None, exactly as locus_annotations does it. Checking only
-        # "nan" here left a cell reading "NA" classified as the status "na", so the locus-detail
-        # page showed "Na" instead of "Unknown" whenever this fallback was in use.
-        if normalized in BLANK_STATUS_VALUES:
-            return None
-        if normalized == "possibly affected":
-            return "affected"
-        return normalized
-
-    def compute_jaccard(start1, end1, start2, end2):
-        """Jaccard index for two half-open intervals (fallback)."""
-        overlap_start = max(start1, start2)
-        overlap_end = min(end1, end2)
-        if overlap_start >= overlap_end:
-            return 0.0
-        overlap_size = overlap_end - overlap_start
-        union_size = (end1 - start1) + (end2 - start2) - overlap_size
-        return overlap_size / union_size if union_size > 0 else 0.0
-
-    def motifs_match(motif1, motif2):
-        """Canonical match for <=6bp, length match for longer (fallback)."""
-        if not motif1 or not motif2:
-            return False
-        if len(motif1) <= 6:
-            return (compute_canonical_motif(motif1, include_reverse_complement=True)
-                    == compute_canonical_motif(motif2, include_reverse_complement=True))
-        return len(motif1) == len(motif2)
 
     def load_known_disease_loci(filepath, fetch_strchive=False, strchive_filepath=None,
                                 build_locus_lookup=False):
         """Disabled fallback: no disease catalog available -> empty trees/lookup.
 
         Mirrors the real loader's (interval_trees, strchive_trees, locus_lookup)
-        return shape so the startup call site unpacks identically.
+        return shape so the startup call site unpacks identically. With every tree empty,
+        no locus is ever matched against a catalog, so compute_jaccard, motifs_match and
+        strchive_locus_motifs are never called and need no fallback.
         """
         return {}, {}, {}
-
-    def strchive_locus_motifs(locus_data):
-        """Reference plus pathogenic STRchive motifs of one locus (fallback)."""
-        return (list(locus_data.get("reference_motif_reference_orientation") or [])
-                + list(locus_data.get("pathogenic_motif_reference_orientation") or []))
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -174,7 +140,7 @@ LIST_COLUMNS_STATIC = [
     "pLI", "inheritance",
     "IsKnownMotif", "IsInMendelianGene", "KnownDiseaseLocus",
     # The three variation-cluster columns are optional: they are carried over from the input
-    # TSV only when it supplies them. A database predating them reports them as None
+    # TSV only when it supplies them. A database without them reports them as None
     # (row_to_list_dict tolerates a missing static column), which leaves the VC column blank.
     "VariationClusterSizeDiff", "VariationCluster", "VariationClusterFilterReason",
     "AoU1027_MaxAllele", "AoU1027_99thPercentile",
@@ -222,11 +188,7 @@ def sanitize_for_json(obj):
 
 
 def resolve_tag_to_loci(tag):
-    """Return the set of LocusIds matching a user-defined tag.
-
-    Only user tags are supported in the single-DB server; the system tags
-    (readviz / readviz pending) of the original multi-source server are gone.
-    """
+    """Return the set of LocusIds matching a user-defined tag."""
     return app.config["ANNOTATIONS"]["tag_to_loci"].get(tag, set())
 
 
@@ -331,9 +293,6 @@ def parse_motif_size_filter(motif_size_str):
                 clauses.append("MotifSize = ?")
             except ValueError:
                 return None, [], f"Invalid motif_size value: '{part}'"
-
-    if not clauses:
-        return None, [], None
 
     return "(" + " OR ".join(clauses) + ")", params, None
 
@@ -679,76 +638,46 @@ def validate_database(path):
 # ---------------------------------------------------------------------------
 
 
-def _normalize_metadata_column(name):
-    """Lowercase + drop underscores/spaces, for case/underscore-insensitive matching."""
-    return str(name).strip().lower().replace("_", "").replace(" ", "")
-
-
 def load_sample_table(filepath):
     """Load sample metadata and create lookup dictionaries.
 
-    Permissive on purpose so it accepts exactly what the build accepts (the same
-    file is forwarded by trails.py): only ``sample_id`` is required, column names
-    are matched case/underscore-insensitively, and ``affected_status`` /
-    ``analysis_status`` are optional (treated as unknown when absent). All other
-    columns are preserved verbatim on each sample row (e.g. ``ancestry``).
+    Reads the table with input_tables.read_sample_metadata, the build's reader, so it accepts
+    and normalizes exactly what the build does (trails.py forwards the same file to both): only
+    ``sample_id`` is required, column names are matched case/underscore-insensitively, and an
+    absent ``affected_status`` / ``analysis_status`` reads as unknown. The build keeps only the
+    columns it uses, so every other column (e.g. ``ancestry``) is added to each sample's row
+    here, verbatim, for the pages and exports to show.
+
+    Args:
+        filepath: Path to the sample-metadata TSV (optionally gzipped).
 
     Returns:
         Tuple (sample_id_to_row, affected_status_lookup, analysis_status_lookup).
     """
+    # Imported here rather than at the top: input_tables imports locus_annotations, which needs
+    # intervaltree, and the server runs without it as long as no sample table is given.
+    import input_tables
     import pandas as pd
 
-    df = pd.read_table(filepath, dtype=str, keep_default_na=False)
+    sample_id_to_row, affected_status_lookup, analysis_status_lookup = input_tables.read_sample_metadata(filepath)
 
-    # Canonicalize the columns we need, case/underscore-insensitively.
-    column_by_normalized = {_normalize_metadata_column(c): c for c in df.columns}
-    id_column = column_by_normalized.get("sampleid")
-    if id_column is None:
-        raise ValueError(
-            f"Sample table {filepath} is missing a 'sample_id' column; "
-            f"found columns: {list(df.columns)[:10]}")
-    rename = {id_column: "sample_id"}
-    # Every column input_tables.read_sample_metadata canonicalizes for the build (input_tables.py's
-    # match_columns list), so a "FamilyID"/"Sex" header reaches parse_outlier_samples under the
-    # lower-case name it looks up instead of coming back as None.
-    for canonical in ("sex", "family_id", "maternal_id", "paternal_id",
-                      "affected_status", "analysis_status", "phenotype_description"):
-        actual = column_by_normalized.get(_normalize_metadata_column(canonical))
-        if actual and actual != canonical:
-            rename[actual] = canonical
-    df = df.rename(columns=rename)
-
-    analysis_status_remap = {"rncc": "unsolved", "rcpc": "unsolved", "s_kgfp": "solved"}
-    if "analysis_status" in df.columns:
-        df["analysis_status"] = (
-            df["analysis_status"].astype(str).str.strip().str.lower().replace(analysis_status_remap)
-        )
-        # The build maps every blank spelling to "unknown" (input_tables.read_sample_metadata);
-        # covering only "" and "nan" here would leave a plain "NA" cell rendering as "Na".
-        df["analysis_status"] = df["analysis_status"].apply(
-            lambda v: "unknown" if v in BLANK_STATUS_VALUES else v)
-    else:
-        df["analysis_status"] = "unknown"
-    if "affected_status" not in df.columns:
-        df["affected_status"] = ""
-    if "phenotype_description" in df.columns:
-        # Strip only a leading "NA; " prefix (matches input_tables.read_sample_metadata).
-        df["phenotype_description"] = df["phenotype_description"].apply(
-            lambda p: p[len("NA; "):] if isinstance(p, str) and p.startswith("NA; ") else p
-        )
-    df = df.drop_duplicates(subset=["sample_id"], keep="first")
-    sample_id_to_row = df.set_index("sample_id").to_dict(orient="index")
-    affected_status_lookup = dict(
-        zip(df.sample_id, df.affected_status.map(normalize_affected_status_for_logic))
-    )
-    analysis_status_lookup = dict(zip(df.sample_id, df.analysis_status))
+    raw_df = pd.read_table(filepath, dtype=str, keep_default_na=False)
+    raw_sample_id_column = input_tables.match_columns(raw_df, ["sample_id"])["sample_id"]
+    read_columns = {input_tables.normalize_column_name(column)
+                    for sample_row in sample_id_to_row.values() for column in sample_row}
+    other_columns = [column for column in raw_df.columns
+                     if input_tables.normalize_column_name(column) not in read_columns]
+    if other_columns:
+        # The first row of a duplicated sample_id is the one read_sample_metadata keeps
+        for row in raw_df.drop_duplicates(subset=[raw_sample_id_column], keep="first").to_dict(orient="records"):
+            sample_id_to_row[row[raw_sample_id_column]].update({column: row[column] for column in other_columns})
     return sample_id_to_row, affected_status_lookup, analysis_status_lookup
 
 
 def load_mendelian_warnings(db_path, threshold=0.10):
     """Load Mendelian violation data and flag samples with high violation rates.
 
-    The Mendelian-violation tables now live in the SINGLE results database. If the
+    The Mendelian-violation tables live in the results database. If the
     table is absent (no trios were available at build time), returns {}.
 
     Args:
@@ -946,13 +875,41 @@ def get_db():
 
 
 # ---------------------------------------------------------------------------
-# CORS handler
+# Request checks
 # ---------------------------------------------------------------------------
 
+# No response carries CORS headers, on purpose. The pages are served by this server, so their
+# requests are same-origin, and scripts and notebooks are not subject to CORS at all. The only
+# readers the headers would let in are pages on other sites the user has open, and those must not
+# read sample ids, phenotypes and the other results.
 
 # Loopback addresses. A server bound to one of these is reachable only from this machine, which
 # is what makes the unauthenticated annotation routes acceptable by default.
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+@app.before_request
+def reject_requests_for_another_host():
+    """Refuse a request that names a host other than this machine, while bound to loopback.
+
+    A web page on another site can point its own domain name at 127.0.0.1 (DNS rebinding) and
+    then reach this server as if it were the page's own site, reading the results and editing
+    notes and tags. The browser still names that domain in the Host header, so while the server
+    is bound to a loopback address, where every legitimate request names a loopback host, any
+    other Host is refused. Bound to another address (e.g. --host 0.0.0.0), the server is meant
+    to be reached under whatever name or address other machines know this one by, which cannot
+    be listed in advance, so the Host header is not checked; the write routes are then still
+    limited to this machine by restrict_writes.
+    """
+    if app.config.get("BIND_HOST", "127.0.0.1") not in LOOPBACK_HOSTS:
+        return None
+    if urlsplit(f"//{request.host}").hostname in LOOPBACK_HOSTS:
+        return None
+    return jsonify({
+        "error": "unexpected host name",
+        "detail": f"This server is bound to a loopback address and only answers requests for "
+                  f"{', '.join(sorted(LOOPBACK_HOSTS))}, not '{request.host}'.",
+    }), 403
 
 
 @app.before_request
@@ -963,8 +920,8 @@ def restrict_writes():
     have no authentication:
 
       * Another origin. A POST with a plain content type is a "simple" request the browser sends
-        before CORS gets a chance to hide anything, so the response headers below cannot stop
-        another page the user has open from writing to this database.
+        without asking this server first, so another page the user has open could write to this
+        database if the Origin header were not checked.
       * Another machine. Bound to a non-loopback address the write routes are reachable by anyone
         who can route to the port, so they are refused unless --allow-remote-writes says otherwise.
 
@@ -985,21 +942,6 @@ def restrict_writes():
     if origin and origin.rstrip("/") != request.host_url.rstrip("/"):
         return jsonify({"error": "cross-origin requests are not allowed"}), 403
     return None
-
-
-@app.after_request
-def add_cors_headers(response):
-    """Allow cross-origin reads of the API, but never cross-origin writes.
-
-    The bundled UI is same-origin (index_page_template.html builds API_BASE_URL from
-    window.location.origin), so it needs no CORS headers at all. The wildcard exists only so a
-    notebook or a separate viewer can GET the read-only endpoints; advertising PUT/POST/DELETE
-    here would invite any page to mutate this database's notes and tags.
-    """
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    return response
 
 
 # ---------------------------------------------------------------------------
@@ -1026,11 +968,23 @@ def get_motif_variants(motif):
     return variants
 
 
+def is_true_flag(name):
+    """Return whether the request sets a boolean query parameter, as true, 1 or yes in any case.
+
+    Args:
+        name: The query parameter's name.
+
+    Returns:
+        True when the parameter is set to one of those values.
+    """
+    return request.args.get(name, "").lower() in ("true", "1", "yes")
+
+
 def validate_params():
     """Validate and parse query parameters from the request.
 
-    The 'source' query parameter is ignored (single-database server): if present it
-    is silently dropped rather than rejected, so old multi-source URLs keep working.
+    The pages send a 'source' query parameter (the database's label), which is accepted and
+    ignored.
 
     Returns:
         Tuple (params_dict, error_response). If error_response is not None, the
@@ -1174,7 +1128,7 @@ def validate_params():
 
     for flag_name in ("apply_pathogenic_threshold", "known_loci_only", "known_motifs_only", "mendelian_genes_only",
                       "exclude_vc_depth_filtered", "exclude_vc_size_filtered"):
-        if request.args.get(flag_name, "").lower() in ("true", "1", "yes"):
+        if is_true_flag(flag_name):
             params[flag_name] = True
 
     # These list-valued filters are stored only when at least one entry survives the strip, the
@@ -1195,8 +1149,8 @@ def validate_params():
         params["sample_id_like"] = sample_id_like_keywords
 
     # search (optional, comma-separated; each term routed by shape, all OR'ed together). The
-    # separate locus_id / reference_region / gene_symbol / gene_id parameters below still work
-    # for anyone calling the API directly; the UI sends this one instead.
+    # separate locus_id / reference_region / gene_symbol / gene_id parameters below are for
+    # anyone calling the API directly; the UI sends this one instead.
     if request.args.get("search"):
         search_terms = []
         for term in split_search_terms(request.args["search"]):
@@ -1282,11 +1236,28 @@ def validate_params():
     return params, None
 
 
+# validate_params entries that are not filters, or are the SQL form of a filter whose
+# user-facing value is kept under its own name, so filters_applied leaves them out
+NON_FILTER_PARAMS = ("page", "page_size", "outlier_type", "sort_by", "motif_size_clause", "motif_size_params",
+                     "reference_region_parsed", "search_terms")
+
+
+def build_filters_applied(params):
+    """Return the filters of validated query parameters, as the request gave them.
+
+    Args:
+        params: dict of validated query parameters from validate_params().
+
+    Returns:
+        The params without NON_FILTER_PARAMS, for a response's filters_applied.
+    """
+    return {k: v for k, v in params.items() if k not in NON_FILTER_PARAMS}
+
+
 def has_affected_unsolved_outliers_table():
     """Whether the database has the table the grouped view needs.
 
-    A database built before the build wrote AFFECTED_UNSOLVED_OUTLIERS_TABLE lacks it until it is
-    rebuilt.
+    A database without AFFECTED_UNSOLVED_OUTLIERS_TABLE gets it when it is rebuilt.
 
     Returns:
         True when the table exists.
@@ -1369,11 +1340,10 @@ def build_api_order_by(params, source_columns):
     # VariationClusterSizeDiff is VARCHAR whenever the build saw a value that is not an integer
     # (see result_database.infer_column_types), and ordering a VARCHAR by itself would compare
     # digit strings ("999" above "4847"). The cast is harmless on the BIGINT case. TRY_CAST
-    # rather than CAST because DuckDB raises on a value that will not parse, where SQLite
-    # silently yielded 0; a value that will not parse sorts as NULL, which DESC puts last
-    # alongside the loci that have no variation cluster at all. The SORT_MAPPING column name
-    # stays the real one so the missing-column check below still tests a column this database
-    # either has or does not.
+    # rather than CAST because CAST raises on a value that will not parse; with TRY_CAST such a
+    # value sorts as NULL, which DESC puts last alongside the loci that have no variation
+    # cluster at all. The SORT_MAPPING column name stays the real one so the missing-column
+    # check below still tests a column this database either has or does not.
     SORT_EXPRESSIONS = {"variation_cluster": "TRY_CAST(VariationClusterSizeDiff AS BIGINT)"}
 
     sequence = list(sort_list)
@@ -1445,6 +1415,63 @@ def reference_region_clause(parsed_region):
     return " AND ".join(region_clauses), region_params
 
 
+def build_pathogenic_threshold_clause(table_name, allele_size_column):
+    """Build the SQL that keeps the alleles at or above their known disease locus's pathogenic minimum.
+
+    Shared by the apply_pathogenic_threshold filter of /api/v1/loci, which compares a locus's
+    largest affected allele, and of /api/v1/swim_plot_data, which compares each allele it draws.
+
+    Args:
+        table_name: The table holding LocusId and the allele size column: "loci" or "swim_plot".
+        allele_size_column: The allele size column compared.
+
+    Returns:
+        Tuple (clause, params) to append to a WHERE clause. The clause matches nothing when no
+        known disease locus has a pathogenic minimum.
+    """
+    thresholds = app.config.get("KNOWN_DISEASE_LOCUS_THRESHOLDS", {})
+    if not thresholds:
+        return "1=0", []
+    threshold_clauses = []
+    threshold_params = []
+    for locus_id, threshold in sorted(thresholds.items()):
+        threshold_clauses.append(f"({table_name}.LocusId = ? AND {table_name}.{allele_size_column} >= ?)")
+        threshold_params.extend([locus_id, threshold])
+    return f"({' OR '.join(threshold_clauses)})", threshold_params
+
+
+def build_require_above_population_clause(params, table_name, allele_size_column):
+    """Build the SQL of the require_above_population filter for one allele size column.
+
+    Keeps an allele above the population value (99th percentile, or the maximum when
+    population_metric is "max") of every cohort the filter names that has data there. A locus
+    with no data in any of those cohorts is dropped unless include_loci_without_population_data
+    is set. A cohort whose column the loci table lacks is left out, and with none left nothing
+    matches. Shared like build_pathogenic_threshold_clause.
+
+    Args:
+        params: dict of validated query parameters holding require_above_population.
+        table_name: The table holding the allele size column and the {cohort}_{metric} columns:
+            "loci", or "swim_plot", which copies them from loci.
+        allele_size_column: The allele size column compared.
+
+    Returns:
+        The clause to append to a WHERE clause, or None when it would check nothing.
+    """
+    source_columns = app.config.get("DB_COLUMNS_SET", set())
+    m = "MaxAllele" if params.get("population_metric") == "max" else "99thPercentile"
+    pop_datasets = POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION[params["require_above_population"]]
+    present = [d for d in pop_datasets if f"{d}_{m}" in source_columns]
+    above_terms = [f"({table_name}.{d}_{m} IS NULL OR {table_name}.{allele_size_column} > {table_name}.{d}_{m})"
+                   for d in present]
+    if params.get("include_loci_without_population_data"):
+        return "(" + " AND ".join(above_terms) + ")" if above_terms else None
+    if not present:
+        return "1=0"
+    exists_term = " OR ".join(f"{table_name}.{d}_{m} IS NOT NULL" for d in present)
+    return "((" + exists_term + ") AND " + " AND ".join(above_terms) + ")"
+
+
 def build_api_where_clause(params):
     """Build the WHERE clause that picks the loci matching validated API query parameters.
 
@@ -1460,17 +1487,50 @@ def build_api_where_clause(params):
     """
     ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
     source_columns = app.config.get("DB_COLUMNS_SET", set())
+
+    # The loci with an outlier of the requested type. Guarded like every filter: a database built
+    # without this outlier type simply has no rows for it, which is not the same thing as a SQL
+    # error. OUTLIER_TYPE_MAP advertises all three types regardless of what the loaded database
+    # actually contains.
+    if not source_columns or f"OutlierSampleIds_{ot}" in source_columns:
+        clauses = [f"(loci.OutlierSampleIds_{ot} IS NOT NULL AND loci.OutlierSampleIds_{ot} != '')"]
+    else:
+        clauses = ["1=0"]
+
+    if params["outlier_type"] == "hemi":
+        clauses.append("Chrom IN ('chrX', 'chrY')")
+        # The build writes "" (not NULL) for a locus with no hemizygous alleles
+        # (allele_histograms.convert_counts_to_histogram_string returns "" for an empty count
+        # dict), so IS NOT NULL alone matches every row and filters nothing. Guarded on the column
+        # like the filters, so an autosome-only database matches nothing instead of raising.
+        if not source_columns or "HemizygousAlleleHistogram" in source_columns:
+            clauses.append("HemizygousAlleleHistogram IS NOT NULL AND HemizygousAlleleHistogram != ''")
+        else:
+            clauses.append("1=0")
+
+    filter_clauses, sql_params = build_locus_filter_clauses(params)
+    return " AND ".join(clauses + filter_clauses), sql_params
+
+
+def build_locus_filter_clauses(params):
+    """Build the SQL of every locus filter set in validated API query parameters.
+
+    Only the filters: build_api_where_clause adds the restriction to the loci with an outlier of
+    the requested type, which /api/v1/swim_plot_data does not need, since its rows each carry
+    their own outlier type.
+
+    Args:
+        params: dict of validated query parameters from validate_params().
+
+    Returns:
+        Tuple (clauses, sql_params): conditions on the `loci` table, to be ANDed together, and
+        their parameters in order.
+    """
+    ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
+    source_columns = app.config.get("DB_COLUMNS_SET", set())
     clauses = []
     sql_params = []
     min_expansion = params.get("min_expansion", 0)
-
-    # Guarded like every other filter below: a database built without this outlier type simply has
-    # no rows for it, which is not the same thing as a SQL error. OUTLIER_TYPE_MAP advertises all
-    # three types regardless of what the loaded database actually contains.
-    if not source_columns or f"OutlierSampleIds_{ot}" in source_columns:
-        clauses.append(f"(loci.OutlierSampleIds_{ot} IS NOT NULL AND loci.OutlierSampleIds_{ot} != '')")
-    else:
-        clauses.append("1=0")
 
     if "min_expansion" in params:
         clauses.append(f"loci.FirstAffectedAlleleSize_{ot} >= loci.NumRepeatsInReference + ?")
@@ -1497,25 +1557,13 @@ def build_api_where_clause(params):
         else:
             # Backing column absent: the filter cannot be evaluated, so match no
             # rows rather than silently returning every locus (mirrors the
-            # require_above_population "1=0" fallback below).
+            # require_above_population "1=0" fallback).
             clauses.append("1=0")
 
     if "require_above_population" in params:
-        include_without_data = params.get("include_loci_without_population_data", False)
-        m = "MaxAllele" if params.get("population_metric") == "max" else "99thPercentile"
-        pop_datasets = POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION[params["require_above_population"]]
-        present = [d for d in pop_datasets if f"{d}_{m}" in source_columns]
-        above_terms = [f"(loci.{d}_{m} IS NULL OR loci.FirstAffectedAlleleSize_{ot} > loci.{d}_{m})"
-                       for d in present]
-        if include_without_data:
-            if above_terms:
-                clauses.append("(" + " AND ".join(above_terms) + ")")
-        else:
-            if present:
-                exists_term = " OR ".join(f"loci.{d}_{m} IS NOT NULL" for d in present)
-                clauses.append("((" + exists_term + ") AND " + " AND ".join(above_terms) + ")")
-            else:
-                clauses.append("1=0")
+        clause = build_require_above_population_clause(params, "loci", f"FirstAffectedAlleleSize_{ot}")
+        if clause:
+            clauses.append(clause)
 
     if "motif" in params:
         if "CanonicalMotif" in source_columns:
@@ -1588,15 +1636,9 @@ def build_api_where_clause(params):
             sql_params.extend(sorted(known_ids))
 
     if params.get("apply_pathogenic_threshold"):
-        thresholds = app.config.get("KNOWN_DISEASE_LOCUS_THRESHOLDS", {})
-        if not thresholds:
-            clauses.append("1=0")
-        else:
-            threshold_clauses = []
-            for locus_id, threshold in sorted(thresholds.items()):
-                threshold_clauses.append(f"(loci.LocusId = ? AND loci.FirstAffectedAlleleSize_{ot} >= ?)")
-                sql_params.extend([locus_id, threshold])
-            clauses.append(f"({' OR '.join(threshold_clauses)})")
+        clause, threshold_params = build_pathogenic_threshold_clause("loci", f"FirstAffectedAlleleSize_{ot}")
+        clauses.append(clause)
+        sql_params.extend(threshold_params)
 
     if params.get("known_motifs_only"):
         clauses.append("loci.IsKnownMotif = 1" if "IsKnownMotif" in source_columns else "1=0")
@@ -1717,13 +1759,13 @@ def build_api_where_clause(params):
                 search_clauses.append(f"({clause})")
                 search_params.extend(region_params)
         if locus_id_values:
-            # One "lower(LocusId) IN (...)" for every pasted id rather than one ILIKE each: a
-            # chain of N ILIKEs costs N comparisons per row, while the IN list is a single hash
-            # probe DuckDB can also answer from the column's statistics. Pasting a few hundred
-            # ids is normal here, so the difference is seconds per request.
+            # One "lower(LocusId) IN (...)" for every pasted id: a single hash probe per row,
+            # which DuckDB can also answer from the column's statistics, where a predicate per
+            # id would cost one comparison per id per row. Pasting a few hundred ids is normal
+            # here, so the difference is seconds per request.
             # Both sides are lower-cased because the build stores a locus id as the input matrix
-            # spelled it, which is what the ILIKE was there for. An IN list holds no wildcards,
-            # so a contig name carrying "_" needs no escaping and matches literally.
+            # spelled it and the match is case-insensitive. An IN list holds no wildcards, so a
+            # contig name carrying "_" needs no escaping and matches literally.
             search_clauses.insert(0, f"lower(LocusId) IN ({','.join('?' * len(locus_id_values))})")
             search_params[:0] = locus_id_values
         clauses.append(f"({' OR '.join(search_clauses)})" if search_clauses else "0")
@@ -1793,17 +1835,6 @@ def build_api_where_clause(params):
             clauses.append(f"LocusId IN ({','.join('?' * len(matching))})")
             sql_params.extend(sorted(matching))
 
-    if params["outlier_type"] == "hemi":
-        clauses.append("Chrom IN ('chrX', 'chrY')")
-        # The build writes "" (not NULL) for a locus with no hemizygous alleles
-        # (allele_histograms.convert_counts_to_histogram_string returns "" for an empty count
-        # dict), so IS NOT NULL alone matches every row and filters nothing. Guarded on the column
-        # like the filters above, so an autosome-only database matches nothing instead of raising.
-        if not source_columns or "HemizygousAlleleHistogram" in source_columns:
-            clauses.append("HemizygousAlleleHistogram IS NOT NULL AND HemizygousAlleleHistogram != ''")
-        else:
-            clauses.append("1=0")
-
     # The loci where #Aff counts one sample, or one family's samples (the loci a row of the grouped
     # view expands to). A database without the table cannot say, so nothing matches.
     for param_name, column in (("affected_unsolved_outlier_sample_id", "sample_id"),
@@ -1817,7 +1848,7 @@ def build_api_where_clause(params):
                        f"WHERE outlier_type = ? AND {column} = ?)")
         sql_params.extend([ot, params[param_name]])
 
-    return " AND ".join(clauses) if clauses else "1=1", sql_params
+    return clauses, sql_params
 
 
 def build_api_query(params):
@@ -1836,10 +1867,9 @@ def build_api_query(params):
 
     order_by = build_api_order_by(params, source_columns)
 
-    # One pass over loci, with no inner "pick the LocusIds first" subquery in front of it.
-    # DuckDB is columnar: the filter and the sort read only the columns they name, and the
-    # remaining ~180 are read only for the page's rows, so deferring the wide read by hand
-    # would just make the table be scanned twice.
+    # One pass over loci. DuckDB is columnar: the filter and the sort read only the columns they
+    # name, and the remaining ~180 are read only for the page's rows, so picking the page's
+    # LocusIds in a subquery first would only make the table be scanned twice.
     select_query = f"SELECT * FROM loci WHERE {where}{order_by} LIMIT ? OFFSET ?"
     count_query = f"SELECT COUNT(*) FROM loci WHERE {where}"
     # The motif name breaks ties on count, so two motifs with the same number of loci keep a
@@ -1970,29 +2000,23 @@ def describe_sample(sample_id, sample_lookup, affected_lookup, analysis_lookup):
     }
 
 
-def build_sample_details(row_dict, raw_row, conn, lookups, phenotype_scores=None):
+def build_sample_details(row_dict, raw_row, lookups, per_outlier_scores, population_gate_cohorts):
     """Build sample details for outliers exceeding the population 99th percentile.
 
     Args:
-        phenotype_scores: Optional pre-fetched {'per_outlier': ..., 'per_locus': ...}
-            dict for this locus (see fetch_phenotype_scores_of_exported_loci) — avoids one
-            fetch_phenotype_scores() DB round trip per call when the caller already
-            bulk-loaded scores for the whole result set. Falls back to fetching
-            per-locus from conn when not supplied.
+        row_dict: dict of the locus's list columns (row_to_list_dict).
+        raw_row: The locus's loci-table row, holding its OutlierSampleIds_* columns.
+        lookups: app.config["LOOKUPS"].
+        per_outlier_scores: dict mapping outlier type to the locus's per-outlier phenotype score
+            dicts (see fetch_per_outlier_phenotype_scores_of_loci), {} when it has none.
+        population_gate_cohorts: The cohorts whose 99th percentiles the build gated its counts
+            and phenotype scores with; an outlier is listed only above the largest of them.
 
     Returns:
         dict with AllAlleleOutliers / ShortAlleleOutliers / HemizygousOutliers keys
         (only present if qualifying samples exist).
     """
-    pop_max = max(
-        row_dict.get("HPRC256_99thPercentile") or 0,
-        row_dict.get("AoU1027_99thPercentile") or 0,
-    )
-
-    locus_id = row_dict.get("LocusId", "")
-    if phenotype_scores is None:
-        phenotype_scores = fetch_phenotype_scores(conn, locus_id) if conn else {}
-    per_outlier_scores = phenotype_scores.get("per_outlier", {})
+    pop_max = analysis_columns.get_population_p99_threshold(row_dict, population_gate_cohorts) or 0
 
     outlier_configs = [
         ("OutlierSampleIds_AllAlleles", "AllAlleleOutliers", "AllAlleles"),
@@ -2056,11 +2080,74 @@ def strchive_inheritance_modes(value):
     return [value]
 
 
+# Two loci are the same locus when their intervals overlap with a Jaccard index above this, as in
+# locus_annotations.matches_disease_locus
+KNOWN_DISEASE_LOCUS_MIN_JACCARD = 0.66
+
+
+def find_matching_known_disease_locus(chrom, start_0based, end_1based, motif, disease_trees,
+                                      strchive_trees):
+    """Return the known disease locus one locus matches, and the catalog it is from.
+
+    Matches the way locus_annotations.matches_disease_locus decides at build time that a locus is
+    a known disease locus: an overlap with a Jaccard index above KNOWN_DISEASE_LOCUS_MIN_JACCARD
+    plus a motif match, the variant catalog first and the STRchive trees as the fallback for loci
+    the catalog does not know. Both STRchive motif lists count, as in the build, so a locus the
+    build flagged as known through a pathogenic motif is matched here too.
+
+    Args:
+        chrom: The locus chromosome, with or without a "chr" prefix.
+        start_0based: The locus start, 0-based.
+        end_1based: The locus end, 1-based.
+        motif: The locus motif.
+        disease_trees: chrom -> IntervalTree of variant catalog disease loci.
+        strchive_trees: chrom -> IntervalTree of STRchive disease loci (may be empty or None).
+
+    Returns:
+        Tuple (disease_locus, source): the matched disease locus's catalog record and
+        "variant_catalog" or "STRchive", or (None, None) when nothing matches.
+    """
+    if not motif or start_0based is None or end_1based is None:
+        return None, None
+    chrom_key = chrom.replace("chr", "") if chrom else ""
+    for source, trees in (("variant_catalog", disease_trees), ("STRchive", strchive_trees)):
+        tree = trees.get(chrom_key) if trees else None
+        if not tree:
+            continue
+        for interval in tree.overlap(start_0based, end_1based):
+            if not interval.data:
+                continue
+            if compute_jaccard(start_0based, end_1based, interval.begin, interval.end) <= KNOWN_DISEASE_LOCUS_MIN_JACCARD:
+                continue
+            if source == "variant_catalog":
+                disease_motifs = [interval.data.get("RepeatUnit", "")] + (interval.data.get("PathogenicMotifs") or [])
+            else:
+                disease_motifs = strchive_locus_motifs(interval.data)
+            if any(motifs_match(motif, disease_motif) for disease_motif in disease_motifs):
+                return interval.data, source
+    return None, None
+
+
+def lowest_catalog_pathogenic_min(disease_locus):
+    """Return the smallest PathogenicMin among a variant catalog locus's diseases.
+
+    Args:
+        disease_locus: A variant catalog record.
+
+    Returns:
+        The smallest PathogenicMin, or None when none of its diseases records one.
+    """
+    pathogenic_mins = [disease["PathogenicMin"] for disease in disease_locus.get("Diseases", [])
+                       if disease.get("PathogenicMin") is not None]
+    return min(pathogenic_mins) if pathogenic_mins else None
+
+
 def compute_known_disease_info(row, lookups):
     """Look up known-disease-locus info for a locus.
 
-    Uses Jaccard > 0.66 overlap and length-dependent motif matching, with a STRchive
-    fallback. Returns a dict with disease info or None when no match is found.
+    Looks the locus up by LocusId and by coordinates in the variant catalog first, then matches
+    it the way the build does (find_matching_known_disease_locus). Returns a dict with disease
+    info or None when no match is found.
     """
     locus_id = row.get("LocusId", "")
     chrom = row.get("Chrom", "")
@@ -2069,51 +2156,17 @@ def compute_known_disease_info(row, lookups):
     end_1based = row.get("End1Based")
     motif = row.get("Motif", "")
 
-    disease_info = None
-    is_strchive = False
-
-    if locus_id in lookups["locus"]:
-        disease_info = lookups["locus"][locus_id]
-    else:
-        coord_key = f"{chrom_key}-{start_0based}-{end_1based}-{motif}"
-        if coord_key in lookups["locus"]:
-            disease_info = lookups["locus"][coord_key]
-
-    if not disease_info and chrom_key in lookups["disease_trees"] and motif and start_0based is not None and end_1based is not None:
-        for interval in lookups["disease_trees"][chrom_key].overlap(start_0based, end_1based):
-            if not interval.data:
-                continue
-            if compute_jaccard(start_0based, end_1based, interval.begin, interval.end) <= 0.66:
-                continue
-            disease_motifs = [interval.data.get("RepeatUnit", "")] + (interval.data.get("PathogenicMotifs") or [])
-            for dm in disease_motifs:
-                if motifs_match(motif, dm):
-                    disease_info = interval.data
-                    break
-            if disease_info:
-                break
-
-    if not disease_info and lookups.get("strchive_trees") and chrom_key in lookups["strchive_trees"] and motif and start_0based is not None and end_1based is not None:
-        for interval in lookups["strchive_trees"][chrom_key].overlap(start_0based, end_1based):
-            if not interval.data:
-                continue
-            if compute_jaccard(start_0based, end_1based, interval.begin, interval.end) <= 0.66:
-                continue
-            # Both motif lists, exactly as matches_disease_locus matches them during the build;
-            # checking only the reference motifs here would show no disease details for a locus
-            # the build flagged as known via a pathogenic motif.
-            for strchive_motif in strchive_locus_motifs(interval.data):
-                if motifs_match(motif, strchive_motif):
-                    disease_info = interval.data
-                    is_strchive = True
-                    break
-            if is_strchive:
-                break
+    disease_info = (lookups["locus"].get(locus_id)
+                    or lookups["locus"].get(f"{chrom_key}-{start_0based}-{end_1based}-{motif}"))
+    source = "variant_catalog"
+    if not disease_info:
+        disease_info, source = find_matching_known_disease_locus(
+            chrom, start_0based, end_1based, motif, lookups["disease_trees"], lookups.get("strchive_trees"))
 
     if not disease_info:
         return None
 
-    if is_strchive:
+    if source == "STRchive":
         return {
             "locus_id": disease_info.get("locus_id", disease_info.get("id")),
             "pathogenic_min": disease_info.get("pathogenic_min"),
@@ -2133,16 +2186,11 @@ def compute_known_disease_info(row, lookups):
     if not disease_info.get("Diseases"):
         return None
 
-    pathogenic_min = None
-    for disease in disease_info.get("Diseases", []):
-        if disease.get("PathogenicMin") and (pathogenic_min is None or disease["PathogenicMin"] < pathogenic_min):
-            pathogenic_min = disease["PathogenicMin"]
-
     inheritance_modes = {d["Inheritance"] for d in disease_info.get("Diseases", []) if d.get("Inheritance")}
 
     return {
         "locus_id": disease_info.get("LocusId"),
-        "pathogenic_min": pathogenic_min,
+        "pathogenic_min": lowest_catalog_pathogenic_min(disease_info),
         "inheritance": sorted(inheritance_modes) if inheritance_modes else None,
         "diseases": [{
             "name": d.get("Name"),
@@ -2158,11 +2206,11 @@ def known_disease_pathogenic_min(chrom, start_0based, end_1based, motif, disease
                                  strchive_trees):
     """Return the lowest pathogenic minimum recorded for one locus, or None.
 
-    Matches the way locus_annotations.matches_disease_locus decides that a locus is a known
-    disease locus: overlap with Jaccard above 0.66 plus a motif match, the variant catalog first
-    and the STRchive trees as the fallback. Walking STRchive here too is what keeps the
-    pathogenic-threshold filter from dropping a locus that is known only through STRchive, whose
-    locus-detail page does report a pathogenic minimum.
+    The locus is matched with find_matching_known_disease_locus, the same match the locus-detail
+    page uses. Walking STRchive too is what keeps the pathogenic-threshold filter from dropping a
+    locus that is known only through STRchive, whose locus-detail page does report a pathogenic
+    minimum. A variant catalog match stops the search even when it records no minimum, since
+    STRchive is only the fallback for loci the catalog does not know.
 
     Args:
         chrom: The locus chromosome, with or without a "chr" prefix.
@@ -2176,195 +2224,100 @@ def known_disease_pathogenic_min(chrom, start_0based, end_1based, motif, disease
         The smallest pathogenic minimum of the matching disease locus, or None when nothing
         matches or the matched locus records no pathogenic minimum.
     """
-    if not motif or start_0based is None or end_1based is None:
+    disease_locus, source = find_matching_known_disease_locus(
+        chrom, start_0based, end_1based, motif, disease_trees, strchive_trees)
+    if disease_locus is None:
         return None
-    chrom_key = chrom.replace("chr", "") if chrom else ""
-
-    catalog_tree = disease_trees.get(chrom_key) if disease_trees else None
-    if catalog_tree:
-        for interval in catalog_tree.overlap(start_0based, end_1based):
-            if not interval.data:
-                continue
-            if compute_jaccard(start_0based, end_1based, interval.begin, interval.end) <= 0.66:
-                continue
-            disease_motifs = [interval.data.get("RepeatUnit", "")] + (interval.data.get("PathogenicMotifs") or [])
-            if not any(motifs_match(motif, dm) for dm in disease_motifs):
-                continue
-            pathogenic_mins = [d.get("PathogenicMin") for d in interval.data.get("Diseases", [])
-                               if d.get("PathogenicMin") is not None]
-            # The catalog matched, so stop here even when it records no threshold: the STRchive
-            # trees are a fallback for loci the catalog does not know, exactly as in
-            # matches_disease_locus and compute_known_disease_info.
-            return min(pathogenic_mins) if pathogenic_mins else None
-
-    strchive_tree = strchive_trees.get(chrom_key) if strchive_trees else None
-    if strchive_tree:
-        for interval in strchive_tree.overlap(start_0based, end_1based):
-            if not interval.data:
-                continue
-            if compute_jaccard(start_0based, end_1based, interval.begin, interval.end) <= 0.66:
-                continue
-            # Both motif lists, the one definition of them, so the filter and the build agree on
-            # which loci STRchive knows.
-            if not any(motifs_match(motif, sm) for sm in strchive_locus_motifs(interval.data)):
-                continue
-            return interval.data.get("pathogenic_min")
-
-    return None
+    if source == "STRchive":
+        return disease_locus.get("pathogenic_min")
+    return lowest_catalog_pathogenic_min(disease_locus)
 
 
-def fetch_phenotype_scores(conn, locus_id):
-    """Fetch phenotype scores for a locus, if the score tables exist.
+# The per_outlier_phenotype_scores columns each per-outlier score dict holds
+PER_OUTLIER_PHENOTYPE_SCORE_COLUMNS = (
+    "sample_id", "allele_size", "gene_symbol",
+    "gene_phenotype_similarity", "gene_phenotype_overlap_count",
+    "n_matching_diseases", "best_matching_disease", "best_disease_inheritance",
+    "pairwise_similarity_to_next", "pairwise_shared_count_raw",
+    "pairwise_shared_count_ic", "next_sample_id",
+)
 
-    Returns:
-        dict with 'per_outlier' and 'per_locus' keys, or {} when the tables are
-        absent.
-    """
-    tables = duckdb_compat.list_tables(conn)
-    if "per_outlier_phenotype_scores" not in tables:
-        return {}
-
-    result = {"per_outlier": {}, "per_locus": {}}
-    rows = conn.execute(
-        """SELECT sample_id, outlier_type, allele_size, gene_symbol,
-                  gene_phenotype_similarity, gene_phenotype_overlap_count,
-                  n_matching_diseases, best_matching_disease, best_disease_inheritance,
-                  pairwise_similarity_to_next, pairwise_shared_count_raw,
-                  pairwise_shared_count_ic, next_sample_id
-           FROM per_outlier_phenotype_scores
-           WHERE locus_id = ?
-           ORDER BY outlier_type, allele_size DESC""",
-        (locus_id,),
-    ).fetchall()
-    for row in rows:
-        outlier_type = row[1]
-        score_dict = {
-            "sample_id": row[0],
-            "allele_size": row[2],
-            "gene_symbol": row[3],
-            "gene_phenotype_similarity": row[4],
-            "gene_phenotype_overlap_count": row[5],
-            "n_matching_diseases": row[6],
-            "best_matching_disease": row[7],
-            "best_disease_inheritance": row[8],
-            "pairwise_similarity_to_next": row[9],
-            "pairwise_shared_count_raw": row[10],
-            "pairwise_shared_count_ic": row[11],
-            "next_sample_id": row[12],
-        }
-        for k, v in score_dict.items():
-            if isinstance(v, float) and v != v:
-                score_dict[k] = None
-        result["per_outlier"].setdefault(outlier_type, []).append(score_dict)
-
-    if "per_locus_phenotype_scores" in tables:
-        rows = conn.execute(
-            """SELECT outlier_type, num_qualifying_samples, sum_pairwise_similarity,
-                      sum_pairwise_shared_raw, sum_pairwise_shared_ic,
-                      max_gene_phenotype_similarity, qualifying_sample_ids
-               FROM per_locus_phenotype_scores
-               WHERE locus_id = ?""",
-            (locus_id,),
-        ).fetchall()
-        for row in rows:
-            score_dict = {
-                "num_qualifying_samples": row[1],
-                "sum_pairwise_similarity": row[2],
-                "sum_pairwise_shared_raw": row[3],
-                "sum_pairwise_shared_ic": row[4],
-                "max_gene_phenotype_similarity": row[5],
-                "qualifying_sample_ids": row[6],
-            }
-            for k, v in score_dict.items():
-                if isinstance(v, float) and v != v:
-                    score_dict[k] = None
-            result["per_locus"][row[0]] = score_dict
-    return result
+# The per_locus_phenotype_scores columns each aggregate score dict holds
+PER_LOCUS_PHENOTYPE_SCORE_COLUMNS = (
+    "num_qualifying_samples", "sum_pairwise_similarity",
+    "sum_pairwise_shared_raw", "sum_pairwise_shared_ic",
+    "max_gene_phenotype_similarity", "qualifying_sample_ids",
+)
 
 
-def fetch_phenotype_scores_of_exported_loci(conn, export_query, export_query_params):
-    """Bulk-load the phenotype scores of the loci an export query returns, in one pass.
+def fetch_per_outlier_phenotype_scores_of_loci(conn, locus_ids_query, locus_ids_query_params):
+    """Load the per-outlier phenotype scores of the loci a query returns, in one query.
 
-    Same per-locus output shape as fetch_phenotype_scores(), but issues two queries
-    total instead of one query per locus. Used by exports that enrich every row with
-    per-sample details, where calling fetch_phenotype_scores() per row would mean N
-    SQL round trips for an N-locus export. Only the exported loci are loaded: a
-    per_outlier_phenotype_scores table can hold millions of rows, which take several
-    GB as Python dicts, so loading every locus made even a one-locus export slow.
+    Used for one locus by the locus-detail page, and for every exported locus by the exports that
+    list each locus's outlier samples. Only those loci are loaded: a per_outlier_phenotype_scores
+    table can hold millions of rows, which take several GB as Python dicts.
 
     Args:
         conn: DuckDB database connection.
-        export_query: The export's SELECT over loci (it returns a LocusId column).
-        export_query_params: The parameters of export_query.
+        locus_ids_query: A SELECT returning a LocusId column, e.g. an export's query over loci.
+        locus_ids_query_params: The parameters of locus_ids_query.
 
     Returns:
-        dict mapping locus_id to the same {'per_outlier': ..., 'per_locus': ...}
-        structure fetch_phenotype_scores() returns for a single locus.
+        dict mapping locus_id to a dict mapping outlier_type to that type's score dicts
+        (PER_OUTLIER_PHENOTYPE_SCORE_COLUMNS, NaN as None), largest allele first. {} when the
+        database has no per_outlier_phenotype_scores table.
+    """
+    if "per_outlier_phenotype_scores" not in duckdb_compat.list_tables(conn):
+        return {}
+
+    scores = collections.defaultdict(dict)
+    rows = conn.execute(
+        f"SELECT locus_id, outlier_type, {', '.join(PER_OUTLIER_PHENOTYPE_SCORE_COLUMNS)} "
+        f"FROM per_outlier_phenotype_scores "
+        f"WHERE locus_id IN (SELECT LocusId FROM ({locus_ids_query}) AS selected_loci) "
+        f"ORDER BY locus_id, outlier_type, allele_size DESC",
+        list(locus_ids_query_params),
+    ).fetchall()
+    for locus_id, outlier_type, *values in rows:
+        scores[locus_id].setdefault(outlier_type, []).append({
+            column: None if isinstance(value, float) and value != value else value
+            for column, value in zip(PER_OUTLIER_PHENOTYPE_SCORE_COLUMNS, values)})
+    return dict(scores)
+
+
+def fetch_phenotype_scores(conn, locus_id):
+    """Fetch the phenotype scores of one locus, if the score tables exist.
+
+    Args:
+        conn: DuckDB database connection.
+        locus_id: The locus's LocusId.
+
+    Returns:
+        dict with a 'per_outlier' key (outlier_type -> score dicts, see
+        fetch_per_outlier_phenotype_scores_of_loci) and a 'per_locus' key (outlier_type -> that
+        type's aggregate scores, PER_LOCUS_PHENOTYPE_SCORE_COLUMNS), each {} when the locus has
+        none. {} when the database has no per_outlier_phenotype_scores table.
     """
     tables = duckdb_compat.list_tables(conn)
     if "per_outlier_phenotype_scores" not in tables:
         return {}
 
-    results = collections.defaultdict(lambda: {"per_outlier": {}, "per_locus": {}})
-    exported_loci_filter = f"WHERE locus_id IN (SELECT LocusId FROM ({export_query}) AS exported_loci)"
-
-    rows = conn.execute(
-        f"""SELECT locus_id, sample_id, outlier_type, allele_size, gene_symbol,
-                  gene_phenotype_similarity, gene_phenotype_overlap_count,
-                  n_matching_diseases, best_matching_disease, best_disease_inheritance,
-                  pairwise_similarity_to_next, pairwise_shared_count_raw,
-                  pairwise_shared_count_ic, next_sample_id
-           FROM per_outlier_phenotype_scores
-           {exported_loci_filter}
-           ORDER BY locus_id, outlier_type, allele_size DESC""",
-        list(export_query_params),
-    ).fetchall()
-    for row in rows:
-        locus_id, outlier_type = row[0], row[2]
-        score_dict = {
-            "sample_id": row[1],
-            "allele_size": row[3],
-            "gene_symbol": row[4],
-            "gene_phenotype_similarity": row[5],
-            "gene_phenotype_overlap_count": row[6],
-            "n_matching_diseases": row[7],
-            "best_matching_disease": row[8],
-            "best_disease_inheritance": row[9],
-            "pairwise_similarity_to_next": row[10],
-            "pairwise_shared_count_raw": row[11],
-            "pairwise_shared_count_ic": row[12],
-            "next_sample_id": row[13],
-        }
-        for k, v in score_dict.items():
-            if isinstance(v, float) and v != v:
-                score_dict[k] = None
-        results[locus_id]["per_outlier"].setdefault(outlier_type, []).append(score_dict)
-
+    result = {
+        "per_outlier": fetch_per_outlier_phenotype_scores_of_loci(
+            conn, "SELECT ? AS LocusId", [locus_id]).get(locus_id, {}),
+        "per_locus": {},
+    }
     if "per_locus_phenotype_scores" in tables:
         rows = conn.execute(
-            f"""SELECT locus_id, outlier_type, num_qualifying_samples, sum_pairwise_similarity,
-                      sum_pairwise_shared_raw, sum_pairwise_shared_ic,
-                      max_gene_phenotype_similarity, qualifying_sample_ids
-               FROM per_locus_phenotype_scores
-               {exported_loci_filter}""",
-            list(export_query_params),
+            f"SELECT outlier_type, {', '.join(PER_LOCUS_PHENOTYPE_SCORE_COLUMNS)} "
+            f"FROM per_locus_phenotype_scores WHERE locus_id = ?",
+            (locus_id,),
         ).fetchall()
-        for row in rows:
-            locus_id, outlier_type = row[0], row[1]
-            score_dict = {
-                "num_qualifying_samples": row[2],
-                "sum_pairwise_similarity": row[3],
-                "sum_pairwise_shared_raw": row[4],
-                "sum_pairwise_shared_ic": row[5],
-                "max_gene_phenotype_similarity": row[6],
-                "qualifying_sample_ids": row[7],
-            }
-            for k, v in score_dict.items():
-                if isinstance(v, float) and v != v:
-                    score_dict[k] = None
-            results[locus_id]["per_locus"][outlier_type] = score_dict
-
-    return dict(results)
+        for outlier_type, *values in rows:
+            result["per_locus"][outlier_type] = {
+                column: None if isinstance(value, float) and value != value else value
+                for column, value in zip(PER_LOCUS_PHENOTYPE_SCORE_COLUMNS, values)}
+    return result
 
 
 def row_to_full_dict(row):
@@ -2386,7 +2339,6 @@ def index():
     """Serve the web UI via on-the-fly Jinja2 template rendering."""
     template = jinja2_env.get_template("index_page_template.html")
     return template.render(
-        db_labels=app.config["DB_LABELS"],
         default_source=app.config["DB_LABELS"][0],
         has_mendelian=app.config.get("HAS_MENDELIAN", False),
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
@@ -2401,7 +2353,6 @@ def swim():
     """Serve the swim plot UI."""
     template = jinja2_env.get_template("swim_plot_template.html")
     return template.render(
-        db_labels=app.config["DB_LABELS"],
         default_source=app.config["DB_LABELS"][0],
         has_mendelian=app.config.get("HAS_MENDELIAN", False),
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
@@ -2414,7 +2365,6 @@ def sample_qc():
     """Serve the sample QC page."""
     template = jinja2_env.get_template("sample_qc_template.html")
     return template.render(
-        db_labels=app.config["DB_LABELS"],
         default_source=app.config["DB_LABELS"][0],
         has_mendelian=app.config.get("HAS_MENDELIAN", False),
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
@@ -2435,7 +2385,6 @@ def qc2():
     return template.render(
         has_mendelian=True,
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
-        outlier_warnings_by_source={app.config["DB_LABELS"][0]: app.config.get("OUTLIER_WARNINGS", {})},
     )
 
 
@@ -2463,10 +2412,10 @@ def get_annotations(locus_id):
     return jsonify(result)
 
 
-# Flask serves requests on several threads, so two annotation writes can overlap. DuckDB does not
-# wait for the other writer the way sqlite3's file lock and busy timeout did: it raises on the
-# second connection instead. Every write to the annotations database therefore runs under this one
-# process-wide lock, which is enough because that database is only ever written from here.
+# Flask serves requests on several threads, so two annotation writes can overlap, and DuckDB raises
+# on a second concurrent writer instead of waiting for it. Every write to the annotations database
+# therefore runs under this one process-wide lock, which is enough because that database is only
+# ever written from here.
 ANNOTATION_WRITE_LOCK = threading.Lock()
 
 
@@ -2617,18 +2566,13 @@ def get_loci():
         if lid in pathogenic_thresholds:
             r["PathogenicMin"] = pathogenic_thresholds[lid]
 
-    filters_applied = {k: v for k, v in params.items()
-                       if k not in ("page", "page_size", "outlier_type", "sort_by", "motif_size_clause",
-                                    "motif_size_params", "reference_region_parsed",
-                                    "search_terms")}
-
     return jsonify({
         "total": total,
         "page": params["page"],
         "page_size": params["page_size"],
         "total_pages": total_pages,
         "outlier_type": ot,
-        "filters_applied": filters_applied,
+        "filters_applied": build_filters_applied(params),
         "results": results,
         "motif_counts": motif_counts,
         "gene_region_counts": gene_region_counts,
@@ -3124,16 +3068,12 @@ def export_json(conn, query, count_query, sql_params, ot, params):
     outlier sample (allele size, sample/family id, sex, ancestry, affected/analysis
     status, phenotype, purity, methylation, and phenotype-similarity scores) —
     regardless of result-set size. The exported loci's phenotype scores are bulk-loaded
-    once up front (fetch_phenotype_scores_of_exported_loci) rather than per row. Rows
+    once up front (fetch_per_outlier_phenotype_scores_of_loci) rather than per row. Rows
     still stream from the cursor.
     """
     tags_dict = app.config["ANNOTATIONS"]["tags"]
     lookups = app.config["LOOKUPS"]
-
-    non_filter_keys = {"source", "outlier_type", "sort_by", "page", "page_size",
-                       "motif_size_clause", "motif_size_params", "reference_region_parsed",
-                       "search_terms"}
-    filters_applied = {k: v for k, v in params.items() if k not in non_filter_keys}
+    population_gate_cohorts = app.config["POPULATION_GATE_COHORTS"]
 
     try:
         total = conn.execute(count_query, sql_params).fetchone()[0]
@@ -3145,7 +3085,7 @@ def export_json(conn, query, count_query, sql_params, ot, params):
         "source": app.config["DB_LABELS"][0],
         "outlier_type": params["outlier_type"],
         "sort_by": params.get("sort_by") or ["count"],
-        "filters_applied": filters_applied,
+        "filters_applied": build_filters_applied(params),
         "total_loci": total,
         "generated_at": datetime.now().isoformat(),
     }
@@ -3158,13 +3098,14 @@ def export_json(conn, query, count_query, sql_params, ot, params):
 
     def generate():
         try:
-            all_phenotype_scores = fetch_phenotype_scores_of_exported_loci(conn, query, sql_params)
+            per_outlier_scores_by_locus = fetch_per_outlier_phenotype_scores_of_loci(conn, query, sql_params)
             yield '{\n  "metadata": ' + json.dumps(metadata, indent=2).replace("\n", "\n  ") + ',\n  "loci": [\n'
             first = True
             for raw_row in conn.execute(query, sql_params):
                 row_dict = to_dict(raw_row)
-                phenotype_scores = all_phenotype_scores.get(row_dict.get("LocusId", ""), {})
-                sample_details = build_sample_details(row_dict, raw_row, conn, lookups, phenotype_scores=phenotype_scores)
+                sample_details = build_sample_details(
+                    row_dict, raw_row, lookups, per_outlier_scores_by_locus.get(row_dict.get("LocusId", ""), {}),
+                    population_gate_cohorts)
                 if sample_details:
                     row_dict["Samples"] = sample_details
                 yield ("" if first else ",\n") + "    " + json.dumps(row_dict, indent=2).replace("\n", "\n    ")
@@ -3177,8 +3118,13 @@ def export_json(conn, query, count_query, sql_params, ot, params):
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
-def compute_plot_thresholds(row_dict, all_allele_outliers_str, short_allele_outliers_str, affected_lookup):
+def compute_plot_thresholds(row_dict, all_allele_outliers_str, short_allele_outliers_str, affected_lookup,
+                            population_gate_cohorts):
     """Compute PlotReadVisualization thresholds for the ExpansionHunter export.
+
+    A locus's largest outlier earns a threshold when it is affected and above every unaffected
+    outlier; for the long allele it also has to be above the largest 99th percentile of the
+    population_gate_cohorts, the cohorts the build gated its counts with.
 
     Returns a dict with LongAllele/ShortAllele thresholds, or None if no criteria met.
     """
@@ -3215,8 +3161,7 @@ def compute_plot_thresholds(row_dict, all_allele_outliers_str, short_allele_outl
 
     long_comparison = max(
         max_long_unaffected,
-        row_dict.get("HPRC256_99thPercentile") or 0,
-        row_dict.get("AoU1027_99thPercentile") or 0,
+        analysis_columns.get_population_p99_threshold(row_dict, population_gate_cohorts) or 0,
     )
     long_threshold = find_threshold(long_outliers, affected_lookup, long_comparison)
     short_threshold = find_threshold(short_outliers, affected_lookup, max_short_unaffected)
@@ -3257,16 +3202,17 @@ def export_expansion_hunter(conn, query, count_query, sql_params, ot, params):
             rows = conn.execute(query, sql_params).fetchall()
             results = [to_dict(row) for row in rows]
             lookups = app.config["LOOKUPS"]
-            # Bulk-loaded once for the whole export, the way export_json does it: passing the
-            # per-locus scores in keeps build_sample_details from running its own
-            # fetch_phenotype_scores() query (plus a list_tables() call) for every locus.
-            all_phenotype_scores = fetch_phenotype_scores_of_exported_loci(conn, query, sql_params)
+            population_gate_cohorts = app.config["POPULATION_GATE_COHORTS"]
+            # Loaded once for the whole export, the way export_json does it, rather than with a
+            # query per locus
+            per_outlier_scores_by_locus = fetch_per_outlier_phenotype_scores_of_loci(conn, query, sql_params)
             for row_dict, raw_row in zip(results, rows):
                 thresholds = compute_plot_thresholds(
                     row_dict,
                     raw_row["OutlierSampleIds_AllAlleles"] or "",
                     raw_row["OutlierSampleIds_ShortAlleles"] or "",
                     affected_lookup,
+                    population_gate_cohorts,
                 )
                 if thresholds:
                     row_dict["PlotReadVisualization"] = [
@@ -3274,8 +3220,8 @@ def export_expansion_hunter(conn, query, count_query, sql_params, ot, params):
                         for allele in ("LongAllele", "ShortAllele") if allele in thresholds
                     ]
                 sample_details = build_sample_details(
-                    row_dict, raw_row, conn, lookups,
-                    phenotype_scores=all_phenotype_scores.get(row_dict.get("LocusId", ""), {}))
+                    row_dict, raw_row, lookups, per_outlier_scores_by_locus.get(row_dict.get("LocusId", ""), {}),
+                    population_gate_cohorts)
                 if sample_details:
                     row_dict["Samples"] = sample_details
         finally:
@@ -3373,44 +3319,39 @@ def get_locus_detail(locus_id):
     })
 
 
+# Filters the swim plot applies to each allele it draws, comparing that allele's own size, where
+# /api/v1/loci compares a locus's largest affected allele
+SWIM_PLOT_ALLELE_LEVEL_FILTERS = ("min_expansion", "apply_pathogenic_threshold", "require_above_population")
+
+
 @app.route("/api/v1/swim_plot_data")
 def get_swim_plot_data():
-    """Return swim-plot data: one entry per outlier sample per motif category."""
-    outlier_type = request.args.get("outlier_type", "all")
-    if outlier_type not in OUTLIER_TYPE_MAP:
-        return jsonify({"error": "Invalid parameter", "detail": f"outlier_type must be one of: all, short, hemi — got '{outlier_type}'"}), 400
-    ot = OUTLIER_TYPE_MAP[outlier_type]
+    """Return swim-plot data: one entry per outlier sample per motif category.
 
-    require_affected_above_unaffected = request.args.get("require_affected_above_unaffected", "")
-    apply_pathogenic_threshold = request.args.get("apply_pathogenic_threshold", "")
-    known_loci_only = request.args.get("known_loci_only", "")
-    mendelian_only = request.args.get("mendelian_only", "")
-    known_motifs_only = request.args.get("known_motifs_only", "")
-    require_above_population = request.args.get("require_above_population", "")
-    include_loci_without_population_data = request.args.get("include_loci_without_population_data", "") in ("1", "true")
-    population_metric = "MaxAllele" if request.args.get("population_metric", "") == "max" else "99thPercentile"
-    gene_regions_raw = request.args.get("gene_regions", "")
-    exclude_gene_regions_raw = request.args.get("exclude_gene_regions", "")
-    motif_size_raw = request.args.get("motif_size", "")
-    motif_raw = request.args.get("motif", "")
-    locus_id_raw = request.args.get("locus_id", "")
-    gene_symbol_raw = request.args.get("gene_symbol", "")
-    gene_id = request.args.get("gene_id", "")
-    search_raw = request.args.get("search", "")
-    max_variation_cluster_size_diff = request.args.get("max_variation_cluster_size_diff", "")
-    min_pli = request.args.get("min_pli", "")
-    phenotype_keyword_raw = request.args.get("phenotype_keyword", "")
-    sample_id_keyword_raw = request.args.get("sample_id_keyword", "")
-    sample_id_like_raw = request.args.get("sample_id_like", "")
-    min_expansion = request.args.get("min_expansion", "")
-    min_sigma_percentile_raw = request.args.get("min_sigma_percentile", "")
+    Takes the /api/v1/loci parameters (see validate_params), plus require_affected_above_unaffected,
+    which keeps only the affected alleles above every unaffected allele at their locus;
+    mendelian_only is another name for mendelian_genes_only. Each row is one allele, so:
 
-    source_columns = app.config.get("DB_COLUMNS_SET", set())
-    extra_clauses = []
-    extra_params = []
+      * the sample-level filters (SAMPLE_LEVEL_FILTERS) keep the rows of the matching samples;
+      * the SWIM_PLOT_ALLELE_LEVEL_FILTERS compare each row's own allele, where /api/v1/loci
+        compares the locus's largest affected allele;
+      * every other filter keeps the rows of the loci /api/v1/loci returns for the parameters
+        without those two kinds (build_locus_filter_clauses). min_repeats_above_population
+        therefore compares every population cohort, as /api/v1/loci does without
+        require_above_population.
+    """
+    params, error = validate_params()
+    if error:
+        return error
+    if is_true_flag("mendelian_only"):
+        params["mendelian_genes_only"] = True
+    ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
 
-    if require_affected_above_unaffected == "1":
-        extra_clauses.append("""(
+    row_clauses = []
+    row_params = []
+
+    if is_true_flag("require_affected_above_unaffected"):
+        row_clauses.append("""(
             affected_status IN ('Affected', 'Possibly Affected')
             AND allele_size > COALESCE(
                 (SELECT MAX(inner_sp.allele_size)
@@ -3422,249 +3363,46 @@ def get_swim_plot_data():
             )
         )""")
 
-    if known_loci_only == "1":
-        known_ids = app.config.get("KNOWN_DISEASE_LOCUS_IDS", set())
-        if not known_ids:
-            extra_clauses.append("1=0")
-        else:
-            extra_clauses.append(f"LocusId IN ({','.join('?' * len(known_ids))})")
-            extra_params.extend(sorted(known_ids))
+    if "min_expansion" in params:
+        row_clauses.append("swim_plot.allele_size >= swim_plot.NumRepeatsInReference + ?")
+        row_params.append(params["min_expansion"])
 
-    if apply_pathogenic_threshold == "1":
-        thresholds = app.config.get("KNOWN_DISEASE_LOCUS_THRESHOLDS", {})
-        if not thresholds:
-            extra_clauses.append("1=0")
-        else:
-            threshold_clauses = []
-            for locus_id, threshold in sorted(thresholds.items()):
-                threshold_clauses.append("(LocusId = ? AND allele_size >= ?)")
-                extra_params.extend([locus_id, threshold])
-            extra_clauses.append(f"({' OR '.join(threshold_clauses)})")
+    if params.get("apply_pathogenic_threshold"):
+        clause, threshold_params = build_pathogenic_threshold_clause("swim_plot", "allele_size")
+        row_clauses.append(clause)
+        row_params.extend(threshold_params)
 
-    if mendelian_only == "1":
-        extra_clauses.append("IsInMendelianGene = 1" if (not source_columns or "IsInMendelianGene" in source_columns) else "1=0")
-
-    if known_motifs_only == "1":
-        extra_clauses.append("IsKnownMotif = 1" if (not source_columns or "IsKnownMotif" in source_columns) else "1=0")
-
-    if require_above_population in POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION:
-        # Only reference population-stat columns that actually exist in the DB
-        # (a minimal-input build omits them); with none present the filter cannot
-        # be evaluated, so match no rows. Mirrors build_api_query.
-        datasets = POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION[require_above_population]
-        present = [d for d in datasets if not source_columns or f"{d}_{population_metric}" in source_columns]
-        above_terms = [f"({d}_{population_metric} IS NULL OR allele_size > {d}_{population_metric})" for d in present]
-        if include_loci_without_population_data:
-            if above_terms:
-                extra_clauses.append("(" + " AND ".join(above_terms) + ")")
-        else:
-            if present:
-                exists_term = " OR ".join(f"{d}_{population_metric} IS NOT NULL" for d in present)
-                extra_clauses.append("((" + exists_term + ") AND " + " AND ".join(above_terms) + ")")
-            else:
-                extra_clauses.append("1=0")
-
-    if gene_regions_raw:
-        db_regions = []
-        for r in (x.strip() for x in gene_regions_raw.split(",") if x.strip()):
-            db_regions.extend(GENE_REGION_MAP.get(r, []))
-        if db_regions:
-            extra_clauses.append(f"gene_region IN ({','.join('?' * len(db_regions))})")
-            extra_params.extend(db_regions)
-
-    if exclude_gene_regions_raw:
-        db_regions = []
-        for r in (x.strip() for x in exclude_gene_regions_raw.split(",") if x.strip()):
-            db_regions.extend(GENE_REGION_MAP.get(r, []))
-        if db_regions:
-            # Keep unannotated (NULL gene_region) rows: NULL NOT IN (...) is unknown
-            # in SQL and would otherwise drop them.
-            extra_clauses.append(f"(gene_region IS NULL OR gene_region NOT IN ({','.join('?' * len(db_regions))}))")
-            extra_params.extend(db_regions)
-
-    if motif_size_raw:
-        clause, params_list, error = parse_motif_size_filter(motif_size_raw)
-        if error:
-            return jsonify({"error": "Invalid parameter", "detail": error}), 400
+    if "require_above_population" in params:
+        clause = build_require_above_population_clause(params, "swim_plot", "allele_size")
         if clause:
-            extra_clauses.append(clause)
-            extra_params.extend(params_list)
+            row_clauses.append(clause)
 
-    if motif_raw:
-        motifs = [m.strip() for m in motif_raw.split(",") if m.strip()]
-        # This endpoint parses its own parameters rather than going through validate_params, so it
-        # repeats the IUPAC check here; without it compute_canonical_motif raises KeyError -> 500.
-        invalid_motifs = [m for m in motifs if not VALID_MOTIF_PATTERN.match(m)]
-        if invalid_motifs:
-            return jsonify({
-                "error": "Invalid parameter",
-                "detail": f"motif must contain only IUPAC bases ({''.join(sorted(COMPLEMENT))}); "
-                          f"got '{invalid_motifs[0]}'",
-            }), 400
-        if motifs:
-            canonical_motifs = {compute_canonical_motif(m, include_reverse_complement=True) for m in motifs}
-            extra_clauses.append(f"CanonicalMotif IN ({','.join('?' * len(canonical_motifs))})")
-            extra_params.extend(sorted(canonical_motifs))
+    if "phenotype_keyword" in params:
+        row_clauses.append("(" + " OR ".join("swim_plot.phenotype_description ILIKE ?"
+                                             for _ in params["phenotype_keyword"]) + ")")
+        row_params.extend(f"%{kw}%" for kw in params["phenotype_keyword"])
 
-    if locus_id_raw:
-        locus_ids = [lid.strip() for lid in locus_id_raw.split(",") if lid.strip()]
-        if locus_ids:
-            extra_clauses.append(f"LocusId IN ({','.join('?' * len(locus_ids))})")
-            extra_params.extend(locus_ids)
+    if "sample_id_keyword" in params:
+        row_clauses.append("(" + " OR ".join("lower(swim_plot.sample_id) = lower(?)"
+                                             for _ in params["sample_id_keyword"]) + ")")
+        row_params.extend(params["sample_id_keyword"])
 
-    if gene_symbol_raw:
-        symbols = [gs.strip() for gs in gene_symbol_raw.split(",") if gs.strip()]
-        if symbols:
-            gs_clauses = ["GeneTableGeneSymbol ILIKE ?" for _ in symbols]
-            extra_clauses.append(f"({' OR '.join(gs_clauses)})")
-            extra_params.extend([f"%{gs}%" for gs in symbols])
+    if "sample_id_like" in params:
+        # Escaped like the loci list's sample_id_like, so the same keyword selects the same samples
+        # in both views.
+        row_clauses.append("(" + " OR ".join("swim_plot.sample_id ILIKE ? ESCAPE '\\'"
+                                             for _ in params["sample_id_like"]) + ")")
+        row_params.extend(f"%{escape_like_wildcards(kw)}%" for kw in params["sample_id_like"])
 
-    if gene_id:
-        if not source_columns or "gene_id" in source_columns:
-            extra_clauses.append("gene_id = ?")
-            extra_params.append(normalize_gene_id(gene_id) or gene_id.strip())
-        else:
-            extra_clauses.append("1=0")
+    # The locus filters, answered from loci. swim_plot carries no coordinates or variation-cluster
+    # columns, and this endpoint runs one query per motif category, so the matching loci are picked
+    # once, into the swim_plot_matching_loci temp table, after the connection is opened.
+    locus_filter_clauses, locus_filter_params = build_locus_filter_clauses(
+        {k: v for k, v in params.items() if k not in SAMPLE_LEVEL_FILTERS + SWIM_PLOT_ALLELE_LEVEL_FILTERS})
+    if locus_filter_clauses:
+        row_clauses.append("swim_plot.LocusId IN (SELECT LocusId FROM swim_plot_matching_loci)")
 
-    # Merged search box, the same OR over locus ids / gene ids / gene symbols / regions that
-    # build_api_query applies. swim_plot carries no coordinates, so a region term is answered by
-    # a subquery against loci in the same database rather than by materializing its locus ids,
-    # which for a whole chromosome would be hundreds of thousands of bind parameters.
-    if search_raw:
-        search_clauses = []
-        search_params = []
-        locus_id_values = []
-        for term in split_search_terms(search_raw):
-            kind, value, error = classify_search_term(term)
-            if error:
-                return jsonify({"error": "Invalid parameter", "detail": error}), 400
-            if kind == "locus_id":
-                # Collected into the one set lookup built below instead of a predicate per term.
-                locus_id_values.append(value.lower())
-            elif kind == "gene_id":
-                if not source_columns or "gene_id" in source_columns:
-                    search_clauses.append("gene_id = ?")
-                    search_params.append(value)
-            elif kind == "gene_symbol":
-                if not source_columns or "GeneTableGeneSymbol" in source_columns:
-                    search_clauses.append("GeneTableGeneSymbol ILIKE ?")
-                    search_params.append(f"%{value}%")
-            else:
-                clause, region_params = reference_region_clause(value)
-                search_clauses.append(f"LocusId IN (SELECT LocusId FROM loci AS loci WHERE {clause})")
-                search_params.extend(region_params)
-        if locus_id_values:
-            # Matched the same way the results table matches it (see build_api_query): one
-            # case-insensitive set lookup over every pasted id, which needs no wildcard escaping.
-            search_clauses.insert(0, f"lower(LocusId) IN ({','.join('?' * len(locus_id_values))})")
-            search_params[:0] = locus_id_values
-        extra_clauses.append(f"({' OR '.join(search_clauses)})" if search_clauses else "1=0")
-        extra_params.extend(search_params)
-
-    # Max variation cluster size diff. swim_plot does not copy VariationClusterSizeDiff, so this
-    # is answered against loci too, the same way a region term is.
-    # Set below when the variation-cluster filter is active, and consumed once the connection is
-    # open to populate the vc_filtered_loci temp table the clause refers to.
-    vc_filter_max = None
-    if max_variation_cluster_size_diff:
-        try:
-            max_vc_diff = parse_int64(max_variation_cluster_size_diff)
-        except ValueError:
-            return jsonify({
-                "error": "Invalid parameter",
-                "detail": "max_variation_cluster_size_diff must be an integer number of base pairs, "
-                          f"got '{max_variation_cluster_size_diff}'",
-            }), 400
-        # source_columns is the loci column set (configure_app fills DB_COLUMNS_SET from
-        # "SELECT * FROM loci LIMIT 1"), and VariationClusterSizeDiff is only ever read from loci,
-        # so the same set guards this filter. The clause below deliberately keeps a locus whose
-        # cluster size is unknown, so a database with no such column at all is that same situation
-        # for every locus: add no clause, exactly as build_api_query does. Matching nothing here
-        # would empty the swim plot for a request whose results table still returns every locus.
-        if not source_columns or "VariationClusterSizeDiff" in source_columns:
-            # This endpoint runs one query per motif category, so an inline subquery over loci
-            # would re-scan that column 25 times for a single chart. Materialize the matching
-            # LocusIds into a temp table once, after the connection is opened, and join against
-            # that instead.
-            vc_filter_max = max_vc_diff
-            extra_clauses.append("LocusId IN (SELECT LocusId FROM vc_filtered_loci)")
-
-    if min_pli:
-        try:
-            pli_value = float(min_pli)
-        except ValueError:
-            return jsonify({"error": "Invalid parameter", "detail": f"min_pli must be a number, got '{min_pli}'"}), 400
-        if not source_columns or "pLI" in source_columns:
-            extra_params.append(pli_value)
-            extra_clauses.append("pLI >= ?")
-        else:
-            extra_clauses.append("1=0")
-
-    if phenotype_keyword_raw:
-        keywords = [kw.strip() for kw in phenotype_keyword_raw.split(",") if kw.strip()]
-        if keywords:
-            kw_clauses = ["phenotype_description ILIKE ?" for _ in keywords]
-            extra_clauses.append(f"({' OR '.join(kw_clauses)})")
-            extra_params.extend([f"%{kw}%" for kw in keywords])
-
-    if sample_id_keyword_raw:
-        keywords = [kw.strip() for kw in sample_id_keyword_raw.split(",") if kw.strip()]
-        if keywords:
-            kw_clauses = ["lower(sample_id) = lower(?)" for _ in keywords]
-            extra_clauses.append(f"({' OR '.join(kw_clauses)})")
-            extra_params.extend(keywords)
-
-    if sample_id_like_raw:
-        keywords = [kw.strip() for kw in sample_id_like_raw.split(",") if kw.strip()]
-        if keywords:
-            # Escaped like the loci list's sample_id_like, so the same keyword selects the same
-            # samples in both views.
-            kw_clauses = ["sample_id ILIKE ? ESCAPE '\\'" for _ in keywords]
-            extra_clauses.append(f"({' OR '.join(kw_clauses)})")
-            extra_params.extend([f"%{escape_like_wildcards(kw)}%" for kw in keywords])
-
-    if min_expansion:
-        try:
-            min_expansion_value = parse_int64(min_expansion)
-            if min_expansion_value < 0:
-                raise ValueError
-        except ValueError:
-            return jsonify({"error": "Invalid parameter", "detail": f"min_expansion must be an integer >= 0, got '{min_expansion}'"}), 400
-        extra_clauses.append("allele_size >= NumRepeatsInReference + ?")
-        extra_params.append(min_expansion_value)
-
-    if min_sigma_percentile_raw:
-        try:
-            val = float(min_sigma_percentile_raw)
-            if not 0 <= val <= 1:
-                raise ValueError
-            threshold = 1 - val
-            hprc_exists = "HPRC256_StdevPercentile" in source_columns
-            aou_exists = "AoU1027_StdevPercentile" in source_columns
-            if hprc_exists and aou_exists:
-                extra_clauses.append("((HPRC256_StdevPercentile IS NOT NULL AND HPRC256_StdevPercentile <= ?) OR (AoU1027_StdevPercentile IS NOT NULL AND AoU1027_StdevPercentile <= ?))")
-                extra_params.extend([threshold, threshold])
-            elif hprc_exists:
-                extra_clauses.append("(HPRC256_StdevPercentile IS NOT NULL AND HPRC256_StdevPercentile <= ?)")
-                extra_params.append(threshold)
-            elif aou_exists:
-                extra_clauses.append("(AoU1027_StdevPercentile IS NOT NULL AND AoU1027_StdevPercentile <= ?)")
-                extra_params.append(threshold)
-            else:
-                extra_clauses.append("1=0")
-        except ValueError:
-            return jsonify({"error": "Invalid parameter", "detail": f"min_sigma_percentile must be a number between 0 and 1, got '{min_sigma_percentile_raw}'"}), 400
-
-    tag_raw = request.args.get("tag", "").strip()
-    if tag_raw:
-        matching = resolve_tag_to_loci(tag_raw)
-        if not matching:
-            extra_clauses.append("1=0")
-        else:
-            extra_clauses.append(f"LocusId IN ({','.join('?' * len(matching))})")
-            extra_params.extend(sorted(matching))
-
-    extra_where = (" AND " + " AND ".join(extra_clauses)) if extra_clauses else ""
+    extra_where = (" AND " + " AND ".join(row_clauses)) if row_clauses else ""
     # "Unknown" is the motif_category swim_plot assigns rows whose MotifSize is
     # missing (swim_plot._compute_motif_category); include it so those rows are
     # not silently dropped from the endpoint.
@@ -3676,15 +3414,14 @@ def get_swim_plot_data():
         if "swim_plot" not in duckdb_compat.list_tables(conn):
             return jsonify({"error": "swim_plot table not found", "detail": "The database has no swim_plot table."}), 500
 
-        if vc_filter_max is not None:
+        if locus_filter_clauses:
             # A read-only main database still allows temp tables (they live in memory, in this
-            # connection's own temp schema), so this costs one scan of loci's one relevant
-            # column per request instead of one per category.
+            # connection's own temp schema), so this costs one scan of loci per request instead
+            # of one per category.
             conn.execute(
-                "CREATE OR REPLACE TEMP TABLE vc_filtered_loci AS SELECT LocusId FROM loci "
-                "WHERE VariationClusterSizeDiff IS NULL "
-                "OR COALESCE(TRY_CAST(VariationClusterSizeDiff AS BIGINT), 0) <= ?",
-                (vc_filter_max,))
+                "CREATE OR REPLACE TEMP TABLE swim_plot_matching_loci AS SELECT LocusId FROM loci "
+                f"WHERE {' AND '.join(locus_filter_clauses)}",
+                locus_filter_params)
 
         # LocusId and sample_id follow allele_size in the ORDER BY so the top 500 is a decided
         # set rather than an arbitrary one: hundreds of rows share an allele size, and DuckDB
@@ -3697,7 +3434,7 @@ def get_swim_plot_data():
                 FROM swim_plot
                 WHERE outlier_type = ? AND motif_category = ?""" + extra_where + """
                 ORDER BY allele_size DESC, LocusId, sample_id LIMIT 500""")
-            for row in conn.execute(query, [ot, motif_category] + extra_params).fetchall():
+            for row in conn.execute(query, [ot, motif_category] + row_params).fetchall():
                 entry = {
                     "rowid": row["rowid"],
                     "allele_size": row["allele_size"],
@@ -3965,7 +3702,7 @@ def get_schema():
             "max_variation_cluster_size_diff": {"type": "integer", "description": "Keep loci whose TRExplorer variation cluster is at most this many base pairs larger than the repeat itself. Loci with no variation cluster annotation are kept"},
             "exclude_vc_depth_filtered": {"type": "boolean", "description": "Drop loci where no variation cluster could be computed because the region had too little coverage in the population dataset the clusters were derived from (VariationClusterFilterReason = DEPTH), shown as a gold crossed-out circle in the VC column"},
             "exclude_vc_size_filtered": {"type": "boolean", "description": "Drop loci where a variation cluster was computed and then discarded because it was wider than the maximum allowed (VariationClusterFilterReason = EXTENSION), shown as a dark red crossed-out circle in the VC column"},
-            # The legacy parameters below are superseded by 'search', which the UI sends instead; they still work for direct API callers.
+            # The UI sends 'search' instead of the parameters below, which are for direct API callers.
             "gene_id": {"type": "string"},
             "gene_symbol": {"type": "string"},
             "locus_id": {"type": "string"},
@@ -3987,7 +3724,7 @@ def get_schema():
         "has_affected_unsolved_outliers_table": has_affected_unsolved_outliers_table(),
         "group_sort_options": list(GROUPED_SORTS),
         "total_loci": app.config.get("TOTAL_LOCI", 0),
-        # None for a database built before the pipeline started recording the sample count
+        # None for a database whose metadata table does not record the sample count
         "total_samples": app.config.get("TOTAL_SAMPLES"),
         "database_columns": app.config.get("DB_COLUMNS", []),
         "all_tags": app.config["ANNOTATIONS"]["all_tags"],
@@ -4037,8 +3774,8 @@ def configure_app(db_path, sample_table=None, known_loci_json=None,
     """
     db_path = os.path.abspath(db_path)
     app.config["DB_PATH"] = db_path
-    # The templates still expect a db_labels list (their source-selector block is
-    # guarded by `db_labels|length > 1`, so a single entry hides the selector).
+    # The database's one label: the pages send it back as their source parameter and key their
+    # outlier-warning map by it, and /api/v1/schema and the JSON export report it as the source.
     app.config["DB_LABELS"] = ["TRails"]
 
     # Sample metadata (optional).
@@ -4079,9 +3816,10 @@ def configure_app(db_path, sample_table=None, known_loci_json=None,
     conn = duckdb_compat.connect(db_path, read_only=True)
     try:
         total_loci = conn.execute("SELECT COUNT(*) FROM loci").fetchone()[0]
-        # None for a database built before the pipeline started recording the sample count.
+        # None for a database whose metadata table does not record the sample count.
         total_samples = read_sample_count(conn)
-        # Named in the page's #Fam and Group Results By help text
+        # Named in the page's #Fam and Group Results By help text, and the population bar of the
+        # exports' outlier sample lists (build_sample_details, compute_plot_thresholds)
         population_gate_cohorts = read_population_gate_cohorts(conn)
         # LIMIT 0 rather than duckdb_compat.table_columns: the columns are advertised as an
         # ordered list via /api/v1/schema, and a query's description keeps the table's order
@@ -4171,8 +3909,6 @@ def configure_app(db_path, sample_table=None, known_loci_json=None,
     app.config["MENDELIAN_WARNINGS"] = load_mendelian_warnings(db_path)
     app.config["QC2_CACHE"] = None
 
-    return total_loci, db_columns_set, tables
-
 
 # ---------------------------------------------------------------------------
 # Main entry point
@@ -4190,7 +3926,7 @@ def main():
         print(f"Loading known disease loci: {args.known_loci_json}")
     print(f"Loading annotations: {args.annotations_db}")
 
-    total_loci, _db_columns_set, tables = configure_app(
+    configure_app(
         args.db,
         sample_table=args.sample_table,
         known_loci_json=args.known_loci_json,
@@ -4198,6 +3934,7 @@ def main():
         strchive_loci_json=args.strchive_loci_json,
     )
 
+    total_loci = app.config["TOTAL_LOCI"]
     total_samples = app.config["TOTAL_SAMPLES"]
     if total_samples is None:
         print(f"Loaded {total_loci:,d} loci (sample count not recorded; rebuild the database to add it)")

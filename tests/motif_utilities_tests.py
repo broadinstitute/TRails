@@ -1,8 +1,8 @@
 """Unit tests for motif_utilities.
 
-Golden values for reverse_complement and compute_canonical_motif are borrowed
-from str_analysis/utils/canonical_repeat_unit_tests.py to confirm the port
-reproduces the original behavior exactly.
+The reverse_complement and compute_canonical_motif cases check fixed expected
+outputs, including IUPAC ambiguity codes and motifs whose canonical form comes
+from the reverse complement.
 """
 
 import unittest

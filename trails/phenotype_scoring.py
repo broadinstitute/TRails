@@ -1,13 +1,10 @@
-"""HPO gene-phenotype and pairwise phenotype scoring for TRails.
-
-This module ports the *inlined* phenotype-scoring path of the original
-``analyze_results.py`` pipeline (its ``compute_phenotype_scores`` plus the
-low-level helpers it borrowed from ``gene_phenotype_scorer.py``). It does NOT
-port the standalone ``process_all_loci`` CLI.
+"""Gene-phenotype and pairwise phenotype scores for the qualifying outlier samples of each locus.
 
 For each locus and outlier type (AllAlleles / ShortAlleles / HemizygousAlleles)
-it selects the *qualifying* affected/unsolved outlier samples, then computes two
-families of scores:
+it selects the *qualifying* outlier samples (the affected/unsolved samples that
+``analysis_columns.find_affected_unsolved_samples_above_unaffected`` selects for
+the NumAffectedUnsolved* counts, restricted to those with HPO terms), then
+computes two families of scores:
 
   * A gene-phenotype similarity: how well a patient's HPO terms match the known
     disease phenotypes of the gene at that locus, restricted to diseases whose
@@ -28,12 +25,10 @@ HPO term-id strings (as produced by ``input_tables.read_phenotypes``).
 """
 
 from analysis_columns import (
+    OUTLIER_TYPES,
     POPULATION_P99_GATE_COHORTS,
-    is_affected_unsolved,
-    is_above_population_p99,
-    is_above_unaffected,
-    is_missing_outlier_value,
-    parse_outlier_entries,
+    find_affected_unsolved_samples_above_unaffected,
+    parse_outlier_entries_by_type,
 )
 
 
@@ -46,8 +41,6 @@ OUTLIER_TYPE_INHERITANCE = {
     "ShortAlleles": {"AR"},
     "HemizygousAlleles": {"XR", "XL", "XD"},
 }
-
-OUTLIER_TYPES = ["AllAlleles", "ShortAlleles", "HemizygousAlleles"]
 
 
 # Whether the pyhpo Ontology() singleton has already been initialized. Building
@@ -222,27 +215,17 @@ def score_patient_vs_gene_filtered(patient_hpo_ids, gene_symbol, gene_disease_da
 
     Args:
         patient_hpo_ids: Iterable of the patient's HPO term ids.
-        gene_symbol: The gene symbol to score against, or None.
+        gene_symbol: The gene symbol to score against; must be a key of
+            ``gene_disease_data``.
         gene_disease_data: Mapping
             ``{gene_symbol: {disease_id: {"phenotypes": set, "inheritance": set}}}``.
         allowed_inheritance: Set of inheritance codes compatible with the outlier
             type (e.g. {"AD", "XD"}).
 
     Returns:
-        dict with keys: has_annotation (bool), best_disease (str or None),
-        best_similarity (float), best_inheritance (str or None),
-        overlap_count (int), n_matching_diseases (int).
+        dict with keys: best_disease (str or None), best_similarity (float),
+        best_inheritance (str or None), overlap_count (int), n_matching_diseases (int).
     """
-    if gene_symbol not in gene_disease_data:
-        return {
-            "has_annotation": False,
-            "best_disease": None,
-            "best_similarity": 0.0,
-            "best_inheritance": None,
-            "overlap_count": 0,
-            "n_matching_diseases": 0,
-        }
-
     disease_scores = []
     for disease_id, data in gene_disease_data[gene_symbol].items():
         disease_phenotypes = data["phenotypes"]
@@ -260,7 +243,6 @@ def score_patient_vs_gene_filtered(patient_hpo_ids, gene_symbol, gene_disease_da
 
     if not disease_scores:
         return {
-            "has_annotation": True,
             "best_disease": None,
             "best_similarity": 0.0,
             "best_inheritance": None,
@@ -270,7 +252,6 @@ def score_patient_vs_gene_filtered(patient_hpo_ids, gene_symbol, gene_disease_da
 
     disease_scores.sort(key=lambda score: score["similarity"], reverse=True)
     return {
-        "has_annotation": True,
         "best_disease": disease_scores[0]["disease_id"],
         "best_similarity": disease_scores[0]["similarity"],
         "best_inheritance": disease_scores[0]["inheritance"],
@@ -279,28 +260,25 @@ def score_patient_vs_gene_filtered(patient_hpo_ids, gene_symbol, gene_disease_da
     }
 
 
-def get_qualifying_samples(row, outlier_type, affected_lookup, analysis_lookup, participant_to_hpo,
+def get_qualifying_samples(row, affected_lookup, analysis_lookup, participant_to_hpo,
                            population_gate_cohorts=POPULATION_P99_GATE_COHORTS):
-    """Select the qualifying outlier samples for one locus and outlier type.
+    """Select the qualifying outlier samples of one locus, for each outlier type.
 
-    Walking the outlier entries largest-allele-first, a sample qualifies only if
-    it passes all four gates:
-      1. Affected and unsolved (``is_affected_unsolved``).
-      2. Above the largest unaffected/solved sample (``is_above_unaffected``).
-      3. Above every available 99th percentile of the population_gate_cohorts
-         (``is_above_population_p99``).
-      4. Has at least one HPO term in ``participant_to_hpo``.
+    A sample qualifies for an outlier type when
+    ``analysis_columns.find_affected_unsolved_samples_above_unaffected`` selects it
+    (affected/unsolved, strictly above every unaffected/solved sample and above the
+    largest 99th percentile of the population_gate_cohorts, which are the samples
+    NumAffectedUnsolvedSamplesAboveUnaffected counts) and it has at least one HPO
+    term in ``participant_to_hpo``.
 
-    The result is then deduplicated by sample_id keeping the LARGEST qualifying
-    allele per sample (its first occurrence in the descending-allele order). A
-    diploid/homozygous sample can otherwise pass at two allele sizes, which would
-    inflate the qualifying count and fabricate a perfect self-similarity in the
-    consecutive-pair comparison.
+    Each sample appears at most once per outlier type, at its LARGEST qualifying
+    allele. A diploid/homozygous sample can pass at two allele sizes, and listing it
+    twice would inflate the qualifying count and fabricate a perfect
+    self-similarity in the consecutive-pair comparison.
 
     Args:
-        row: A locus record dict carrying OutlierSampleIds_*, the
-            FirstUnaffectedAlleleSize_* and *_99thPercentile columns, and LocusId.
-        outlier_type: One of AllAlleles / ShortAlleles / HemizygousAlleles.
+        row: A locus record dict carrying OutlierSampleIds_*, the *_99thPercentile
+            columns, and LocusId.
         affected_lookup: Mapping of sample_id -> affected_status.
         analysis_lookup: Mapping of sample_id -> analysis_status.
         participant_to_hpo: Mapping of sample_id -> set of HPO term ids.
@@ -308,37 +286,19 @@ def get_qualifying_samples(row, outlier_type, affected_lookup, analysis_lookup, 
             allele must exceed.
 
     Returns:
-        list of (sample_id, allele_size, hpo_term_set) tuples sorted by allele
-        size descending, at most one entry per sample_id.
+        dict: outlier_type -> list of (sample_id, allele_size, hpo_term_set) tuples
+        sorted by allele size descending (samples sharing an allele size in outlier
+        string order), empty when no sample qualifies.
     """
-    column = f"OutlierSampleIds_{outlier_type}"
-    outlier_value = row.get(column)
-    if is_missing_outlier_value(outlier_value):
-        return []
-
-    qualifying = []
-    for allele_size, sample_id, _purity, _methylation in parse_outlier_entries(
-        outlier_value, locus_id=row.get("LocusId"), column=column
-    ):
-        if not is_affected_unsolved(sample_id, affected_lookup, analysis_lookup):
-            continue
-        if not is_above_unaffected(allele_size, row, outlier_type):
-            continue
-        if not is_above_population_p99(allele_size, row, population_gate_cohorts):
-            continue
-        hpo_term_set = participant_to_hpo.get(sample_id, set())
-        if not hpo_term_set:
-            continue
-        qualifying.append((sample_id, allele_size, set(hpo_term_set)))
-
-    seen_sample_ids = set()
-    deduped_qualifying = []
-    for entry in qualifying:
-        if entry[0] in seen_sample_ids:
-            continue
-        seen_sample_ids.add(entry[0])
-        deduped_qualifying.append(entry)
-    return deduped_qualifying
+    samples_for_each_outlier_type = find_affected_unsolved_samples_above_unaffected(
+        row, affected_lookup, analysis_lookup, parse_outlier_entries_by_type(row),
+        population_gate_cohorts)
+    return {
+        outlier_type: [(sample_id, allele_size, set(participant_to_hpo[sample_id]))
+                       for sample_id, allele_size in (samples or {}).items()
+                       if participant_to_hpo.get(sample_id)]
+        for outlier_type, samples in zip(OUTLIER_TYPES, samples_for_each_outlier_type)
+    }
 
 
 def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_disease_data,
@@ -354,10 +314,9 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
     comma-joined qualifying sample ids).
 
     As a side effect, each record gains ``MaxGenePhenoSim_{outlier_type}`` and
-    ``SumPairwiseSim_{outlier_type}`` columns (the per-locus aggregates), so the
-    loci table carries the same denormalized phenotype columns the original
-    pipeline merged in. Outlier types with no qualifying samples leave those
-    columns as None on that record.
+    ``SumPairwiseSim_{outlier_type}`` columns, so the loci table carries the
+    per-locus phenotype aggregates. Outlier types with no qualifying samples leave
+    those columns as None on that record.
 
     If ``participant_to_hpo`` is empty there are no phenotypes to score: the
     function returns ([], []) and adds no columns to the records. The loci-table
@@ -407,11 +366,9 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
             row.setdefault(f"MaxGenePhenoSim_{outlier_type}", None)
             row.setdefault(f"SumPairwiseSim_{outlier_type}", None)
 
-        for outlier_type in OUTLIER_TYPES:
-            qualifying = get_qualifying_samples(
-                row, outlier_type, affected_lookup, analysis_lookup, participant_to_hpo,
-                population_gate_cohorts
-            )
+        for outlier_type, qualifying in get_qualifying_samples(
+                row, affected_lookup, analysis_lookup, participant_to_hpo,
+                population_gate_cohorts).items():
             if not qualifying:
                 continue
 

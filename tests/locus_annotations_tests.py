@@ -289,10 +289,10 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
         self.assertEqual(strchive_trees, {})
         self.assertEqual(locus_lookup, {})  # not built unless build_locus_lookup=True
         self.assertIn("1", interval_trees)
-        # Start is converted from 1-based 1000 to 0-based 999.
+        # MainReferenceRegion's start is already 0-based, so it is stored as it is.
         intervals = sorted(interval_trees["1"])
         self.assertEqual(len(intervals), 1)
-        self.assertEqual(intervals[0].begin, 999)
+        self.assertEqual(intervals[0].begin, 1000)
         self.assertEqual(intervals[0].end, 1030)
         self.assertEqual(intervals[0].data["LocusId"], "DISEASE_A")
 
@@ -301,7 +301,7 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
             self.catalog_path, build_locus_lookup=True)
         # Keyed by LocusId and by "chrom-start0-end1-RepeatUnit".
         self.assertIn("DISEASE_A", locus_lookup)
-        self.assertIn("1-999-1030-CAG", locus_lookup)
+        self.assertIn("1-1000-1030-CAG", locus_lookup)
         self.assertEqual(locus_lookup["DISEASE_A"]["LocusId"], "DISEASE_A")
 
     def test_no_network_fetch_by_default(self):
@@ -323,7 +323,7 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
                 self.catalog_path, strchive_filepath=strchive_path)
             self.assertIn("2", strchive_trees)
             intervals = sorted(strchive_trees["2"])
-            self.assertEqual(intervals[0].begin, 499)
+            self.assertEqual(intervals[0].begin, 500)
             self.assertEqual(intervals[0].end, 530)
         finally:
             os.remove(strchive_path)
@@ -342,13 +342,46 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
             _trees, strchive_trees, _lookup = locus_annotations.load_known_disease_loci(
                 self.catalog_path, strchive_filepath=strchive_path)
             self.assertEqual(
-                locus_annotations.matches_disease_locus("chr2-499-530-CCG", {}, strchive_trees),
+                locus_annotations.matches_disease_locus("chr2-500-530-CCG", {}, strchive_trees),
                 "STR_B")
             self.assertIn(
                 locus_annotations.compute_canonical_motif("CCG", include_reverse_complement=True),
                 locus_annotations.collect_known_disease_canonical_motifs({}, strchive_trees))
         finally:
             os.remove(strchive_path)
+
+    def test_real_htt_locus_is_stored_at_its_locus_id_coordinates(self):
+        # HTT's CAG repeat, as the GRCh38 variant catalog and STRchive list it. Both give the
+        # 57 bp of 19 CAG repeats with a 0-based start, which TRExplorer and TRGT-style
+        # catalogs call 4-3074876-3074933-CAG, so a locus with that id matches with Jaccard 1.
+        catalog_path = _make_catalog_file([{
+            "LocusId": "HTT",
+            "MainReferenceRegion": "chr4:3074876-3074933",
+            "RepeatUnit": "CAG",
+            "Diseases": [{"Symbol": "HD", "Name": "Huntington's disease"}],
+        }])
+        strchive_path = _make_catalog_file([{
+            "id": "HD_HTT", "disease": "Huntington disease", "chrom": "chr4",
+            "start_hg38": 3074876, "stop_hg38": 3074933,
+            "reference_motif_reference_orientation": ["CAG"],
+            "pathogenic_motif_reference_orientation": ["CAG"],
+        }])
+        try:
+            interval_trees, strchive_trees, locus_lookup = locus_annotations.load_known_disease_loci(
+                catalog_path, strchive_filepath=strchive_path, build_locus_lookup=True)
+        finally:
+            os.remove(catalog_path)
+            os.remove(strchive_path)
+        for trees in (interval_trees, strchive_trees):
+            [interval] = trees["4"]
+            self.assertEqual((interval.begin, interval.end), (3074876, 3074933))
+            self.assertEqual((interval.end - interval.begin) % len("CAG"), 0)
+        self.assertEqual(locus_lookup["4-3074876-3074933-CAG"]["LocusId"], "HTT")
+        self.assertEqual(
+            locus_annotations.matches_disease_locus("4-3074876-3074933-CAG", interval_trees), "HTT")
+        self.assertEqual(
+            locus_annotations.matches_disease_locus("4-3074876-3074933-CAG", {}, strchive_trees),
+            "HD_HTT")
 
 
 class MatchesDiseaseLocusTests(unittest.TestCase):
@@ -365,43 +398,43 @@ class MatchesDiseaseLocusTests(unittest.TestCase):
         self.catalog_path = _make_catalog_file(self.catalog)
         self.interval_trees, _, _ = locus_annotations.load_known_disease_loci(
             self.catalog_path)
-        # Stored interval is [999, 1030).
+        # Stored interval is [1000, 1030).
 
     def tearDown(self):
         os.remove(self.catalog_path)
 
     def test_exact_overlap_and_motif_match(self):
-        # Query [999,1030) CAG: Jaccard 1.0, motif matches RepeatUnit.
+        # Query [1000,1030) CAG: Jaccard 1.0, motif matches RepeatUnit.
         self.assertEqual(
             locus_annotations.matches_disease_locus(
-                "1-999-1030-CAG", self.interval_trees),
+                "1-1000-1030-CAG", self.interval_trees),
             "ATXN_TEST")
 
     def test_matches_via_reverse_complement_motif(self):
         # CTG reverse-complements to CAG canonical -> match.
         self.assertEqual(
             locus_annotations.matches_disease_locus(
-                "1-999-1030-CTG", self.interval_trees),
+                "1-1000-1030-CTG", self.interval_trees),
             "ATXN_TEST")
 
     def test_matches_pathogenic_motif(self):
         # CGG canonical matches the pathogenic motif CCG (rev-comp), same canonical.
         self.assertEqual(
             locus_annotations.matches_disease_locus(
-                "1-999-1030-CGG", self.interval_trees),
+                "1-1000-1030-CGG", self.interval_trees),
             "ATXN_TEST")
 
     def test_motif_mismatch_returns_none(self):
         # Overlap is fine but AT does not match CAG or CCG.
         self.assertIsNone(
             locus_annotations.matches_disease_locus(
-                "1-999-1030-AT", self.interval_trees))
+                "1-1000-1030-AT", self.interval_trees))
 
     def test_low_jaccard_overlap_returns_none(self):
-        # Query [999, 1500): overlaps but Jaccard = 31/501 < 0.66 -> no match.
+        # Query [1000, 1500): overlaps but Jaccard = 30/500 < 0.66 -> no match.
         self.assertIsNone(
             locus_annotations.matches_disease_locus(
-                "1-999-1500-CAG", self.interval_trees))
+                "1-1000-1500-CAG", self.interval_trees))
 
     def test_no_overlap_returns_none(self):
         self.assertIsNone(
@@ -411,12 +444,12 @@ class MatchesDiseaseLocusTests(unittest.TestCase):
     def test_wrong_chromosome_returns_none(self):
         self.assertIsNone(
             locus_annotations.matches_disease_locus(
-                "2-999-1030-CAG", self.interval_trees))
+                "2-1000-1030-CAG", self.interval_trees))
 
     def test_chr_prefix_in_query_is_normalized(self):
         self.assertEqual(
             locus_annotations.matches_disease_locus(
-                "chr1-999-1030-CAG", self.interval_trees),
+                "chr1-1000-1030-CAG", self.interval_trees),
             "ATXN_TEST")
 
     def test_strchive_fallback(self):
@@ -474,8 +507,8 @@ class StrchiveLocusMotifsTests(unittest.TestCase):
             ["AAGGG"])
 
     def test_the_server_uses_this_definition(self):
-        # results_server's locus-detail fallback used to keep its own reference-only copy of this
-        # list, which is how it came to disagree with the build about known disease loci.
+        # The server's locus-detail fallback must use this same function, so the server and the
+        # build agree on which loci are known disease loci.
         self.assertIs(results_server.strchive_locus_motifs,
                       locus_annotations.strchive_locus_motifs)
 
@@ -524,7 +557,7 @@ class KnownMotifAndMendelianGeneTests(unittest.TestCase):
 
 
 class PathogenicMotifsNullTests(unittest.TestCase):
-    """WS2: PathogenicMotifs explicitly null must not raise TypeError."""
+    """A catalog locus whose PathogenicMotifs is an explicit null still matches by RepeatUnit."""
 
     def test_null_pathogenic_motifs_does_not_crash(self):
         tree = intervaltree.IntervalTree()

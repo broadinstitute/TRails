@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import trails_setup
+import trexplorer_annotations
 
 
 class GenelookupExportTests(unittest.TestCase):
@@ -86,6 +87,39 @@ class FetchReferenceDataTests(unittest.TestCase):
         self.assertIn(trails_setup.TREXPLORER_ANNOTATIONS_DATABASE_NAME, names)
         self.assertIn(trails_setup.GENELOOKUP_GENE_TABLE_NAME, names)
         self.assertIn(trails_setup.TREXPLORER_CATALOG_VERSION, trails_setup.TREXPLORER_ANNOTATIONS_TSV_URL)
+
+
+class TRExplorerAnnotationsDatabaseCacheTests(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_a_database_recorded_under_another_format_is_rebuilt_from_the_same_url(self):
+        # A cached database recorded without the current database format may lack columns that
+        # add_trexplorer_annotations reads, so it is rebuilt. The download URL stays the plain one.
+        name, source, fetch = next(entry for entry in trails_setup.REFERENCE_FILES
+                                   if entry[0] == trails_setup.TREXPLORER_ANNOTATIONS_DATABASE_NAME)
+        self.assertIn(f"database_format={trails_setup.TREXPLORER_ANNOTATIONS_DATABASE_FORMAT_VERSION}", source)
+        database_path = os.path.join(self.tmpdir, name)
+        manifest_path = os.path.join(self.tmpdir, trails_setup.CACHE_MANIFEST_NAME)
+        with open(database_path, "w") as f:
+            f.write("a database built in an older format")
+        with open(manifest_path, "w") as f:
+            json.dump({name: trails_setup.TREXPLORER_ANNOTATIONS_TSV_URL}, f)
+
+        with mock.patch.object(trails_setup, "REFERENCE_FILES", [(name, source, fetch)]), \
+                mock.patch.object(trails_setup, "_download") as download, \
+                mock.patch.object(trexplorer_annotations, "build_trexplorer_annotations_database") as build:
+            self.assertEqual(trails_setup.fetch_reference_data(self.tmpdir), {name: database_path})
+
+        downloaded_table = database_path + ".download.tsv.gz"
+        download.assert_called_once_with(trails_setup.TREXPLORER_ANNOTATIONS_TSV_URL, downloaded_table)
+        build.assert_called_once_with(downloaded_table, database_path)
+        with open(manifest_path) as f:
+            self.assertEqual(json.load(f), {name: source})
 
 
 if __name__ == "__main__":

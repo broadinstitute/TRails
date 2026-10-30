@@ -4,8 +4,9 @@
 // qc2_template.html, and swim_plot_template.html. Kept in one place so fixes to the
 // box-plot stats / Mendelian-warning popup can't drift between the pages. (escapeHtml,
 // isAffectedStatus, setupDropdownMenu, renderMendelianWarning, computeBoxStats,
-// computePercentile, singleBinBoxPlotPlugin, and the Mendelian-warning popup handler.)
-// Page-specific pieces (MOTIF_BINS, MENDELIAN_WARNINGS, chart-building) stay in each page.
+// computePercentile, singleBinBoxPlotPlugin, the QC pages' per-bin builders appendQCBinCard and
+// createSingleBinBoxPlotChart, and the Mendelian-warning popup handler.)
+// Page-specific pieces (MOTIF_BINS, MENDELIAN_WARNINGS, each chart's data and options) stay in each page.
 // Requires Chart.js + jQuery (loaded by header_template.html) and the page-level
 // MENDELIAN_WARNINGS const (referenced only at call time).
 // =========================================================================
@@ -235,6 +236,131 @@ const singleBinBoxPlotPlugin = {
 };
 
 Chart.register(singleBinBoxPlotPlugin);
+
+// Append one bin's card to a QC page's row of charts (Sample QC, QC2): the bin name over an empty
+// canvas for its chart, then, when tableRows is not empty, a table titled tableTitle. tableRows
+// holds the inner HTML of each table row. Returns the canvas id, which the chart is drawn into
+// once the card is in the DOM.
+function appendQCBinCard(container, binIndex, bin, tableTitle, tableHeaderHtml, tableRows) {
+    const chartWrapper = document.createElement('div');
+    chartWrapper.className = 'qc-chart-container';
+
+    const label = document.createElement('div');
+    label.className = 'qc-bin-label';
+    label.textContent = bin;
+
+    // Canvas wrapper for fixed height
+    const canvasWrapper = document.createElement('div');
+    canvasWrapper.className = 'qc-chart-canvas-wrapper';
+
+    const canvas = document.createElement('canvas');
+    canvas.id = `${container.id}-chart-${binIndex}`;
+
+    canvasWrapper.appendChild(canvas);
+    chartWrapper.appendChild(label);
+    chartWrapper.appendChild(canvasWrapper);
+
+    if (tableRows.length > 0) {
+        const tableTitleDiv = document.createElement('div');
+        tableTitleDiv.className = 'qc-table-title';
+        tableTitleDiv.textContent = tableTitle;
+
+        const table = document.createElement('table');
+        table.className = 'qc-top-table';
+
+        const thead = document.createElement('thead');
+        thead.innerHTML = tableHeaderHtml;
+        table.appendChild(thead);
+
+        const tbody = document.createElement('tbody');
+        tableRows.forEach(rowHtml => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = rowHtml;
+            tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+
+        chartWrapper.appendChild(tableTitleDiv);
+        chartWrapper.appendChild(table);
+    }
+
+    container.appendChild(chartWrapper);
+    return canvas.id;
+}
+
+// Draw one bin's chart on a QC page: a box plot of the points' y values (singleBinBoxPlotPlugin,
+// with its 95th and 99th percentile lines) behind one dot per point, jittered sideways around
+// x = 0. Each point is {y, ...} plus whatever fields options.tooltipLines reads. The options are
+// what the pages' charts differ in:
+//   datasetLabel, backgroundColor, borderColor, pointRadius, pointHoverRadius: the dots;
+//   yAxisTitle, yAxisRange (e.g. {beginAtZero: true} or {min: 0, max: yMax}) and the optional
+//   yTickLabel(value) callback: the y axis;
+//   tooltipLines(point): the lines of a dot's tooltip.
+function createSingleBinBoxPlotChart(canvasId, points, options) {
+    const ctx = document.getElementById(canvasId).getContext('2d');
+    const values = points.map(point => point.y);
+
+    const yTicks = { font: { size: 10 }, maxTicksLimit: 6 };
+    if (options.yTickLabel) yTicks.callback = options.yTickLabel;
+
+    const chart = new Chart(ctx, {
+        type: 'scatter',
+        data: {
+            datasets: [{
+                label: options.datasetLabel,
+                // jitter between -0.3 and 0.3
+                data: points.map(point => Object.assign({ x: (Math.random() - 0.5) * 0.6 }, point)),
+                backgroundColor: options.backgroundColor,
+                borderColor: options.borderColor,
+                pointRadius: options.pointRadius,
+                pointHoverRadius: options.pointHoverRadius
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: {
+                    type: 'linear',
+                    min: -0.8,
+                    max: 0.8,
+                    display: false,  // Hide x-axis since it's just jitter
+                    grid: { display: false }
+                },
+                y: Object.assign({
+                    title: {
+                        display: true,
+                        text: options.yAxisTitle,
+                        font: { size: 11 }
+                    },
+                    ticks: yTicks
+                }, options.yAxisRange)
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            return options.tooltipLines(context.raw);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Store box stats for the custom plugin
+    chart.config._boxStats = computeBoxStats(values);
+
+    // Compute and store percentiles for the custom plugin
+    const sortedValues = values.slice().sort((a, b) => a - b);
+    chart.config._percentiles = {
+        p95: computePercentile(sortedValues, 95),
+        p99: computePercentile(sortedValues, 99)
+    };
+
+    return chart;
+}
 
 // Warning icon click handler — show violation rates and/or outlier info popup
 document.addEventListener('click', function(e) {

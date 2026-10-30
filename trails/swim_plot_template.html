@@ -468,7 +468,7 @@ function renderSwimChart(data) {
     const xAxisMode = $('input[name="swim_xaxis_mode"]:checked').val() || 'absolute';
 
     // Read motif size filter for dynamic y-axis range
-    // Parse the new motif_size format to extract min/max for y-axis display.
+    // Parse the motif_size filter (e.g. 3, 3-6, 5-, -10) for the y-axis range.
     // Use the motif_size that produced the loaded data (swimLoadedParams), NOT
     // the live input, so re-renders (e.g. x-axis toggle) don't apply a filter
     // the user typed but hasn't loaded yet.
@@ -556,8 +556,10 @@ function renderSwimChart(data) {
         // Determine point style: triangle for a "true"/"candidate" tag, rect for intergenic, circle
         // otherwise. Not Chart.js's 'star': it is drawn from line segments only, so with this
         // dataset's 0.5px border the points meant to stand out showed as faint hairline asterisks.
+        // A tag counts only as a whole (ignoring case and surrounding spaces), so 'not a candidate'
+        // or 'untrue' does not.
         let style = 'circle';
-        const tags = (item.tags || '').toString().toLowerCase();
+        const tags = (item.tags || []).map(tag => String(tag).trim().toLowerCase());
         if (tags.includes('true') || tags.includes('candidate')) {
             style = 'triangle';
         } else if (item.gene_region === 'intergenic') {
@@ -657,11 +659,7 @@ function renderSwimChart(data) {
                         },
                         font: { size: 11 }
                     },
-                    grid: {
-                        color: function(context) {
-                            return 'rgba(0, 0, 0, 0.08)';
-                        }
-                    }
+                    grid: { color: 'rgba(0, 0, 0, 0.08)' }
                 }
             },
             plugins: {
@@ -750,8 +748,12 @@ function setSwimNoteEditingEnabled(enabled) {
 // (which would show one sample's details while the modal's save actions target a different one).
 let swimDetailSeq = 0;
 
+// The item the modal shows, which the modal's note and tag buttons act on and refreshSwimModal reloads
+let _currentModalItem = null;
+
 // Show detail modal for a clicked point (fetches full detail from API)
 function showDotDetail(item) {
+    _currentModalItem = item;
     const seq = ++swimDetailSeq;
     const locusId = escapeHtml(item.LocusId || '');
     const geneSymbol = escapeHtml(item.GeneTableGeneSymbol || '');
@@ -1149,15 +1151,7 @@ $(document).ready(function() {
         fullTextSearch: true,
         maxResults: 10,
     });
-    fetch(SWIM_API_BASE + '/annotations/tags')
-        .then(r => r.json())
-        .then(data => {
-            // all_tags is what /annotations/tags reports; the single-DB server returns no
-            // system tags, so today this is exactly the set of user-defined tags.
-            const values = (data.all_tags || []).map(t => ({ name: t, value: t }));
-            setupDropdownMenu($('#swim-tag-filter'), values);
-        })
-        .catch(e => console.error('Populate tags error:', e));
+    refreshSwimTags();
 
     $('#dot-detail-modal').modal();
 
@@ -1176,72 +1170,12 @@ $(document).ready(function() {
 
     // Auto-load on page load
     loadSwimPlot();
-
-    // Cache all tags for prompt hints
-    fetch(SWIM_API_BASE + '/annotations/tags')
-        .then(function(r) { return r.json(); })
-        .then(function(data) { window._allTagsList = data.tags || []; })
-        .catch(function() {});
 });
 
 // =========================================================================
-// Swim Plot Annotation CRUD
+// Swim Plot Annotation CRUD (the write helpers saveNote, deleteNote, addTag and removeTag are in
+// header_template.html, shared with the results page)
 // =========================================================================
-
-// Track current item shown in modal for refresh
-let _currentModalItem = null;
-
-// Override showDotDetail to track current item
-const _originalShowDotDetail = showDotDetail;
-showDotDetail = function(item) {
-    _currentModalItem = item;
-    _originalShowDotDetail(item);
-};
-
-// The annotation write routes explain every failure in the response body: a "detail" field for
-// the read-only-server 403 (the results_server.restrict_writes before_request hook) and an "error" field for the
-// validation failures, so surface that text instead of a bare status number. The callers show
-// err.message in an alert.
-async function swimAnnotationError(response) {
-    const body = await response.json().catch(() => ({}));
-    return new Error(body.detail || body.error || `HTTP ${response.status}`);
-}
-
-async function swimSaveNote(locusId, noteText) {
-    const response = await fetch(SWIM_API_BASE + '/annotations/' + encodeURIComponent(locusId) + '/note', {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({note_text: noteText}),
-    });
-    if (!response.ok) throw await swimAnnotationError(response);
-    return response.json();
-}
-
-async function swimDeleteNote(locusId) {
-    const response = await fetch(SWIM_API_BASE + '/annotations/' + encodeURIComponent(locusId) + '/note', {
-        method: 'DELETE',
-    });
-    if (!response.ok) throw await swimAnnotationError(response);
-    return response.json();
-}
-
-async function swimAddTag(locusId, tag) {
-    const response = await fetch(SWIM_API_BASE + '/annotations/' + encodeURIComponent(locusId) + '/tags', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({tag: tag}),
-    });
-    if (!response.ok) throw await swimAnnotationError(response);
-    return response.json();
-}
-
-async function swimRemoveTag(locusId, tag) {
-    const response = await fetch(SWIM_API_BASE + '/annotations/' + encodeURIComponent(locusId) + '/tags/' + encodeURIComponent(tag), {
-        method: 'DELETE',
-    });
-    if (!response.ok) throw await swimAnnotationError(response);
-    return response.json();
-}
 
 function refreshSwimModal() {
     if (_currentModalItem) showDotDetail(_currentModalItem);
@@ -1271,19 +1205,20 @@ $(document).on('click', '.swim-edit-note-btn', function() {
     var existing = $('#dot-detail-content .note-text').text() || '';
     var noteText = prompt('Enter note:', existing);
     if (noteText === null || !noteText.trim()) return;
-    swimSaveNote(locusId, noteText.trim()).then(refreshSwimModal).catch(function(e) { alert('Failed: ' + e.message); });
+    saveNote(locusId, noteText.trim()).then(refreshSwimModal).catch(function(e) { alert('Failed: ' + e.message); });
 });
 
-// Refresh the cached tag list AND the #swim-tag-filter dropdown menu so a tag added (or
-// removed) from the modal is immediately selectable in the filter, instead of only after a
-// page reload. Preserves the current filter selection.
+// Fill the cached tag list (the add-tag prompt's hint) AND the #swim-tag-filter dropdown menu
+// from one /annotations/tags request. Runs at startup and after every tag change from the modal,
+// so a tag added or removed there is selectable in the filter right away. Preserves the current
+// filter selection.
 function refreshSwimTags() {
     return fetch(SWIM_API_BASE + '/annotations/tags')
         .then(function(r) { return r.json(); })
         .then(function(d) {
             window._allTagsList = d.tags || [];  // user tags only — used for the add-tag hint
             var selected = $('#swim-tag-filter').dropdown('get value');
-            // all_tags, matching the initial population above.
+            // all_tags is the user-defined tags (/annotations/tags returns no system tags).
             var values = (d.all_tags || []).map(function(t) {
                 return { name: t, value: t, selected: t === selected };
             });
@@ -1300,7 +1235,7 @@ $(document).on('click', '.swim-add-tag-btn', function() {
     var hint = allTags.length > 0 ? 'Existing tags: ' + allTags.join(', ') + '\n\nEnter tag:' : 'Enter tag:';
     var tag = prompt(hint);
     if (tag === null || !tag.trim()) return;
-    swimAddTag(locusId, tag.trim()).then(function(result) {
+    addTag(locusId, tag.trim()).then(function(result) {
         applySwimTagUpdate(result);
         // Refresh tag cache
         refreshSwimTags();
@@ -1314,13 +1249,13 @@ $(document).on('click', '.swim-inline-add-note, .swim-inline-edit-note', functio
     var existing = $(this).closest('.annotation-section').find('.note-text').text() || '';
     var noteText = prompt('Enter note:', existing);
     if (noteText === null || !noteText.trim()) return;
-    swimSaveNote(locusId, noteText.trim()).then(refreshSwimModal).catch(function(e) { alert('Failed: ' + e.message); });
+    saveNote(locusId, noteText.trim()).then(refreshSwimModal).catch(function(e) { alert('Failed: ' + e.message); });
 });
 
 $(document).on('click', '.swim-inline-delete-note', function() {
     var locusId = $(this).data('locus-id');
     if (!confirm('Delete this note?')) return;
-    swimDeleteNote(locusId).then(refreshSwimModal).catch(function(e) { alert('Failed: ' + e.message); });
+    deleteNote(locusId).then(refreshSwimModal).catch(function(e) { alert('Failed: ' + e.message); });
 });
 
 $(document).on('click', '.swim-inline-add-tag', function() {
@@ -1329,7 +1264,7 @@ $(document).on('click', '.swim-inline-add-tag', function() {
     var hint = allTags.length > 0 ? 'Existing tags: ' + allTags.join(', ') + '\n\nEnter tag:' : 'Enter tag:';
     var tag = prompt(hint);
     if (tag === null || !tag.trim()) return;
-    swimAddTag(locusId, tag.trim()).then(function(result) {
+    addTag(locusId, tag.trim()).then(function(result) {
         applySwimTagUpdate(result);
         refreshSwimTags();
         refreshSwimModal();
@@ -1342,7 +1277,7 @@ $(document).on('click', '.swim-remove-tag-btn', function() {
     // null or a number, so a tag literally named "true" or "1" would arrive here as a boolean
     // or a number and fail the strict comparison against swimLoadedParams.tag below.
     var tag = $(this).attr('data-tag');
-    swimRemoveTag(locusId, tag).then(function(result) {
+    removeTag(locusId, tag).then(function(result) {
         applySwimTagUpdate(result);
         refreshSwimTags();
         refreshSwimModal();

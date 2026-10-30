@@ -7,7 +7,7 @@
         <div class="one wide column"></div>
         <div class="fourteen wide column">
 
-            <!-- Filter Panel (Task 4) -->
+            <!-- Filter Panel -->
             <div id="filter-panel">
 <div class="ui form">
 
@@ -222,7 +222,7 @@
 
     <!-- Search: gene symbols, gene IDs, locus IDs and reference regions in one box -->
     <div class="field" style="margin-bottom: 1.2em;">
-        <label style="display: inline;">Search</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="Searches <b>gene symbols, gene IDs, locus IDs and reference regions</b> in one box, replacing the four separate fields.<br /><br />Each comma-separated term is routed by its shape, and a locus is kept if it matches <b>any</b> term:<br />&bull; <b>FMR1</b> &mdash; gene symbol (substring match)<br />&bull; <b>ENSG00000102081</b> &mdash; Ensembl gene ID<br />&bull; <b>2-89831737-89831752-CCATT</b> &mdash; locus ID<br />&bull; <b>chr16:11579459-11579529</b>, <b>chr16:11579459</b> or <b>chr16</b> &mdash; reference region, with a 0-based start"></i>
+        <label style="display: inline;">Search</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="Searches <b>gene symbols, gene IDs, locus IDs and reference regions</b> in one box.<br /><br />Each comma-separated term is routed by its shape, and a locus is kept if it matches <b>any</b> term:<br />&bull; <b>FMR1</b> &mdash; gene symbol (substring match)<br />&bull; <b>ENSG00000102081</b> &mdash; Ensembl gene ID<br />&bull; <b>2-89831737-89831752-CCATT</b> &mdash; locus ID<br />&bull; <b>chr16:11579459-11579529</b>, <b>chr16:11579459</b> or <b>chr16</b> &mdash; reference region, with a 0-based start"></i>
         <input type="text" name="search" placeholder="e.g., FMR1, ENSG00000102081, 2-89831737-89831752-CCATT, chr16:11579459-11579529">
     </div>
 
@@ -345,7 +345,7 @@
 </div>
             </div>
 
-            <!-- Active Filters Bar (Task 4.4 / D3) -->
+            <!-- Active Filters Bar -->
             <div id="active-filters-bar" style="display: none; margin-bottom: 12px;">
                 <span style="color: #888; font-size: 0.9em; margin-right: 8px;">Active filters:</span>
                 <span id="active-filter-chips"></span>
@@ -479,7 +479,7 @@
 
 <script>
 // =========================================================================
-// Task 5: Semantic UI Initialization
+// Semantic UI Initialization
 // =========================================================================
 
 $(document).ready(function() {
@@ -512,7 +512,8 @@ $(document).ready(function() {
         if (i >= 0) { list.splice(i, 1); applySortChange(list); }
     });
 
-    // Drag a pill onto another to re-prioritize (insert before the drop target).
+    // Drag a pill onto another to re-prioritize: dragged forward it lands after the drop target,
+    // dragged back it lands before it (see the drop handler).
     $('#sort-pills').on('dragstart', '.sort-pill', function(e) {
         _draggedSortValue = String($(this).data('value'));
         e.originalEvent.dataTransfer.effectAllowed = 'move';
@@ -553,7 +554,7 @@ $(document).ready(function() {
     renderSortPills();
     syncSortCheckboxes();
 
-    // B11: Mutual exclusion between include/exclude gene region checkboxes.
+    // Mutual exclusion between include/exclude gene region checkboxes.
     $('#filter-panel input[name^="gene_region_"]').on('change', function() {
         const region = this.name.replace('gene_region_', '');
         if ($(this).parent().checkbox('is checked')) {
@@ -597,12 +598,6 @@ $(document).ready(function() {
     // yet is a silent no-op, so the next Search or Export (both re-read the dropdown through
     // readStateFromUI) would drop the tag.
     const tagDropdownReady = populateTagDropdown();
-    tagDropdownReady.then(() => {
-        // Cache all tags for prompt hints
-        fetch(`${API_BASE_URL}/annotations/tags`)
-            .then(r => r.json())
-            .then(data => { window._allTagsList = data.tags || []; });
-    });
 
     // Initialize the Group Results By sort dropdown. Choosing a column also picks its natural
     // direction (GROUP_SORT_NATURAL_DIRECTIONS), which the ASC / DESC radios can then override.
@@ -648,10 +643,10 @@ $(document).ready(function() {
 });
 
 // =========================================================================
-// Task 6: URL Hash State Management
+// URL Hash State Management
 // =========================================================================
 
-// 6.1 Default State
+// Default State
 const API_BASE_URL = window.location.origin + '/api/v1';
 
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
@@ -706,7 +701,7 @@ function populationMetricAffectsResults() {
     return Boolean(currentState.require_above_population || currentState.min_repeats_above_population);
 }
 
-// 6.2 Write State to URL
+// Write State to URL
 // Build the '#...' hash that represents the current filter state.
 function buildStateHash() {
     const params = {};
@@ -746,7 +741,7 @@ function replaceStateInUrl() {
     }
 }
 
-// 6.3 Read State from URL
+// Read State from URL
 function readStateFromUrl() {
     currentState = JSON.parse(JSON.stringify(DEFAULT_STATE));
     const hash = window.location.hash.substring(1);
@@ -769,8 +764,8 @@ function readStateFromUrl() {
     // Legacy URLs: the Gene Symbol(s), Gene ID, Locus Id(s) and Reference Region boxes were
     // merged into one search field, so fold those parameters into it and an old bookmark
     // still finds its loci with the UI showing what it filtered on. They stay valid API
-    // parameters for anyone calling /api/v1/loci directly. Several of them at once used to
-    // AND together and now OR, which is what the merged box does.
+    // parameters for anyone calling /api/v1/loci directly. The search box keeps a locus that
+    // matches any of its terms, so a bookmark with several of them keeps a locus that matches any one.
     // locus_id and gene_symbol were comma-separated lists, so they split. reference_region and
     // gene_id each held a single value, and a region may itself contain comma thousands
     // separators ("chr16:11,579,459-11,579,529"), so splitting those would shred the coordinates.
@@ -793,7 +788,7 @@ function readStateFromUrl() {
     applyStateToUI();
 }
 
-// 6.4 Apply State to UI
+// Apply State to UI
 function applyStateToUI() {
     // Radio buttons
     for (const name of ['outlier_type', 'require_above_unaffected',
@@ -860,7 +855,7 @@ function applyStateToUI() {
 
 }
 
-// 6.5 Read State from UI
+// Read State from UI
 function readStateFromUI() {
     // Radio buttons
     currentState.outlier_type = $('input[name="outlier_type"]:checked').val() || 'all';
@@ -923,17 +918,17 @@ function readStateFromUI() {
     currentState.page = 1;
 }
 
-// 6.6 Browser Navigation
+// Browser Navigation
 window.addEventListener('popstate', function() {
     readStateFromUrl();
     performSearch();
 });
 
 // =========================================================================
-// Task 7: API Fetch and Search Logic
+// API Fetch and Search Logic
 // =========================================================================
 
-// 7.1 Build API URL
+// Build API URL
 function buildApiUrl() {
     const params = new URLSearchParams();
     params.set('outlier_type', currentState.outlier_type);
@@ -993,6 +988,17 @@ function buildGroupedApiUrl() {
     return url.toString();
 }
 
+// The locus table's export (bed, tsv, json or expansion_hunter): its query, every row rather than
+// a page
+function buildLocusExportUrl(format) {
+    const url = new URL(buildApiUrl());
+    url.pathname = url.pathname.replace(/\/loci$/, '/export');
+    url.searchParams.delete('page');
+    url.searchParams.delete('page_size');
+    url.searchParams.set('format', format);
+    return url.toString();
+}
+
 // The grouped view's export (groups_tsv or group_loci_tsv): its query, every row rather than a page
 function buildGroupedExportUrl(format) {
     const url = new URL(buildGroupedApiUrl());
@@ -1018,7 +1024,7 @@ function buildGroupLociApiUrl(groupId, page) {
     return url.toString();
 }
 
-// 7.2 Fetch with timeout utility
+// Fetch with timeout utility
 // Aborts with an explicit TimeoutError reason so a timeout is distinguishable from a
 // genuine connection failure (and never surfaces the browser's cryptic default
 // "signal is aborted without reason"). See the performSearch() catch for the mapping.
@@ -1043,11 +1049,12 @@ function describeFetchError(error) {
     return (error && error.message) || 'Search failed.';
 }
 
-// 7.3 Perform Search
-// Sync the column-header sort indicator with the active sort. Header clicks, the
-// Sort-By radios, clear-all, and chip removal all funnel through performSearch(), so
-// updating the indicator here keeps the highlighted header consistent with the order
-// actually applied. Radio-only sorts (which have no header column) correctly clear it.
+// Perform Search
+// Sync the column-header sort indicator with the active sort: the header of every field in the
+// multi-key sort list gets it, and a field with no header column (e.g. Pairwise Pheno Similarity)
+// adds none of its own. Header clicks, the Sort By checkboxes and pills, clear-all, and chip
+// removal all funnel through performSearch(), so updating the indicator here keeps the
+// highlighted headers consistent with the sort actually applied.
 function syncSortHeaderIndicator() {
     $('#results-table thead th').removeClass('sorted-active');
     for (const field of getSortList()) {
@@ -1179,7 +1186,7 @@ async function performSearch() {
     }
 }
 
-// 7.3 Button Handlers
+// Button Handlers
 $('#search-button').on('click', function() {
     readStateFromUI();
     currentState.page = 1;
@@ -1195,7 +1202,7 @@ $('#filter-panel input[type="text"], #filter-panel input[type="number"]').on('ke
     }
 });
 
-// 7.4 Export function (D5) - triggers server-side export
+// Export function: triggers a server-side export
 async function performExport(format) {
     // readStateFromUI() commits EVERY live filter control into currentState, not just the page.
     // Export does not re-render the results table, so letting those edits stand would desync the
@@ -1211,39 +1218,6 @@ async function performExport(format) {
     $('.export-dropdown').addClass('loading disabled');
 
     try {
-        const params = new URLSearchParams();
-        params.set('source', currentState.source);
-        params.set('outlier_type', currentState.outlier_type);
-        params.set('format', format);
-
-        // Add all filter params from currentState (same params as buildApiUrl but without pagination)
-        if (currentState.require_above_unaffected) params.set('require_above_unaffected', currentState.require_above_unaffected);
-        if (currentState.require_families_above_unaffected) params.set('require_families_above_unaffected', currentState.require_families_above_unaffected);
-        if (currentState.require_above_population) params.set('require_above_population', currentState.require_above_population);
-        if (populationMetricAffectsResults() && currentState.population_metric === 'max') params.set('population_metric', 'max');
-        if (currentState.require_above_population && currentState.include_loci_without_population_data) params.set('include_loci_without_population_data', '1');
-        if (currentState.apply_pathogenic_threshold) params.set('apply_pathogenic_threshold', '1');
-        if (currentState.known_loci_only) params.set('known_loci_only', '1');
-        if (currentState.known_motifs_only) params.set('known_motifs_only', '1');
-        if (currentState.mendelian_genes_only) params.set('mendelian_genes_only', '1');
-        if (currentState.exclude_vc_depth_filtered) params.set('exclude_vc_depth_filtered', '1');
-        if (currentState.exclude_vc_size_filtered) params.set('exclude_vc_size_filtered', '1');
-        if (currentState.gene_regions) params.set('gene_regions', currentState.gene_regions);
-        if (currentState.exclude_gene_regions) params.set('exclude_gene_regions', currentState.exclude_gene_regions);
-        if (currentState.min_expansion) params.set('min_expansion', currentState.min_expansion);
-        if (currentState.min_repeats_threshold) params.set('min_repeats_threshold', currentState.min_repeats_threshold);
-        if (currentState.min_repeats_above_population) params.set('min_repeats_above_population', currentState.min_repeats_above_population);
-        if (currentState.min_sigma_percentile) params.set('min_sigma_percentile', currentState.min_sigma_percentile);
-        if (currentState.motif_size) params.set('motif_size', currentState.motif_size);
-        if (currentState.motif) params.set('motif', currentState.motif);
-        if (currentState.phenotype_keyword) params.set('phenotype_keyword', currentState.phenotype_keyword);
-        if (currentState.sample_id_keyword) params.set('sample_id_keyword', currentState.sample_id_keyword);
-        if (currentState.sample_id_like) params.set('sample_id_like', currentState.sample_id_like);
-        if (currentState.search) params.set('search', currentState.search);
-        if (currentState.max_variation_cluster_size_diff) params.set('max_variation_cluster_size_diff', currentState.max_variation_cluster_size_diff);
-        if (currentState.tag) params.set('tag', currentState.tag);
-        if (currentState.sort_by && currentState.sort_by !== 'count') params.set('sort_by', currentState.sort_by);
-
         // Download via a hidden iframe instead of navigating the top-level page. A direct
         // window.location.href would, on a 400/500 (non-attachment) error response, replace the
         // whole page with the raw API error and lose the user's filters/results. The iframe streams
@@ -1251,7 +1225,7 @@ async function performExport(format) {
         // loads harmlessly inside the iframe, which we surface via alert() without touching the page.
         // The grouped views export from /outlier_samples/export with the grouped table's own query.
         const url = currentState.group_by === 'locus'
-            ? `${API_BASE_URL}/export?${params.toString()}` : buildGroupedExportUrl(format);
+            ? buildLocusExportUrl(format) : buildGroupedExportUrl(format);
         let iframe = document.getElementById('export-iframe');
         if (!iframe) {
             iframe = document.createElement('iframe');
@@ -1278,7 +1252,7 @@ async function performExport(format) {
     }
 }
 
-// 7.5 Active Filters Bar (D3)
+// Active Filters Bar
 function updateActiveFiltersBar() {
     const chips = [];
     const labels = {
@@ -1522,7 +1496,7 @@ function renderSummaryCharts(data) {
 }
 
 // =========================================================================
-// Task 8: Results Table Rendering
+// Results Table Rendering
 // =========================================================================
 
 // Number of columns of whichever header row (locus or grouped) the results table shows
@@ -1531,7 +1505,7 @@ function resultsTableColumnCount() {
     return $row.children('th').length || 1;
 }
 
-// 8.1 Main Render Function
+// Main Render Function
 function renderResults(data) {
     $('#group-header-row').hide();
     $('#locus-header-row').show();
@@ -1549,7 +1523,7 @@ function renderResults(data) {
     tbody.html(html);
 }
 
-// 8.1b Grouped views: one row per unsolved affected sample or family (/api/v1/outlier_samples).
+// Grouped views: one row per unsolved affected sample or family (/api/v1/outlier_samples).
 // The header cells with data-group-sort sort the rows by that column (group_sort). The sorted
 // column gets the same sorted-active indicator as the locus table's; the ASC / DESC radios name
 // its direction.
@@ -1723,7 +1697,7 @@ $('input[name="group_by"]').on('change', function() {
     $('#group-sort-field').toggle($('input[name="group_by"]:checked').val() !== 'locus');
 });
 
-// 8.2 Region Badge Helper
+// Region Badge Helper
 function getRegionBadge(region) {
     const badgeMap = {
         'CDS': 'badge-cds', 'cds': 'badge-cds',
@@ -1738,7 +1712,7 @@ function getRegionBadge(region) {
     return `<span class="badge ${cls}">${escapeHtml(region) || 'unknown'}</span>`;
 }
 
-// 8.3 Value Color Helper
+// Value Color Helper
 function getValueColorClass(alleleSize, popMax, pathogenicMin) {
     if (pathogenicMin != null && alleleSize >= pathogenicMin) return 'val-high';
     if (popMax != null && alleleSize > popMax) return 'val-medium';
@@ -1754,7 +1728,7 @@ const VC_FILTER_REASON_TITLES = {
 };
 const VC_FILTER_REASON_COLORS = {'DEPTH': 'gold', 'EXTENSION': 'darkred'};
 
-// 8.4 Row Rendering Function
+// Row Rendering Function
 function renderLocusRow(locus, rowIndex) {
     const motifSize = locus.MotifSize || (locus.Motif ? locus.Motif.length : '?');
     const allele = locus.FirstAffectedAlleleSize;
@@ -2005,7 +1979,7 @@ function renderLocusRow(locus, rowIndex) {
     </tr>`;
 }
 
-// 8.5 Column Header Sort Handling
+// Column Header Sort Handling
 $('#results-table thead th[data-sort]').on('click', function() {
     const field = String($(this).data('sort'));
     // Toggle this column in/out of the multi-key sort (append to the end if not present).
@@ -2016,7 +1990,7 @@ $('#results-table thead th[data-sort]').on('click', function() {
 });
 
 // =========================================================================
-// Task 9: Locus Detail Inline Expansion
+// Locus Detail Inline Expansion
 // =========================================================================
 
 // A motif longer than maxLength shows its first maxLength bases, "..." and its size, e.g.
@@ -2039,23 +2013,22 @@ $(document).on('click', '.motif-truncated', function(e) {
     // Dismissal is handled by the single persistent document click listener below.
 });
 
-// Dismiss the motif popup on any click that lands outside it and outside its trigger. A
-// single persistent listener (instead of a per-popup $(document).one(...)) avoids the bug
-// where opening a second popup immediately re-fired the previous popup's dismiss handler
-// and removed the just-opened popup. Clicks inside the popup (or on its trigger) are ignored
-// so its text stays selectable. The Mendelian-warning popup is dismissed by the equivalent
-// listener in qc_shared_js.html, which this page now includes.
+// Dismiss the motif popup on any click that lands outside it and outside its trigger. One
+// persistent listener rather than a per-popup $(document).one(...), so opening a second popup
+// does not fire the first popup's dismiss handler and remove the popup just opened. Clicks
+// inside the popup (or on its trigger) are ignored so its text stays selectable. The
+// Mendelian-warning popup is dismissed by the equivalent listener in qc_shared_js.html.
 $(document).on('click', function(e) {
     if (!$(e.target).closest('.motif-truncated, .motif-popup').length) {
         $('.motif-popup').remove();
     }
 });
 
-// 9.1 Click Handler
+// Click Handler
 // Bind to the whole expand cell (not just the inner toggle icon) so the entire
 // pointer-cursor cell area is clickable, not only the narrow chevron. Matching `td` only
 // is what keeps the results table's `<th class="col-expand">` header out of this handler;
-// a click there has no locus row, so it used to fetch /loci/undefined.
+// a click there has no locus row to expand.
 $(document).on('click', 'td.col-expand', async function() {
     const $row = $(this).closest('.locus-row');
     const locusId = $row.data('locus-id');
@@ -2098,7 +2071,7 @@ $(document).on('click', 'td.col-expand', async function() {
     }
 });
 
-// 9.2 Detail Rendering
+// Detail Rendering
 // Mirrors analysis_columns.is_unaffected_or_solved_status, the rule behind #Aff, #Fam and the grouped
 // view: every sample that is neither unaffected nor solved counts, including samples with an unknown
 // affected status and Partially Solved ones.
@@ -2166,23 +2139,22 @@ function renderLocusDetail(detail, outlierType) {
         </div>`;
     }
 
-    // C1: TRExplorer locus ID cross-reference
+    // TRExplorer locus ID cross-reference
     if (locus.TRExplorerLocusId && locus.TRExplorerLocusId !== locus.LocusId) {
         const jaccard = locus.TRExplorerLocusJaccardSimilarity;
         const jStr = jaccard != null ? ` (Jaccard: ${jaccard.toFixed(3)})` : '';
         html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">TRExplorer LocusId: ${escapeHtml(locus.TRExplorerLocusId)}${jStr}</div>`;
     }
 
-    // C2: RepeatMasker intervals
+    // RepeatMasker intervals
     if (locus.RepeatMaskerIntervals && !locus.RepeatMaskerIntervals.startsWith('Simple_repeat')) {
         html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">RepeatMasker: ${escapeHtml(locus.RepeatMaskerIntervals)}</div>`;
     }
 
-    // C3: Variation cluster. Same three states as the table's VC column (see renderLocusRow):
+    // Variation cluster. Same three states as the table's VC column (see renderLocusRow):
     // the size difference when TRExplorer kept a variation cluster for this repeat, the crossed-out
     // circle and the reason when it computed one and then filtered it out, and nothing when it
-    // recorded neither. Without the second branch a filtered-out locus read here as having no
-    // variation cluster at all, while its row one line above showed the crossed-out icon.
+    // recorded neither.
     if (locus.VariationClusterSizeDiff != null && locus.VariationClusterSizeDiff !== '') {
         const vcsDiff = Number(locus.VariationClusterSizeDiff);
         if (Number.isFinite(vcsDiff)) {
@@ -2197,7 +2169,7 @@ function renderLocusDetail(detail, outlierType) {
             + `<i class="times circle outline icon" style="color: ${vcsReasonColor};"></i>${escapeHtml(vcsReasonTitle)}</div>`;
     }
 
-    // C4: Allele histogram
+    // Allele histogram
     const histKey = {AllAlleles: 'AllAlleleHistogram', ShortAlleles: 'ShortAlleleHistogram', HemizygousAlleles: 'HemizygousAlleleHistogram'}[ot];
     const histVal = locus[histKey];
     if (histVal) {
@@ -2214,7 +2186,7 @@ function renderLocusDetail(detail, outlierType) {
     }
 
 
-    // D4: Quick-filter toggle buttons for the per-sample table
+    // Quick-filter toggle buttons for the per-sample table
     html += `<div style="margin-bottom: 8px; display: flex; gap: 6px; flex-wrap: wrap;">
         <button class="ui mini button detail-filter-btn active" data-filter="all">All</button>
         <button class="ui mini button detail-filter-btn" data-filter="affected">Affected</button>
@@ -2278,7 +2250,7 @@ function renderLocusDetail(detail, outlierType) {
         // sample colored as affected-unsolved above does not have
         if (isAffectedStatus(s.affected_status)) rowClass += ' sample-status-affected';
 
-        // D10: Expandable phenotype text in detail panel
+        // Expandable phenotype text in detail panel
         let phenTrunc = '';
         if (s.phenotype_description) {
             if (s.phenotype_description.length > 150) {
@@ -2375,20 +2347,20 @@ function renderLocusDetail(detail, outlierType) {
         html += '</div>';
     }
 
-    // C6: Affected-unsolved summary
+    // Affected-unsolved summary
     const affUnsolved = samples.filter(isAffectedUnsolvedSample);
     if (affUnsolved.length > 0) {
         html += '<div style="margin-top: 8px; padding: 6px 10px; background: #fff5f5; border-left: 4px solid #c62828; border-radius: 3px;">';
         html += '<div style="font-weight: 600; font-size: 0.92em; color: #c62828; margin-bottom: 4px;">Affected Unsolved Summary:</div>';
         html += '<table class="invisible-table affected-unsolved-table"><tbody>';
         for (const s of affUnsolved) {
-            html += `<tr style="font-size: 0.92em; color: #c62828;"><td class="aff-allele">${s.allele_size} x ${formatMotifForDisplay(locus.Motif)}</td><td class="aff-sample">${escapeHtml(s.sample_id)}</td><td class="aff-phenotype">${escapeHtml(s.phenotype_description ? s.phenotype_description.substring(0, 120) : '')}</td></tr>`;
+            html += `<tr style="font-size: 0.92em; color: #c62828;"><td class="aff-allele">${s.allele_size} x ${formatMotifForDisplay(locus.Motif)}</td><td class="aff-sample">${escapeHtml(s.sample_id)}</td><td>${escapeHtml(s.phenotype_description ? s.phenotype_description.substring(0, 120) : '')}</td></tr>`;
         }
         html += '</tbody></table>';
         html += '</div>';
     }
 
-    // C7: Copy-paste sample IDs + Collapse details button row
+    // Copy-paste sample IDs + Collapse details button row
     if (affUnsolved.length > 0) {
         const copyText = affUnsolved.map(s => `("${locus.LocusId}", "${s.sample_id}")`).join(',\n');
         if (!window._copyTextMap) window._copyTextMap = {};
@@ -2406,9 +2378,9 @@ function renderLocusDetail(detail, outlierType) {
     return html;
 }
 
-// 9.3 Detail Panel Event Handlers
+// Detail Panel Event Handlers
 
-// C7: Copy affected sample IDs to clipboard
+// Copy affected sample IDs to clipboard
 $(document).on('click', '.copy-ids-btn', function() {
     const $button = $(this);
     const text = window._copyTextMap[$button.data('locus-id')] || '';
@@ -2469,7 +2441,7 @@ $(document).on('click', '.collapse-all-btn', function() {
     });
 });
 
-// D4: Quick-filter toggles for the per-sample table in the detail panel.
+// Quick-filter toggles for the per-sample table in the detail panel.
 $(document).on('click', '.detail-filter-btn', function() {
     const $panel = $(this).closest('.locus-detail-row');
     $panel.find('.detail-filter-btn').removeClass('active');
@@ -2495,7 +2467,7 @@ $(document).on('click', '.detail-filter-btn', function() {
     });
 });
 
-// D10: Expandable phenotype text
+// Expandable phenotype text
 $(document).on('click', '.expand-phenotype', function() {
     $(this).closest('td').find('.phenotype-short').hide();
     $(this).closest('td').find('.phenotype-full').show();
@@ -2506,10 +2478,10 @@ $(document).on('click', '.collapse-phenotype', function() {
 });
 
 // =========================================================================
-// Task 10: Pagination Controls
+// Pagination Controls
 // =========================================================================
 
-// 10.1 Update Pagination
+// Update Pagination
 function updatePaginationControls(data) {
     const $top = $('.top-pagination');
     const $bottom = $('.bottom-pagination');
@@ -2619,7 +2591,7 @@ function updatePaginationControls(data) {
     bindPaginationEvents($bottom, totalPages);
 }
 
-// 10.2 Pagination Event Binding
+// Pagination Event Binding
 function bindPaginationEvents($container, totalPages) {
     $container.find('.first-page').off('click').on('click', function() {
         if (!$(this).hasClass('disabled')) goToPage(1);
@@ -2650,53 +2622,9 @@ function goToPage(page) {
 }
 
 // =========================================================================
-// Annotation CRUD Functions
+// Annotation CRUD Functions (the write helpers saveNote, deleteNote, addTag and removeTag are in
+// header_template.html, shared with the swim plot)
 // =========================================================================
-
-// The annotation write routes explain every failure in the response body: a "detail" field for
-// the read-only-server 403 (the results_server.restrict_writes before_request hook) and an "error" field for the
-// validation failures, so surface that text instead of a bare status number. The callers show
-// e.message in an alert.
-async function annotationError(response) {
-    const body = await response.json().catch(() => ({}));
-    return new Error(body.detail || body.error || `HTTP ${response.status}`);
-}
-
-async function saveNote(locusId, noteText) {
-    const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}/note`, {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({note_text: noteText}),
-    });
-    if (!response.ok) throw await annotationError(response);
-    return response.json();
-}
-
-async function deleteNote(locusId) {
-    const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}/note`, {
-        method: 'DELETE',
-    });
-    if (!response.ok) throw await annotationError(response);
-    return response.json();
-}
-
-async function addTag(locusId, tag) {
-    const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}/tags`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({tag: tag}),
-    });
-    if (!response.ok) throw await annotationError(response);
-    return response.json();
-}
-
-async function removeTag(locusId, tag) {
-    const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}/tags/${encodeURIComponent(tag)}`, {
-        method: 'DELETE',
-    });
-    if (!response.ok) throw await annotationError(response);
-    return response.json();
-}
 
 // Under a grouped row, highlight that row's sample (or its family's samples) in the locus's detail
 // panel. Shared by the expand handler and refreshDetailPanel, so a refresh keeps the highlight.
@@ -2764,12 +2692,13 @@ async function refreshRowAnnotations(locusId) {
     }
 }
 
-// Populate tag dropdown from API
+// Populate the tag filter dropdown, and the cached tag list the add-tag modal offers, from the API
 async function populateTagDropdown() {
     try {
         const response = await fetch(`${API_BASE_URL}/annotations/tags`);
         if (!response.ok) return;
         const data = await response.json();
+        window._allTagsList = data.tags || [];
         const $dropdown = $('#tag-filter');
         const currentVal = $dropdown.dropdown('get value');
 
@@ -2962,11 +2891,8 @@ $(document).on('click', '.add-tag-btn', async function() {
                 addTag(locusId, tag).then(function() {
                     refreshRowAnnotations(locusId);
                     refreshDetailPanel(locusId);
+                    // Also refreshes the cached tag list this modal offers
                     populateTagDropdown();
-                    // Update cached tags list if new tag
-                    if (!allTags.includes(tag)) {
-                        window._allTagsList = [...allTags, tag].sort();
-                    }
                     resetDropdown();
                     $modal.modal('hide');
                 }).catch(function(e) {
@@ -3038,7 +2964,7 @@ $(document).on('click', '.delete-modal-tag', async function() {
         // Update row badges immediately
         refreshRowAnnotations(locusId);
 
-        // Update tag filter dropdown (in case tag is now unused)
+        // Update tag filter dropdown and the cached tag list (in case tag is now unused)
         populateTagDropdown();
 
         // If the tag just removed is the one the results are filtered by, this locus no longer

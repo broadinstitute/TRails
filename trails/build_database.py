@@ -8,10 +8,6 @@ phenotypes, builds the swim-plot / phenotype / Mendelian tables, and writes them
 all straight into ``db_path``. Nothing is written to disk except the database
 itself: there is no intermediate histogram or JSON file.
 
-It ports the staged logic of the internal ``analyze_results.py`` pipeline (which
-read a pre-built per-locus JSON); here the same per-locus records are built
-directly from the parsed matrix instead of being round-tripped through a file.
-
 ``build()`` wires the modules together in this order (each module is its own
 fully-tested unit):
 
@@ -37,8 +33,8 @@ Steps 9 and 10 count an affected allele only when it exceeds the 99th percentile
 every --population-gate-cohorts cohort that has one at the locus (default: HPRC256 and
 AoU1027).
 
-CLI:
-    python3 build_database.py --repeat-copy-numbers-tsv X --sample-metadata-tsv Y --db out.duckdb
+CLI, from the TRails directory (the build needs the packages in .venv/):
+    .venv/bin/python trails/build_database.py --repeat-copy-numbers-tsv X --sample-metadata-tsv Y --db out.duckdb
 """
 
 import argparse
@@ -126,7 +122,7 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
 
     # Stage 2: read the sample metadata and build the lookups.
     print(f"Reading sample metadata: {sample_metadata_tsv}")
-    sample_lookup, affected_lookup, analysis_lookup, sample_df = (
+    sample_lookup, affected_lookup, analysis_lookup = (
         input_tables.read_sample_metadata(sample_metadata_tsv))
     print(f"  {len(sample_lookup):,} samples with metadata")
 
@@ -267,7 +263,7 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
 
         per_sample_mendelian_rows, per_motif_mendelian_rows = (
             mendelian_qc.compute_mendelian_violations(
-                locus_rows, sample_lookup, sample_df, threshold=mendelian_threshold))
+                locus_rows, sample_lookup, threshold=mendelian_threshold))
         result_database.write_mendelian_tables(
             connection, per_sample_mendelian_rows, per_motif_mendelian_rows)
 

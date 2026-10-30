@@ -6,7 +6,7 @@ everything is optional — a missing optional column disables just the feature t
 it, never the whole run.** Column-name matching for the fixed/known columns is
 **case-insensitive and underscore-insensitive** across every TSV input (`sample_id` ≡
 `Sample_id` ≡ `SampleId` ≡ `SAMPLE_ID`); the per-sample column headers and `sample_id` *values*
-still join exactly. Schemas were derived from the live analysis code.
+still join exactly.
 
 ## Data classes
 
@@ -116,7 +116,7 @@ phenotype-summary columns and enables gene-level phenotype scoring.
 
 This is a per-allele genotype matrix from **any** TR genotyping tool — short-read or long-read
 (TRGT, ExpansionHunter, straglr, LongTR, …). TRails only needs the per-allele repeat copy
-numbers, not a tool-specific VCF. (It generalizes the former TRGT-LPS table.) `trails.py` (via
+numbers, not a tool-specific VCF. `trails.py` (via
 `build_database.build()`) reads it **directly** into the result database — no intermediate
 files are written; the per-locus records described below are built in memory.
 
@@ -193,8 +193,11 @@ ExpansionHunter export) — optional/ignored.
 ### 5. Generated result database  *(server input; built for you)*
 
 `trails.py` builds a single `*.with_analysis_columns.duckdb` (DuckDB) and points the server at
-it (`trails/results_server.py --db <path>`). You don't author it. It contains 6 tables, plus the two
-optional Mendelian-QC tables of section 6:
+it (`trails/results_server.py --db <path>`). You don't author it. It always contains the first 4
+tables below, plus up to 4 optional ones: the two phenotype-score tables, written when a phenotype
+TSV was supplied, scoring was not turned off with `--skip-phenotype-scores`, and it scored at least
+one outlier; and the two Mendelian-QC tables of section 6, written when at least one complete trio
+exists:
 
 | Table | Contents |
 |-------|----------|
@@ -202,8 +205,8 @@ optional Mendelian-QC tables of section 6:
 | `swim_plot` | one row per outlier allele (sample, allele size, affected status, motif, gene, …) |
 | `affected_unsolved_outliers_above_unaffected` | one row per (locus, outlier type, sample) that the #Aff count counts: `LocusId`, `outlier_type`, `sample_id`, `family_id` (NULL when the sample has none) and the sample's largest counted `allele_size`. The Group Results By view reads it. Always present, possibly empty |
 | `metadata` | build facts: the callset's sample count (`num_samples`) and the `--population-gate-cohorts` value the build used (`population_gate_cohorts`, comma-separated) |
-| `per_locus_phenotype_scores` | gene/phenotype similarity per locus *(only if a phenotype TSV was supplied)* |
-| `per_outlier_phenotype_scores` | gene/phenotype similarity per outlier sample *(only if a phenotype TSV was supplied)* |
+| `per_locus_phenotype_scores` | gene/phenotype similarity per locus *(optional, see above)* |
+| `per_outlier_phenotype_scores` | gene/phenotype similarity per outlier sample *(optional, see above)* |
 
 The server also creates a small local annotations database (your notes/tags) on first run,
 next to the result database as `*.with_analysis_columns.duckdb.annotations.duckdb`.
@@ -235,4 +238,4 @@ is uploaded.
 | `variant_catalog_without_offtargets.GRCh38.json` | `--known-loci-json` | public `str-analysis` repo (github.com/broadinstitute/str-analysis) |
 | STRchive disease-locus table (`STRchive-loci.json`) | `--strchive-loci-json` | github.com/dashnowlab/STRchive, downloaded from a built-in default URL and cached locally by the installer (offline-safe); pass the flag to pin your own copy |
 | TRExplorer population statistics and locus annotations (`TRExplorer_v2.1.hg38.annotations.duckdb`) | none | TRExplorer repeat catalog v2.1, hg38 (gs://tandem-repeat-catalog). The installer downloads the annotated catalog table (about 900 MB), keeps the columns TRails uses in this file (about 500 MB) and deletes the download. See "Annotations from TRExplorer" above |
-| gene-disease table (`genelookup_gene_table.tsv.gz`) | `--gene-table` | genelookup.broadinstitute.org, exported through its query service: gene id and symbol, aliases, pLI, LoF O/E upper bound, HGNC id, inheritance, LLM phenotype summary and sources. OMIM's licensed columns are not included (genelookup does not export them). Not versioned, so it is downloaded once and refreshed only with `TRAILS_FORCE=1 ./install.sh` or `trails/trails_setup.py --force`; pass `--gene-table` to use your own table instead |
+| gene-disease table (`genelookup_gene_table.tsv.gz`) | `--gene-table` | genelookup.broadinstitute.org, exported through its query service: gene id and symbol, aliases, pLI, LoF O/E upper bound, HGNC id, inheritance, LLM phenotype summary and sources. OMIM's licensed columns are not included (genelookup does not export them). Not versioned, so it is downloaded once and refreshed only with `TRAILS_FORCE=1 ./install.sh` or `.venv/bin/python trails/trails_setup.py --force`; pass `--gene-table` to use your own table instead |

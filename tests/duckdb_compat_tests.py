@@ -1,9 +1,9 @@
-"""Unit tests for duckdb_compat, the sqlite3-shaped wrapper TRails runs on.
+"""Unit tests for duckdb_compat, the sqlite3-style wrapper TRails runs on.
 
 Everything here is a behavior the rest of TRails depends on and that plain duckdb does not
-give you: rows addressable by name, SQLite's NULL ordering, a description that survives a
-later query on the same connection, and iteration that streams rather than materializing a
-whole export.
+give you: rows addressable by name, NULLs first on ASC and last on DESC, a description that
+survives a later query on the same connection, and iteration that streams rather than
+materializing a whole export.
 """
 
 import os
@@ -81,11 +81,10 @@ class RowTests(unittest.TestCase):
 
 
 class NullOrderingTests(unittest.TestCase):
-    """Every ORDER BY in TRails was written against SQLite's NULL placement.
+    """TRails' ORDER BY clauses expect NULLs first ascending and last descending.
 
-    SQLite sorts NULLs first ascending and last descending. DuckDB's own default is NULLS
-    LAST in both directions, which would silently move every unannotated locus in a sorted
-    result page.
+    DuckDB's own default is NULLS LAST in both directions, which would silently move every
+    unannotated locus in a sorted result page.
     """
 
     def setUp(self):
@@ -114,7 +113,7 @@ class NullOrderingTests(unittest.TestCase):
 
 
 class CursorLifetimeTests(unittest.TestCase):
-    """A duckdb connection holds one result; sqlite3 hands out independent cursors."""
+    """A duckdb connection holds one result, so a later query on it replaces a cursor's result."""
 
     def setUp(self):
         self.conn = duckdb_compat.connect(":memory:")
@@ -162,7 +161,7 @@ class IterationTests(unittest.TestCase):
 
 
 class ConnectionApiTests(unittest.TestCase):
-    """The rest of the sqlite3 connection surface TRails is written against."""
+    """The rest of the sqlite3-style connection surface TRails calls."""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -267,9 +266,8 @@ class ConnectionWrapperTests(unittest.TestCase):
     """What Connection passes down to the duckdb connection it wraps."""
 
     def test_executemany_hands_duckdb_a_list_rather_than_a_generator(self):
-        # duckdb 1.0.x refuses a generator ("executemany requires a list of parameter sets
-        # to be provided"), and requirements.txt allows duckdb 1.0, so the rows have to be
-        # materialized before they go down. The NaNs still become NULL on the way.
+        # duckdb documents executemany as taking a list of parameter sets, so a generator of
+        # rows is materialized before it goes down. The NaNs still become NULL on the way.
         def rows():
             yield ("a", float("nan"))
             yield ("b", 5.0)
@@ -290,9 +288,9 @@ class ConnectionWrapperTests(unittest.TestCase):
 class InsertRowsTests(unittest.TestCase):
     """insert_rows is how the build loads every table, a chunk of rows per statement.
 
-    It replaced a per-row executemany, so what matters is that the values still land
-    exactly as they did: pandas widens a column of ints holding a None to float64 on its
-    own, and an int written into a VARCHAR column would then arrive as "1.0". A chunk also
+    What matters is that every value lands exactly as given: pandas widens a column of ints
+    holding a None to float64 on its own, and an int written into a VARCHAR column would
+    then arrive as "1.0". A chunk also
     holds thousands of rows, more than the sample DuckDB would type an untyped column from,
     so the tests below cover a column whose exceptional value sits past that sample.
     """
@@ -323,9 +321,9 @@ class InsertRowsTests(unittest.TestCase):
     def test_a_mixed_column_keeps_a_value_that_sits_past_the_type_sample(self):
         # The case infer_column_types declares VARCHAR for: an annotation column carrying
         # counts plus a text marker. DuckDB types an object-dtype column off a sample of the
-        # frame (pandas_analyze_sample, 1000 rows), so with the marker at row 2500 of 3000
-        # it used to see only ints, type the column INT32, and fail on the marker; a 5.5 in
-        # the same position was silently stored as "6".
+        # frame (pandas_analyze_sample, 1000 rows), so with the marker at row 2500 of 3000 a
+        # column typed off that sample would come out INT32 and fail on the marker, and a 5.5
+        # in the same position would be silently stored as "6".
         self.conn.execute("CREATE TABLE t (i BIGINT, v VARCHAR)")
         rows = [{"i": i, "v": i} for i in range(3000)]
         rows[2500]["v"] = "not_available"
@@ -338,9 +336,9 @@ class InsertRowsTests(unittest.TestCase):
             [("0",), ("not_available",), ("5.5",), ("true",)])
 
     def test_a_big_int_past_the_type_sample_is_not_truncated(self):
-        # The reverse hazard, on a column that really is all ints: typed off the first rows
-        # the column came out INT32, and the one value wider than that raised "Value out of
-        # range for type INT" instead of being stored.
+        # The reverse hazard, on a column that really is all ints: typed off the first rows,
+        # the column would come out INT32, and the one value wider than that would raise
+        # "Value out of range for type INT" instead of being stored.
         self.conn.execute("CREATE TABLE t (v BIGINT)")
         rows = [{"v": i} for i in range(3000)]
         rows[2500]["v"] = 9007199254740995
@@ -409,7 +407,7 @@ class InsertRowsTests(unittest.TestCase):
 
 
 class NaNParameterTests(unittest.TestCase):
-    """A NaN bound as a parameter has to land as NULL, the way sqlite3 bound it.
+    """A NaN bound as a parameter has to land as NULL.
 
     Missing numbers reach the database writer as NaN. DuckDB stores a bound NaN as an actual
     NaN: it is not NULL, COUNT(col) counts it, and it compares as LARGER than every real
@@ -462,7 +460,7 @@ class NaNParameterTests(unittest.TestCase):
 
 
 class SqlDialectTests(unittest.TestCase):
-    """The two dialect differences the port had to fix at every call site."""
+    """The two SQL dialect rules duckdb_compat leaves to each call site."""
 
     def setUp(self):
         self.conn = duckdb_compat.connect(":memory:")
@@ -473,14 +471,14 @@ class SqlDialectTests(unittest.TestCase):
         self.conn.close()
 
     def test_ilike_is_the_case_insensitive_match(self):
-        # SQLite's LIKE was case-insensitive; DuckDB's is not, so the filters use ILIKE.
+        # DuckDB's LIKE is case-sensitive, so the filters use ILIKE.
         self.assertEqual(self.conn.execute("SELECT symbol FROM t WHERE symbol ILIKE '%fmr%'").fetchall(),
                          [("FMR1",)])
         self.assertEqual(self.conn.execute("SELECT symbol FROM t WHERE symbol LIKE '%fmr%'").fetchall(),
                          [])
 
     def test_try_cast_keeps_unparseable_text_from_raising(self):
-        # SQLite turned 'unknown' into 0 here; a plain CAST raises in DuckDB.
+        # A plain CAST of text that will not parse raises in DuckDB.
         with self.assertRaises(duckdb_compat.Error):
             self.conn.execute("SELECT CAST(size_diff AS BIGINT) FROM t").fetchall()
         # ATXN1 has no value, FMR1 has 13, HTT has text that will not parse.

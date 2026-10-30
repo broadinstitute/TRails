@@ -11,28 +11,32 @@ cell is one of:
   - "21"    : a hemizygous genotype (a single allele size)
   - ""/"."/"./." : a no-call (skipped)
 
-Histogram routing (faithful port of
-str_analysis/combine_single_sample_LPS_to_allele_histograms.py):
+Histogram routing:
   - AllAlleleHistogram        : add the short allele; if diploid also add the long allele.
   - ShortAlleleHistogram      : add the short allele only.
   - HemizygousAlleleHistogram : add the short allele only when the genotype is hemizygous.
 
 Histogram strings are sorted ASCENDING by allele size, formatted "{allele}x:{count}".
 Outlier-sample-id strings are sorted DESCENDING by allele size, formatted
-"{allele}x:{sample_id}", with the exact skip/stop rules transcribed from
-convert_sample_ids_to_string in the reference source.
+"{allele}x:{sample_id}", with the skip/stop rules of convert_sample_ids_to_string.
 """
 
 
-NO_CALL_VALUES = {"", ".", "./.", "nan", "NaN", "NA"}
+# The no-call markers of the matrix format. Any other cell that is not one or two
+# comma-separated integers is also returned as None by parse_genotype.
+NO_CALL_VALUES = {"", ".", "./."}
 
 
 def parse_genotype(cell):
     """Parse a single genotype-matrix cell into a tuple of allele sizes.
 
+    The one parser of the matrix cell format: the histogram builder here and
+    mendelian_qc both use it.
+
     Args:
         cell: The raw cell value, e.g. "12,40" (diploid), "21" (hemizygous),
             or "" / "." / "./." (no-call). None is treated as a no-call.
+            Surrounding whitespace is ignored.
 
     Returns:
         A tuple of ints (length 2 for diploid, length 1 for hemizygous), or
@@ -55,10 +59,9 @@ def parse_genotype(cell):
 def _record_sample_id(allele_to_sample_ids, allele, sample_id, occurrence_counts, n_outlier_sample_ids):
     """Track a sample id for an allele, capped at 2 * n_outlier_sample_ids occurrences.
 
-    The occurrence count is incremented on every routed allele (so a homozygous
-    sample, which routes the same allele twice, counts twice toward the cap),
-    matching update_histograms in the reference source. The sample id is
-    appended at most once per allele.
+    The occurrence count is incremented on every routed allele, so a homozygous
+    sample, which routes the same allele twice, counts twice toward the cap. The
+    sample id is appended at most once per allele.
     """
     occurrence_counts[allele] += 1
     if occurrence_counts[allele] <= 2 * n_outlier_sample_ids:
@@ -141,8 +144,7 @@ def convert_counts_to_histogram_string(allele_counts):
 def convert_sample_ids_to_string(allele_to_sample_ids, n_outlier_sample_ids=10):
     """Format outlier sample ids as "{allele}x:{sample_id}" entries, DESCENDING by allele.
 
-    Faithful transcription of convert_sample_ids_to_string from the reference
-    source: iterate alleles largest-first; break at the first allele carried by
+    Iterate alleles largest-first; break at the first allele carried by
     >= n_outlier_sample_ids samples (a "common" allele); emit sample ids in
     ascending order within each allele; stop once more than n_outlier_sample_ids
     ids have been emitted in total.

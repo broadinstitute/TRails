@@ -36,7 +36,7 @@ import locus_annotations
 
 
 # Allowed normalized values for sample-metadata status columns. A value outside
-# the corresponding set raises (mirrors validate_sample_metadata in the source).
+# the corresponding set raises.
 ALLOWED_AFFECTED_STATUS = {"affected", "unaffected", "unknown", "possibly affected"}
 ALLOWED_ANALYSIS_STATUS = {
     "solved",
@@ -236,29 +236,27 @@ def _is_blank(value):
         return True
     if isinstance(value, float):
         return pandas.isna(value)
-    return str(value).strip().lower() in {"", "nan", "none", "na", "n/a", "null"}
+    return str(value).strip().lower() in locus_annotations.BLANK_STATUS_VALUES
 
 
 def read_sample_metadata(path):
     """Read the sample-metadata table and build lookup dictionaries.
 
-    Only ``sample_id`` is required (the original required eight columns; this is
-    relaxed to an additive guard so a build can run with minimal metadata). All
+    Only ``sample_id`` is required, so a build can run with minimal metadata. All
     other recognized columns (``sex``, ``family_id``, ``maternal_id``,
     ``paternal_id``, ``phenotype_description``, ``affected_status``,
     ``analysis_status``) are matched case/underscore-insensitively and included
     when present.
 
-    Normalizations applied (mirroring the source ``load_sample_table`` +
-    ``validate_sample_metadata``):
+    Normalizations applied:
       * ``analysis_status``: lowercased+stripped, remapped via
         ``ANALYSIS_STATUS_REMAP`` (``rncc``/``rcpc`` -> ``unsolved``,
         ``s_kgfp`` -> ``solved``), then blanks -> ``unknown``.
       * ``affected_status`` (for the affected lookup): lowercased+stripped, with
         ``possibly affected`` -> ``affected``.
       * ``phenotype_description``: a leading ``"NA; "`` prefix is stripped.
-      * ``sample_id`` must not contain ``':'`` (it would break OutlierSampleIds
-        parsing) -> raises ValueError.
+      * ``sample_id`` must not contain ``':'`` or ``','`` (both are
+        OutlierSampleIds delimiters) -> raises ValueError.
       * Duplicate ``sample_id`` rows are dropped, keeping the first.
       * Values outside the allowed sets for affected/analysis/sex raise.
 
@@ -266,13 +264,12 @@ def read_sample_metadata(path):
         path: Path to the sample-metadata TSV (optionally gzipped).
 
     Returns:
-        A tuple ``(sample_lookup, affected_lookup, analysis_lookup, sample_df)``
-        where ``sample_lookup`` maps each sample_id to a dict of its metadata
-        fields, ``affected_lookup`` maps sample_id -> normalized affected_status
-        (or None), ``analysis_lookup`` maps sample_id -> normalized
-        analysis_status, and ``sample_df`` is the cleaned DataFrame (with
-        canonical-named columns: ``sample_id`` plus whichever optional columns
-        were present).
+        A tuple ``(sample_lookup, affected_lookup, analysis_lookup)`` where
+        ``sample_lookup`` maps each sample_id, in file order, to a dict of its
+        metadata fields (``sample_id`` plus whichever optional columns were
+        present, under their canonical names), ``affected_lookup`` maps
+        sample_id -> normalized affected_status (or None), and
+        ``analysis_lookup`` maps sample_id -> normalized analysis_status.
     """
     raw_df = pandas.read_table(path, dtype=str, keep_default_na=False)
 
@@ -306,7 +303,7 @@ def read_sample_metadata(path):
             lambda v: ANALYSIS_STATUS_REMAP.get(str(v).strip().lower(), str(v).strip().lower())
         )
         df["analysis_status"] = df["analysis_status"].apply(
-            lambda v: "unknown" if v in {"", "nan", "none", "na", "n/a", "null"} else v
+            lambda v: "unknown" if v in locus_annotations.BLANK_STATUS_VALUES else v
         )
 
     # Strip leading "NA; " from phenotype_description.
@@ -329,10 +326,11 @@ def read_sample_metadata(path):
     for record in df.to_dict(orient="records"):
         sample_id = record["sample_id"]
         sample_lookup[sample_id] = dict(record)
-        affected_lookup[sample_id] = _normalize_affected_status_for_logic(record.get("affected_status"))
+        affected_lookup[sample_id] = locus_annotations.normalize_affected_status_for_logic(
+            record.get("affected_status"))
         analysis_lookup[sample_id] = record.get("analysis_status")
 
-    return sample_lookup, affected_lookup, analysis_lookup, df
+    return sample_lookup, affected_lookup, analysis_lookup
 
 
 def _validate_status_column(df, column, allowed_set):
@@ -353,20 +351,12 @@ def _validate_status_column(df, column, allowed_set):
         )
 
 
-def _normalize_affected_status_for_logic(value):
-    """Lowercase + collapse 'possibly affected' to 'affected'; None for blanks.
-
-    Delegates to locus_annotations so the build and the server share one definition.
-    """
-    return locus_annotations.normalize_affected_status_for_logic(value)
-
-
 def read_phenotypes(path):
     """Read the phenotypes table into a participant -> HPO-term-set mapping.
 
-    Expects ``participant_id`` and ``term_id`` columns (the format produced by
-    generate_phenotype_table.py), matched case/underscore-insensitively. Only
-    terms starting with ``"HP:"`` are retained.
+    Expects ``participant_id`` and ``term_id`` columns (the format described in
+    docs/INPUT_FORMATS.md), matched case/underscore-insensitively. Only terms
+    starting with ``"HP:"`` are retained.
 
     Args:
         path: Path to the phenotypes TSV (optionally gzipped), or None.
@@ -444,7 +434,7 @@ def read_gene_table(path):
     if "hgnc_gene_id" in columns_to_keep:
         # A single blank cell upcasts this numeric-looking id column to float64, which would write
         # "1100.0" into GeneTableHgncGeneId. Render it back as an id string; blanks stay NaN so
-        # analysis_columns._is_missing still normalizes them to None.
+        # analysis_columns.add_gene_columns (is_none_or_nan) still normalizes them to None.
         df["hgnc_gene_id"] = df["hgnc_gene_id"].apply(
             lambda value: value if _is_blank(value)
             else str(int(value)) if isinstance(value, float) else str(value))
@@ -452,12 +442,14 @@ def read_gene_table(path):
     return df[columns_to_keep].set_index("gene_id").to_dict(orient="index")
 
 
-# HPO term ids that encode an inheritance mode rather than a phenotype, and
-# their mapping to short inheritance codes. The single source of truth for this
-# classification (read_gene_disease_phenotypes uses it to route terms into a
-# disease's inheritance vs. phenotypes set). Terms present here but absent from
-# INHERITANCE_MAP (the non-Mendelian / polygenic group) carry no actionable
-# inheritance code and are simply dropped from the inheritance set.
+# HPO term ids that encode an inheritance mode rather than a phenotype (descendants of
+# HP:0000005 Mode of inheritance, including every one that genes_to_phenotype.txt v2025-05-06
+# uses), and their mapping to short inheritance codes. The single source of truth for this
+# classification (read_gene_disease_phenotypes uses it to route terms into a disease's
+# inheritance vs. phenotypes set). Terms present here but absent from INHERITANCE_MAP (the
+# non-Mendelian / polygenic group and qualifiers such as incomplete penetrance or genetic
+# anticipation) carry no actionable inheritance code, so they are dropped: they enter neither
+# the inheritance set nor the phenotype set that phenotype scoring compares patients against.
 INHERITANCE_HPO_TERMS = {
     "HP:0000006",  # Autosomal dominant
     "HP:0000007",  # Autosomal recessive
@@ -466,12 +458,24 @@ INHERITANCE_HPO_TERMS = {
     "HP:0001423",  # X-linked dominant
     "HP:0001426",  # Non-Mendelian
     "HP:0001427",  # Mitochondrial
+    "HP:0001442",  # Typified by somatic mosaicism
     "HP:0001450",  # Y-linked
+    "HP:0001466",  # Contiguous gene syndrome
+    "HP:0001470",  # Sex-limited expression
+    "HP:0003743",  # Genetic anticipation
+    "HP:0003744",  # Genetic anticipation with paternal anticipation bias
+    "HP:0003745",  # Sporadic
+    "HP:0003829",  # Typified by incomplete penetrance
+    "HP:0003831",  # Typified by age-related disease onset
     "HP:0010982",  # Polygenic
     "HP:0010983",  # Oligogenic
     "HP:0010984",  # Digenic
     "HP:0012275",  # Autosomal dominant with maternal imprinting
+    "HP:0025352",  # Typically de novo
+    "HP:0032382",  # Uniparental disomy
     "HP:0034341",  # Pseudoautosomal recessive
+    "HP:0034344",  # Female-limited expression
+    "HP:4000158",  # Typified by high penetrance
 }
 INHERITANCE_MAP = {
     "HP:0000006": "AD",
@@ -518,7 +522,7 @@ def read_gene_disease_phenotypes(path):
             )
             if fields[2] in INHERITANCE_HPO_TERMS:
                 # Only Mendelian inheritance modes carry an actionable short code;
-                # non-Mendelian/polygenic terms (absent from INHERITANCE_MAP) are
+                # the other inheritance terms (absent from INHERITANCE_MAP) are
                 # dropped rather than added raw, so they can't make phenotype
                 # scoring treat the disease as inheritance-restricted.
                 if fields[2] in INHERITANCE_MAP:

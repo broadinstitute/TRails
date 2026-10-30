@@ -40,11 +40,8 @@ the filesystem move).
 import os
 
 import duckdb_compat
-from analysis_columns import POPULATION_P99_GATE_COHORTS
+from analysis_columns import OUTLIER_TYPES, POPULATION_P99_GATE_COHORTS
 
-
-# The three outlier types, in the canonical order used throughout TRails.
-OUTLIER_TYPES = ("AllAlleles", "ShortAlleles", "HemizygousAlleles")
 
 # The key/value metadata table and the key the sample count is stored under. The
 # results server reads it through ``read_sample_count`` to show "N loci, N samples".
@@ -75,8 +72,7 @@ AFFECTED_UNSOLVED_OUTLIERS_COLUMN_TYPES = {
 # to read. That case is routine rather than exotic: a build run without a gene table
 # still writes ``pLI`` and the ``GeneTable*`` columns, all NULL, and the results server
 # compares ``pLI`` to a number. Comparing a number against a VARCHAR column is a binder
-# error in DuckDB, where SQLite's untyped column simply matched nothing. Any real value
-# in the column overrides this set.
+# error in DuckDB. Any real value in the column overrides this set.
 #
 # The generated names are a superset of the schema (there is no
 # ``ThirdUnaffectedAlleleSize_*``, and only AoU1027 carries the OE_* statistics), which
@@ -352,9 +348,8 @@ def read_sample_count(connection):
 def write_population_gate_cohorts(connection, population_gate_cohorts):
     """Records in ``metadata`` which cohorts gated the NumAffectedUnsolved* counts and phenotype scores.
 
-    Stored comma-joined (e.g. ``HPRC256,AoU1027``), the format the analysis code's own
-    databases use. Like ``write_sample_count``, it creates the table if needed and the
-    caller commits.
+    Stored comma-joined (e.g. ``HPRC256,AoU1027``). Like ``write_sample_count``, it creates
+    the table if needed and the caller commits.
 
     Args:
         connection: An open duckdb_compat connection.
@@ -414,9 +409,9 @@ def write_swim_plot(connection, swim_rows, columns=None):
 def write_phenotype_tables(connection, per_outlier_rows, per_locus_rows):
     """Writes the two phenotype-score tables (when non-empty).
 
-    Both tables are written only when ``per_outlier_rows`` is non-empty (matching
-    the reference: the per-locus table is written alongside the per-outlier one).
-    Column order for each table is taken from the first row dict.
+    Both tables are written only when ``per_outlier_rows`` is non-empty: the per-locus
+    table is written alongside the per-outlier one, never on its own. Column order for
+    each table is taken from the first row dict.
 
     Args:
         connection: An open duckdb_compat connection.
@@ -447,8 +442,7 @@ def write_mendelian_tables(connection, per_sample_rows, per_motif_rows):
     These tables are written only when ``per_sample_rows`` is non-empty (i.e. at
     least one complete trio existed). ``sample_id`` is the primary key of each
     table and is forced to be the first column; the remaining columns and their
-    order come from the first row dict (all declared ``BIGINT``, matching the
-    reference per-trio count schema).
+    order come from the first row dict (all declared ``BIGINT``).
 
     Args:
         connection: An open duckdb_compat connection.

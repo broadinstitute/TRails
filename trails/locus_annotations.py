@@ -10,14 +10,8 @@ after the allele histograms have been built:
     catalog (and, optionally, a cached STRchive locus set), the canonical-motif
     column, and the ``IsKnownMotif`` / ``IsInMendelianGene`` flags.
 
-It is a faithful, standalone port of the relevant pieces of the original
-``tr_analysis_helpers.py`` (``compute_jaccard``, ``motifs_match``,
-``load_known_disease_loci``, ``matches_disease_locus``) and the
-``add_derived_locus_columns`` / known-motif logic from ``analyze_results.py``.
-
-Design choices (per the TRails port blueprint):
-  * No dependency on ``str_analysis``; motif primitives come from
-    ``motif_utilities``.
+Design choices:
+  * Motif primitives come from ``motif_utilities``.
   * No network access by default. ``load_known_disease_loci`` reads the cached
     class-A catalog JSON, and only builds STRchive interval trees when handed a
     cached STRchive-loci JSON path (``fetch_strchive`` triggers the optional
@@ -53,7 +47,7 @@ STRCHIVE_URL = (
 
 
 # Gene-region prioritization rank (lower number = more important / more likely
-# functional). Matches GENE_REGION_RANK in the original analyze_results.py.
+# functional).
 GENE_REGION_RANK = {
     "CDS": 1,
     "5' UTR": 2,
@@ -154,7 +148,10 @@ def _build_strchive_trees(loci):
     """Build chrom -> IntervalTree from a list of STRchive locus dicts.
 
     Only loci with a disease, chromosome, and both hg38 coordinates are kept.
-    The hg38 start is converted from 1-based to 0-based (``start_hg38 - 1``).
+    ``start_hg38`` is already 0-based and ``stop_hg38`` is the exclusive end, the
+    same half-open convention as a TRails ``LocusId`` (STRchive's own BED catalog
+    lists HTT as ``chr4 3074876 3074933``, the values its ``start_hg38`` and
+    ``stop_hg38`` hold), so both are used as they are.
 
     Args:
         loci: A list of STRchive locus dicts (as parsed from STRchive-loci.json).
@@ -170,15 +167,16 @@ def _build_strchive_trees(loci):
            not locus.get("start_hg38") or not locus.get("stop_hg38"):
             continue
         interval_trees[locus["chrom"].replace("chr", "")].addi(
-            int(locus["start_hg38"]) - 1, int(locus["stop_hg38"]), data=locus)
+            int(locus["start_hg38"]), int(locus["stop_hg38"]), data=locus)
         count += 1
 
     print(f"Loaded {count:,d} STRchive disease loci")
     return dict(interval_trees)
 
 
-# Cell values that mean "nothing was recorded" in an affected_status / analysis_status column
-# (matches input_tables._is_blank).
+# Lower-cased, stripped cell values that mean "nothing was recorded" in a sample-metadata
+# column (affected_status, analysis_status, sex, maternal_id, ...). input_tables and
+# mendelian_qc read their blanks from here too.
 BLANK_STATUS_VALUES = {"", "nan", "none", "na", "n/a", "null"}
 
 
@@ -213,9 +211,11 @@ def load_known_disease_loci(filepath=None, fetch_strchive=False, strchive_filepa
     Reads the cached class-A variant catalog JSON (e.g.
     ``variant_catalog_without_offtargets.GRCh38.json``) and keeps only loci that
     carry at least one named disease (``any(d["Name"] for d in Diseases)``) and a
-    parseable ``MainReferenceRegion`` (``chrom:start-end``). The 1-based catalog
-    start is converted to a 0-based start (``start - 1``); the end is already
-    1-based. Each interval carries its full locus dict in ``.data``.
+    parseable ``MainReferenceRegion`` (``chrom:start-end``). The catalog's start is
+    already 0-based and its end 1-based, like a TRails ``LocusId`` (its HTT region,
+    ``chr4:3074876-3074933``, is the 57 bp of 19 CAG repeats that TRExplorer calls
+    ``4-3074876-3074933-CAG``), so both are used as they are. Each interval carries
+    its full locus dict in ``.data``.
 
     The optional STRchive trees are built only when an explicit cached
     ``strchive_filepath`` is given, or when ``fetch_strchive`` is True (which
@@ -261,7 +261,7 @@ def load_known_disease_loci(filepath=None, fetch_strchive=False, strchive_filepa
         chrom_part, coords = reference_region.split(":")
         start_str, end_str = coords.split("-")
         chrom = chrom_part.replace("chr", "")
-        start_0based = int(start_str) - 1
+        start_0based = int(start_str)
         end_1based = int(end_str)
         interval_trees[chrom].addi(start_0based, end_1based, data=locus_data)
         if build_locus_lookup:
