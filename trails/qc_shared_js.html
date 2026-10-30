@@ -8,7 +8,7 @@
 // appendQCBinCard and createSingleBinBoxPlotChart, and the Mendelian-warning popup handler.)
 // Page-specific pieces (MOTIF_BINS, MENDELIAN_WARNINGS, each chart's data and options) stay in each page.
 // Requires Chart.js + jQuery (loaded by header_template.html) and the page-level
-// MENDELIAN_WARNINGS const (referenced only at call time).
+// MENDELIAN_WARNINGS and OUTLIER_WARNINGS consts (referenced only at call time).
 // =========================================================================
 
 // HTML escaping helper
@@ -57,16 +57,13 @@ function setupDropdownMenu($dropdown, items) {
     });
 }
 
-// Helper function to render warning icon if sample has warnings.
-// Mendelian-violation warnings are source-independent; outlier (99th-percentile) warnings are
-// per-source, so the outlier part is only included for the page's currently-selected `source`
-// (pass no source to show only the source-independent Mendelian part).
-function renderMendelianWarning(sampleId, source) {
+// Helper function to render warning icon if sample has warnings: its Mendelian-violation warning
+// (MENDELIAN_WARNINGS) and its 99th-percentile outlier warning (OUTLIER_WARNINGS, which the page
+// defines unless it passes mendelianOnly: true, as the QC2 page does to show only the first).
+function renderMendelianWarning(sampleId, { mendelianOnly = false } = {}) {
     if (!sampleId) return '';
     const mendelian = MENDELIAN_WARNINGS[sampleId];
-    const outlierMap = (source && typeof OUTLIER_WARNINGS_BY_SOURCE !== 'undefined')
-        ? OUTLIER_WARNINGS_BY_SOURCE[source] : null;
-    const outlier = outlierMap ? outlierMap[sampleId] : undefined;
+    const outlier = mendelianOnly ? undefined : OUTLIER_WARNINGS[sampleId];
     if (!mendelian && !outlier) return '';
     const w = Object.assign({}, mendelian || {}, outlier || {});
     // Determine tooltip text based on warning types

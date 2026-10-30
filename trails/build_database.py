@@ -249,7 +249,7 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
         result_database.write_sample_count(connection, len(sample_id_list))
         result_database.write_population_gate_cohorts(connection, population_gate_cohorts)
 
-        swim_rows = swim_plot.generate_swim_plot_table(records, sample_lookup, analysis_lookup)
+        swim_rows = swim_plot.generate_swim_plot_table(records, sample_lookup)
         result_database.write_swim_plot(connection, swim_rows, columns=swim_plot.SWIM_PLOT_COLUMNS)
 
         result_database.write_affected_unsolved_outliers_table(connection, affected_unsolved_outlier_rows)

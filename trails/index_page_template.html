@@ -611,8 +611,8 @@ const API_BASE_URL = window.location.origin + '/api/v1';
 
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
 const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
-// Per-source 99th-percentile outlier warnings (keyed by source, then sample_id).
-const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
+// 99th-percentile outlier warnings, keyed by sample_id
+const OUTLIER_WARNINGS = {{ outlier_warnings | tojson }};
 
 // Population filter that a page opened with no saved filters starts with ('' for none)
 const INITIAL_REQUIRE_ABOVE_POPULATION = {{ initial_require_above_population | tojson }};
@@ -624,7 +624,6 @@ const DEFAULT_STATE = {
     require_above_population: '',
     population_metric: '99th',
     include_loci_without_population_data: false,
-    source: {{ default_source | tojson }},
     apply_pathogenic_threshold: false,
     known_loci_only: false,
     known_motifs_only: false,
@@ -892,7 +891,6 @@ window.addEventListener('popstate', function() {
 function buildApiUrl() {
     const params = new URLSearchParams();
     params.set('outlier_type', currentState.outlier_type);
-    params.set('source', currentState.source);
     params.set('page', currentState.page);
     params.set('page_size', currentState.page_size);
 
@@ -1218,7 +1216,7 @@ function updateActiveFiltersBar() {
         outlier_type: 'Outlier', require_above_unaffected: 'Aff > Unaff',
         require_families_above_unaffected: 'Fam > Unaff', require_above_population: 'Above Pop', population_metric: 'Pop Metric',
         include_loci_without_population_data: 'Include without pop.',
-        source: 'Source', apply_pathogenic_threshold: 'Path. Threshold', known_loci_only: 'Known Loci', known_motifs_only: 'Known Motifs', mendelian_genes_only: 'Mendelian Genes',
+        apply_pathogenic_threshold: 'Path. Threshold', known_loci_only: 'Known Loci', known_motifs_only: 'Known Motifs', mendelian_genes_only: 'Mendelian Genes',
         gene_regions: 'Regions', exclude_gene_regions: 'Excl Regions',
         min_expansion: 'Min Exp', min_repeats_threshold: 'Min Repeats', min_repeats_above_population: 'Min Δpop', min_sigma_percentile: 'σ Percentile',
         motif_size: 'Motif Size',
@@ -1539,13 +1537,13 @@ function renderGroupRow(group, rowIndex, isFamily) {
     let identityCells;
     if (isFamily) {
         const members = (group.members || []).map(m =>
-            `<div>${escapeHtml(m.sample_id)}${renderMendelianWarning(m.sample_id, currentState.source)} <span class="cell-sub">${escapeHtml(m.sex || '')}, ${statusText(m)}</span></div>`).join('');
+            `<div>${escapeHtml(m.sample_id)}${renderMendelianWarning(m.sample_id)} <span class="cell-sub">${escapeHtml(m.sex || '')}, ${statusText(m)}</span></div>`).join('');
         const phenotypes = [...new Set((group.members || []).map(m => m.phenotype_description).filter(Boolean))].join(' | ');
         identityCells = `<td class="col-group-id"><div class="cell-main">${escapeHtml(group.family_id)}</div></td>
         <td class="col-group-members">${members}</td>
         <td class="col-group-phenotype">${phenotypeHtml(phenotypes)}</td>`;
     } else {
-        identityCells = `<td class="col-group-id"><div class="cell-main">${escapeHtml(group.sample_id)}${renderMendelianWarning(group.sample_id, currentState.source)}</div></td>
+        identityCells = `<td class="col-group-id"><div class="cell-main">${escapeHtml(group.sample_id)}${renderMendelianWarning(group.sample_id)}</div></td>
         <td class="col-group-family">${escapeHtml(group.family_id || '')}</td>
         <td class="col-group-sex">${escapeHtml(group.sex || '')}</td>
         <td class="col-group-status">${statusText(group)}</td>
@@ -2011,7 +2009,7 @@ $(document).on('click', 'td.col-expand', async function() {
     refreshCollapseAllButton();
 
     try {
-        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${encodeURIComponent(currentState.source)}`);
+        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}`);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const detail = await response.json();
         const html = renderLocusDetail(detail, currentState.outlier_type);
@@ -2207,7 +2205,7 @@ function renderLocusDetail(detail, outlierType) {
         html += `<td style="text-align: right; font-weight: 600;">${s.allele_size}</td>`;
         html += `<td>${formatMotifForDisplay(locus.Motif)}</td>`;
         if (hasSex) html += `<td>${escapeHtml(s.sex || '')}</td>`;
-        html += `<td>${renderMendelianWarning(s.sample_id, currentState.source)}${escapeHtml(s.sample_id || '')}</td>`;
+        html += `<td>${renderMendelianWarning(s.sample_id)}${escapeHtml(s.sample_id || '')}</td>`;
         html += `<td>${escapeHtml(s.family_id || '')}</td>`;
         html += `<td>${escapeHtml(s.affected_status || '')}</td>`;
         html += `<td>${escapeHtml(s.analysis_status || '')}</td>`;
@@ -2274,7 +2272,7 @@ function renderLocusDetail(detail, outlierType) {
                 const rowStyle = score.gene_phenotype_similarity >= 0.5 ? 'background: #a5d6a7;' : '';
 
                 html += `<tr style="${rowStyle}">`;
-                html += `<td style="padding: 3px 6px;">${renderMendelianWarning(score.sample_id, currentState.source)}${escapeHtml(score.sample_id || '')}</td>`;
+                html += `<td style="padding: 3px 6px;">${renderMendelianWarning(score.sample_id)}${escapeHtml(score.sample_id || '')}</td>`;
                 html += `<td style="padding: 3px 6px; text-align: right;">${score.allele_size || ''}</td>`;
                 html += `<td style="padding: 3px 6px; text-align: right; font-weight: ${score.gene_phenotype_similarity >= 0.5 ? 'bold' : 'normal'};">${geneSimStr}</td>`;
                 html += `<td style="padding: 3px 6px; text-align: right;">${overlapStr}</td>`;
@@ -2583,7 +2581,7 @@ async function refreshDetailPanel(locusId) {
     if ($detailRow.length === 0) return;
 
     try {
-        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${encodeURIComponent(currentState.source)}`);
+        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}`);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const detail = await response.json();
         const html = renderLocusDetail(detail, currentState.outlier_type);
@@ -2808,7 +2806,7 @@ $(document).on('click', '.badge-known-locus', async function(e) {
     const locusId = $(this).data('locus-id');
 
     try {
-        const response = await fetch(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}?source=${encodeURIComponent(currentState.source)}`);
+        const response = await fetch(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}`);
         if (!response.ok) throw new Error('Failed to fetch locus details');
         const data = await response.json();
         const knownDisease = data.annotations?.known_disease_locus;

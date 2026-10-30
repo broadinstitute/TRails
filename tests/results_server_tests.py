@@ -158,14 +158,10 @@ class ResultsServerTests(ServerTestCase):
         self.assertEqual(data["locus"]["LocusId"], "chr1-100-110-AT")
         self.assertIn("AllAlleles", data["outlier_samples"])
 
-    def test_schema_has_single_source(self):
+    def test_schema_reports_the_database_total_loci(self):
         response = self.client.get("/api/v1/schema")
         self.assertEqual(response.status_code, 200)
-        data = response.get_json()
-        self.assertEqual(data["total_loci"], 2)
-        self.assertEqual(data["available_sources"], ["TRails"])
-        # source is accepted but ignored, so it is not advertised as a filter.
-        self.assertNotIn("source", data["filters"])
+        self.assertEqual(response.get_json()["total_loci"], 2)
 
     def test_schema_total_samples_is_null_without_the_metadata_table(self):
         # This fixture has no metadata table, so the key is reported as null rather than
@@ -328,6 +324,10 @@ class ResultsServerTests(ServerTestCase):
         filtered = self.client.get("/api/v1/loci?outlier_type=all&tag=interesting")
         self.assertEqual(filtered.status_code, 200)
         self.assertEqual(filtered.get_json()["total"], 1)
+        # The tag list the pages' menus are filled from now includes it
+        tag_list = self.client.get("/api/v1/annotations/tags").get_json()
+        self.assertEqual(["tags"], sorted(tag_list))
+        self.assertIn("interesting", tag_list["tags"])
 
     def test_concurrent_annotation_writes_all_succeed(self):
         # Flask serves with threaded=True and DuckDB raises instead of waiting when two

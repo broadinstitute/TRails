@@ -1031,9 +1031,6 @@ def is_true_flag(name):
 def validate_params():
     """Validate and parse query parameters from the request.
 
-    The pages send a 'source' query parameter (the database's label), which is accepted and
-    ignored.
-
     Returns:
         Tuple (params_dict, error_response). If error_response is not None, the
         route handler should return it immediately.
@@ -2323,10 +2320,9 @@ def index():
     """Serve the web UI via on-the-fly Jinja2 template rendering."""
     template = jinja2_env.get_template("index_page_template.html")
     return template.render(
-        default_source=app.config["DB_LABELS"][0],
         has_mendelian=app.config.get("HAS_MENDELIAN", False),
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
-        outlier_warnings_by_source={app.config["DB_LABELS"][0]: app.config.get("OUTLIER_WARNINGS", {})},
+        outlier_warnings=app.config.get("OUTLIER_WARNINGS", {}),
         initial_require_above_population=app.config.get("INITIAL_REQUIRE_ABOVE_POPULATION", ""),
         population_gate_cohorts=app.config.get("POPULATION_GATE_COHORTS", ()),
     )
@@ -2337,10 +2333,9 @@ def swim():
     """Serve the swim plot UI."""
     template = jinja2_env.get_template("swim_plot_template.html")
     return template.render(
-        default_source=app.config["DB_LABELS"][0],
         has_mendelian=app.config.get("HAS_MENDELIAN", False),
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
-        outlier_warnings_by_source={app.config["DB_LABELS"][0]: app.config.get("OUTLIER_WARNINGS", {})},
+        outlier_warnings=app.config.get("OUTLIER_WARNINGS", {}),
     )
 
 
@@ -2349,10 +2344,9 @@ def sample_qc():
     """Serve the sample QC page."""
     template = jinja2_env.get_template("sample_qc_template.html")
     return template.render(
-        default_source=app.config["DB_LABELS"][0],
         has_mendelian=app.config.get("HAS_MENDELIAN", False),
         mendelian_warnings=app.config.get("MENDELIAN_WARNINGS", {}),
-        outlier_warnings_by_source={app.config["DB_LABELS"][0]: app.config.get("OUTLIER_WARNINGS", {})},
+        outlier_warnings=app.config.get("OUTLIER_WARNINGS", {}),
     )
 
 
@@ -2381,8 +2375,7 @@ def qc2():
 @app.route("/api/v1/annotations/tags", methods=["GET"])
 def list_all_tags():
     """List all existing user tags (for autocomplete/dropdown)."""
-    user_tags = app.config["ANNOTATIONS"]["all_tags"]
-    return jsonify({"tags": user_tags, "all_tags": user_tags})
+    return jsonify({"tags": app.config["ANNOTATIONS"]["all_tags"]})
 
 
 @app.route("/api/v1/annotations/<path:locus_id>", methods=["GET"])
@@ -3086,7 +3079,6 @@ def export_json(conn, query, count_query, sql_params, ot, params):
         raise
 
     metadata = {
-        "source": app.config["DB_LABELS"][0],
         "outlier_type": params["outlier_type"],
         "sort_by": params.get("sort_by") or ["count"],
         "filters_applied": build_filters_applied(params),
@@ -3603,10 +3595,7 @@ def get_sample_outlier_stats():
 @app.route("/api/v1/schema")
 def get_schema():
     """Return available filter fields, sort options, and enum values."""
-    label = app.config["DB_LABELS"][0]
     return jsonify({
-        "source": label,
-        "available_sources": app.config["DB_LABELS"],
         "filters": {
             "outlier_type": {
                 "type": "enum",
@@ -3720,9 +3709,6 @@ def configure_app(db_path, sample_table=None, known_loci_json=None,
     """
     db_path = os.path.abspath(db_path)
     app.config["DB_PATH"] = db_path
-    # The database's one label: the pages send it back as their source parameter and key their
-    # outlier-warning map by it, and /api/v1/schema and the JSON export report it as the source.
-    app.config["DB_LABELS"] = ["TRails"]
 
     # Sample metadata (optional).
     if sample_table and os.path.exists(sample_table):

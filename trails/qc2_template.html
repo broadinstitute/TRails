@@ -72,9 +72,9 @@
 const QC2_API_BASE = window.location.origin + '/api/v1';
 
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
-// This page has no source selector, so its renderMendelianWarning() calls pass no source and
-// show only the source-independent Mendelian-violation part. The per-source 99th-percentile
-// outlier warnings are therefore never read here and are not serialized into the page.
+// This page shows only the Mendelian-violation part of a sample's warning (its
+// renderMendelianWarning call passes mendelianOnly: true), so the 99th-percentile outlier
+// warnings are never read here and are not serialized into the page.
 const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
 
 
@@ -112,7 +112,7 @@ const TRIO_SECTION = {
     tableTitle: 'Top 20 samples',
     maxTableRows: 20,
     tableHeaderHtml: '<tr><th>Proband ID</th><th>% MV</th></tr>',
-    tableRowHtml: item => `<td title="${escapeHtml(item.sample_id)}">${renderMendelianWarning(item.sample_id)}${escapeHtml(item.sample_id)}</td><td>${formatFractionAsPercent(item.fraction)}</td>`,
+    tableRowHtml: item => `<td title="${escapeHtml(item.sample_id)}">${renderMendelianWarning(item.sample_id, { mendelianOnly: true })}${escapeHtml(item.sample_id)}</td><td>${formatFractionAsPercent(item.fraction)}</td>`,
 };
 
 // One larger, purple dot per center

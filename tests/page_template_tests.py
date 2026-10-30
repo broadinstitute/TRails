@@ -238,29 +238,30 @@ class AnnotationWriteHelperTests(unittest.TestCase):
         self.assertIn('{"error": "note_text is required and cannot be empty"}', server)
 
 
-class QC2OutlierWarningTests(unittest.TestCase):
-    """The QC2 page leaves out the per-source outlier map, which it never reads."""
+class OutlierWarningTests(unittest.TestCase):
+    """A sample's warning icon combines its Mendelian-violation and its outlier warning.
 
-    def test_qc2_page_does_not_serialize_outlier_warnings(self):
-        template = read_template("qc2_template.html")
-        self.assertNotIn("OUTLIER_WARNINGS_BY_SOURCE", template)
-        self.assertNotIn("outlier_warnings_by_source", template)
+    The QC2 page shows only the Mendelian part, so it leaves the outlier map out of the page.
+    """
 
-    def test_the_only_warning_call_on_the_page_passes_no_source(self):
-        # `renderMendelianWarning()` with an empty argument list is the prose mention in the
-        # comment above MENDELIAN_WARNINGS, not a call.
-        calls = re.findall(r"renderMendelianWarning\(([^)]+)\)", read_template("qc2_template.html"))
-        self.assertEqual(["item.sample_id"], calls)
-
-    def test_the_shared_helper_tolerates_the_missing_const(self):
-        # Leaving the const out is only safe because the helper short-circuits on a falsy source and
-        # guards the lookup with typeof.
-        self.assertIn("const outlierMap = (source && typeof OUTLIER_WARNINGS_BY_SOURCE !== 'undefined')",
-                      read_template("qc_shared_js.html"))
-
-    def test_the_pages_that_do_pass_a_source_still_define_the_map(self):
+    def test_the_pages_that_show_outlier_warnings_define_the_map(self):
         for name in ("index_page_template.html", "sample_qc_template.html", "swim_plot_template.html"):
-            self.assertIn("const OUTLIER_WARNINGS_BY_SOURCE =", read_template(name), name)
+            self.assertIn("const OUTLIER_WARNINGS = {{ outlier_warnings | tojson }};", read_template(name), name)
+        # The index, swim and sample QC routes render it
+        self.assertEqual(3, read_template("results_server.py").count(
+            'outlier_warnings=app.config.get("OUTLIER_WARNINGS", {}),'))
+
+    def test_qc2_page_asks_for_the_mendelian_part_only(self):
+        template = read_template("qc2_template.html")
+        self.assertEqual(["item.sample_id, { mendelianOnly: true }"],
+                         re.findall(r"renderMendelianWarning\(([^)]+)\)", template))
+        self.assertNotIn("outlier_warnings", template)
+
+    def test_the_helper_reads_the_outlier_map_only_without_mendelian_only(self):
+        # Leaving the map out of the QC2 page is only safe because the helper does not read it then
+        helper = js_function_body(read_template("qc_shared_js.html"), "function renderMendelianWarning(")
+        self.assertIn("function renderMendelianWarning(sampleId, { mendelianOnly = false } = {}) {", helper)
+        self.assertIn("const outlier = mendelianOnly ? undefined : OUTLIER_WARNINGS[sampleId];", helper)
 
 
 class ClipboardFallbackTests(unittest.TestCase):
@@ -313,14 +314,6 @@ class TagAttributeReadTests(unittest.TestCase):
         template = read_template("swim_plot_template.html")
         self.assertIn("var tag = $(this).attr('data-tag');", template)
         self.assertNotIn(".data('tag')", template)
-
-
-class SampleQCSourceTests(unittest.TestCase):
-    """The Sample QC page loads its data for the server's default source."""
-
-    def test_data_is_fetched_for_the_page_default_source(self):
-        template = read_template("sample_qc_template.html")
-        self.assertIn("sample_qc_data?source=${encodeURIComponent(DEFAULT_SOURCE)}", template)
 
 
 class SharedJsHeaderTests(unittest.TestCase):
@@ -415,18 +408,6 @@ class QCPageSharedCodeTests(unittest.TestCase):
         self.assertIn("chart.config._boxStats = computeBoxStats(values);", builder)
         self.assertIn("p95: computePercentile(sortedValues, 95),", builder)
         self.assertIn("p99: computePercentile(sortedValues, 99)", builder)
-
-
-class DefaultSourceTests(unittest.TestCase):
-    """Every page queries the server's single, default source."""
-
-    def test_api_requests_carry_the_default_source(self):
-        # The server accepts and ignores it; the page's Mendelian-warning lookups use it.
-        self.assertIn("params.set('source', currentState.source);", read_template("index_page_template.html"))
-
-    def test_swim_plot_loads_the_default_source(self):
-        self.assertIn("const params = { outlier_type: outlierType, source: SWIM_DEFAULT_SOURCE };",
-                      read_template("swim_plot_template.html"))
 
 
 class PopulationDataFilterGatingTests(unittest.TestCase):
@@ -879,11 +860,6 @@ class GroupResultsByTests(unittest.TestCase):
                       self.template)
         self.assertIn('SAMPLE_LEVEL_FILTERS = ("sample_id_keyword", "sample_id_like", "phenotype_keyword")',
                       self.server)
-
-    def test_no_grouped_url_adds_a_source(self):
-        for signature in ("function buildGroupedApiUrl(", "function buildGroupedExportUrl(",
-                          "function buildGroupLociApiUrl("):
-            self.assertNotIn("source", js_function_body(self.template, signature), signature)
 
     def test_the_expand_handler_is_bound_to_table_cells_only(self):
         # The grouped header row has a th with the same class, which has no row to expand.

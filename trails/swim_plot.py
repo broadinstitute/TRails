@@ -104,7 +104,7 @@ def _title_case_status(raw_status):
     return "Unknown" if status is None else str(status).strip().title()
 
 
-def generate_swim_plot_table(records, sample_lookup, analysis_lookup):
+def generate_swim_plot_table(records, sample_lookup):
     """Flatten locus records into one swim-plot row per outlier allele.
 
     Walks the three outlier types and, for each locus record carrying a non-empty
@@ -120,9 +120,9 @@ def generate_swim_plot_table(records, sample_lookup, analysis_lookup):
             each carrying OutlierSampleIds_* plus the locus-level passthrough
             columns and FirstUnaffectedAlleleSize_*.
         sample_lookup: Mapping of sample_id -> sample row dict (family_id, sex,
-            affected_status, phenotype_description). A sample id absent here yields
-            None metadata and an "Unknown" status.
-        analysis_lookup: Mapping of sample_id -> analysis_status.
+            affected_status, analysis_status, phenotype_description), as
+            input_tables.read_sample_metadata returns it. A sample id absent here yields
+            None metadata and "Unknown" statuses.
 
     Returns:
         list: One row-dict per outlier entry, in (outlier_type, locus, rank)
@@ -162,7 +162,8 @@ def generate_swim_plot_table(records, sample_lookup, analysis_lookup):
                     # "affected" for the analysis logic.
                     "affected_status": _title_case_status(
                         sample_row.get("affected_status") if sample_row else None),
-                    "analysis_status": _title_case_status(analysis_lookup.get(sample_id)),
+                    "analysis_status": _title_case_status(
+                        sample_row.get("analysis_status") if sample_row else None),
                     "sex": blank_to_none(sample_row.get("sex")) if sample_row else None,
                     "phenotype_description": (
                         blank_to_none(sample_row.get("phenotype_description")) if sample_row else None),

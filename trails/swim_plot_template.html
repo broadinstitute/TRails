@@ -316,12 +316,11 @@
 // =========================================================================
 
 const SWIM_API_BASE = window.location.origin + '/api/v1';
-const SWIM_DEFAULT_SOURCE = {{ default_source | tojson }};
 
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
 const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
-// Per-source 99th-percentile outlier warnings (keyed by source, then sample_id).
-const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
+// 99th-percentile outlier warnings, keyed by sample_id
+const OUTLIER_WARNINGS = {{ outlier_warnings | tojson }};
 
 // /api/v1/swim_plot_data returns at most this many alleles per motif size, the largest ones (the
 // LIMIT in results_server.get_swim_plot_data)
@@ -330,7 +329,7 @@ const SWIM_PLOT_MAX_ALLELES_PER_MOTIF_SIZE = 500;
 // Chart instance and raw data storage
 let swimChart = null;
 let swimRawData = [];
-let swimLoadedParams = null;  // params (incl. source / outlier_type) the rendered chart was loaded with
+let swimLoadedParams = null;  // params (incl. outlier_type) the rendered chart was loaded with
 let swimLoadSeq = 0;  // monotonic load id; a stale response must not overwrite a newer one
 
 // Category helpers
@@ -349,7 +348,7 @@ function yToLabel(y) {
 // Get current control values
 function getSwimParams() {
     const outlierType = $('input[name="swim_outlier_type"]:checked').val() || 'all';
-    const params = { outlier_type: outlierType, source: SWIM_DEFAULT_SOURCE };
+    const params = { outlier_type: outlierType };
 
     // Boolean checkboxes
     if ($('#swim_require_affected_above_unaffected').is(':checked')) params.require_affected_above_unaffected = '1';
@@ -423,7 +422,7 @@ async function loadSwimPlot() {
         const result = await response.json();
         if (requestId !== swimLoadSeq) return;  // superseded while parsing the response
         swimRawData = result.data || [];
-        swimLoadedParams = params;  // remember the source/outlier_type this chart was loaded with (used by showDotDetail)
+        swimLoadedParams = params;  // remember the outlier_type this chart was loaded with (used by showDotDetail)
         renderSwimChart(swimRawData);
     } catch (err) {
         if (requestId !== swimLoadSeq) return;  // stale failure - don't clear the newer load's chart
@@ -752,8 +751,8 @@ function showDotDetail(item) {
     // have changed the outlier-type radio without reloading, which would otherwise fetch detail
     // for a different outlier type than the plotted dot belongs to (wrong details or 404).
     const params = swimLoadedParams || getSwimParams();
-    const detailUrl = `${SWIM_API_BASE}/loci/${encodeURIComponent(item.LocusId)}?source=${encodeURIComponent(params.source)}`;
-    const statsUrl = `${SWIM_API_BASE}/sample_outlier_stats?sample_id=${encodeURIComponent(item.sample_id)}&locus_id=${encodeURIComponent(item.LocusId)}&outlier_type=${encodeURIComponent(params.outlier_type)}&source=${encodeURIComponent(params.source)}`;
+    const detailUrl = `${SWIM_API_BASE}/loci/${encodeURIComponent(item.LocusId)}`;
+    const statsUrl = `${SWIM_API_BASE}/sample_outlier_stats?sample_id=${encodeURIComponent(item.sample_id)}&locus_id=${encodeURIComponent(item.LocusId)}&outlier_type=${encodeURIComponent(params.outlier_type)}`;
 
     const detailPromise = fetch(detailUrl).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
     const statsPromise = fetch(statsUrl).then(r => r.ok ? r.json() : null).catch(() => null);
@@ -776,11 +775,10 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
     const annotations = locusDetail.annotations;
     const outlierSamples = locusDetail.outlier_samples;
 
-    // Derive source / outlier_type from the params the chart was loaded with (passed in by
-    // showDotDetail), NOT the live radios: the user may have changed the outlier-type radio
-    // without reloading, which would otherwise render Mendelian warnings and phenotype-similarity
-    // scores for a different outlier type than the plotted dot belongs to.
-    const swimSource = (params && params.source) || SWIM_DEFAULT_SOURCE;
+    // Derive outlier_type from the params the chart was loaded with (passed in by showDotDetail),
+    // NOT the live radios: the user may have changed the outlier-type radio without reloading,
+    // which would otherwise render phenotype-similarity scores for a different outlier type than
+    // the plotted dot belongs to.
     const swimOutlierType = (params && params.outlier_type) || 'all';
 
     // Build UCSC link, the same URL as the main table's (buildUcscUrl in header_template.html)
@@ -808,7 +806,7 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
     // Section 2: Sample (from sampleItem)
     html += '<div class="detail-section-header">Sample</div>';
     html += '<table class="detail-table">';
-    html += '<tr><td>Sample ID</td><td>' + renderMendelianWarning(sampleItem.sample_id, swimSource) + escapeHtml(sampleItem.sample_id || '') + '</td></tr>';
+    html += '<tr><td>Sample ID</td><td>' + renderMendelianWarning(sampleItem.sample_id) + escapeHtml(sampleItem.sample_id || '') + '</td></tr>';
     html += '<tr><td>Family ID</td><td>' + escapeHtml(sampleItem.family_id || '') + '</td></tr>';
     html += '<tr><td>Affected Status</td><td>' + escapeHtml(sampleItem.affected_status || '') + '</td></tr>';
     html += '<tr><td>Analysis Status</td><td>' + escapeHtml(sampleItem.analysis_status || '') + '</td></tr>';
@@ -1021,7 +1019,7 @@ function renderDotDetailContent(sampleItem, locusDetail, sampleStats, params) {
                     ? '<strong>' + escapeHtml(sample.sample_id || '') + '</strong>'
                     : escapeHtml(sample.sample_id || '');
                 html += '<tr' + rowStyle + '>';
-                html += '<td>' + renderMendelianWarning(sample.sample_id, swimSource) + sampleIdHtml + '</td>';
+                html += '<td>' + renderMendelianWarning(sample.sample_id) + sampleIdHtml + '</td>';
                 html += '<td>' + escapeHtml(String(sample.allele_size != null ? sample.allele_size : '')) + '</td>';
                 html += '<td>' + escapeHtml(sample.affected_status || '') + '</td>';
                 html += '<td>' + escapeHtml(sample.analysis_status || '') + '</td>';

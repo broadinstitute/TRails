@@ -53,13 +53,11 @@
 // =========================================================================
 
 const QC_API_BASE = window.location.origin + '/api/v1';
-const DEFAULT_SOURCE = {{ default_source | tojson }};
 
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
 const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
-// Per-source 99th-percentile outlier warnings; renderMendelianWarning() is passed the
-// page's source so it only shows outlier warnings for the source being viewed.
-const OUTLIER_WARNINGS_BY_SOURCE = {{ outlier_warnings_by_source | tojson }};
+// 99th-percentile outlier warnings, keyed by sample_id
+const OUTLIER_WARNINGS = {{ outlier_warnings | tojson }};
 
 
 // Category order for bins. UNKNOWN_MOTIF_BIN is the bin results_server.compute_sample_qc_data
@@ -112,7 +110,7 @@ function createChartsForSection(containerId, data) {
             .slice(0, 20);
         const canvasId = appendQCBinCard(container, idx, bin, 'Top 20 samples',
             '<tr><th>Sample ID</th><th>Count</th></tr>',
-            top20.map(item => `<td title="${escapeHtml(item.sample_id)}">${renderMendelianWarning(item.sample_id, DEFAULT_SOURCE)}${escapeHtml(item.sample_id)}</td><td>${item.count}</td>`));
+            top20.map(item => `<td title="${escapeHtml(item.sample_id)}">${renderMendelianWarning(item.sample_id)}${escapeHtml(item.sample_id)}</td><td>${item.count}</td>`));
 
         // Create the chart after adding to DOM
         createSingleBinChart(canvasId, binData[bin]);
@@ -122,7 +120,7 @@ function createChartsForSection(containerId, data) {
 // Fetch data and render charts
 async function loadSampleQCData() {
     try {
-        const response = await fetch(`${QC_API_BASE}/sample_qc_data?source=${encodeURIComponent(DEFAULT_SOURCE)}`);
+        const response = await fetch(`${QC_API_BASE}/sample_qc_data`);
         if (!response.ok) {
             const errData = await response.json().catch(() => ({}));
             throw new Error(errData.detail || `HTTP ${response.status}`);

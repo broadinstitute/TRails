@@ -187,10 +187,10 @@ def fetch_reference_data(dest_dir=DEFAULT_REFERENCE_DIR, remote=False, force=Fal
             paths[name] = dest
         elif (not force and os.path.exists(dest) and os.path.getsize(dest) > 0
                 and cached_urls.get(name, source) == source):
-            # A cached file with no manifest entry predates version tracking. Accept it and record
-            # the current pin rather than re-downloading on every run: an install that has never
-            # written a manifest would otherwise never converge, and offline it would lose the
-            # reference entirely. A recorded entry that differs from the pin does re-download.
+            # A cached file is kept when its recorded source matches the current pin, or when no
+            # source is recorded for it, in which case the current pin is recorded for it now. Only
+            # a recorded source that differs from the pin triggers a re-download. Keeping a file
+            # with no record avoids a needless download and keeps the file usable offline.
             if name not in cached_urls:
                 cached_urls[name] = source
             print(f"  [skip] {name} already present")
