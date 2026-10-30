@@ -357,6 +357,21 @@ class ResultsServerTests(ServerTestCase):
         self.assertEqual(reloaded["notes"]["chr1-100-110-AT"]["note_text"], stored["note_text"])
         self.client.delete("/api/v1/annotations/chr1-100-110-AT/note")
 
+    def test_the_in_memory_annotations_change_under_the_write_lock(self):
+        # Otherwise two overlapping writes could commit in one order and update the in-memory copy
+        # in the other, leaving it out of step with the database.
+        lock_held_during_update = []
+
+        def update_cached_annotations(annotations):
+            lock_held_during_update.append(results_server.ANNOTATION_WRITE_LOCK.locked())
+            return {"updated": True}
+
+        self.assertEqual(
+            results_server.execute_annotation_write(
+                "DELETE FROM notes WHERE locus_id = ?", ("no-such-locus",), update_cached_annotations),
+            (None, {"updated": True}))
+        self.assertEqual(lock_held_during_update, [True])
+
     def test_a_failed_annotation_write_reports_the_error(self):
         # A write that cannot reach the database has to come back as a described error rather
         # than an uncaught exception, and must not leave the in-memory annotations claiming it
@@ -631,7 +646,6 @@ class SampleQcLocusCountTests(ServerTestCase):
 STRCHIVE_TEST_LOCI = [
     {
         "id": "TEST_PATHOGENIC",
-        "locus_id": "TEST_PATHOGENIC",
         "disease": "Test pathogenic-motif disease",
         # Every record in the shipped STRchive file stores inheritance as a list.
         "inheritance": ["AD"],
@@ -645,7 +659,6 @@ STRCHIVE_TEST_LOCI = [
     },
     {
         "id": "TEST_REFERENCE",
-        "locus_id": "TEST_REFERENCE",
         "disease": "Test reference-motif disease",
         # A bare string, the shape an older cached STRchive file may still use.
         "inheritance": "AR",
@@ -1453,6 +1466,24 @@ class FamilyCountTests(ServerTestCase):
         self.assertEqual([(r["LocusId"], r["NumAffectedUnsolvedFamiliesAboveUnaffected"]) for r in rows],
                          [("chr2-200-209-AAG", "2"), ("chr1-100-110-AT", "1")])
 
+    def test_a_filter_on_a_column_the_database_lacks_matches_nothing_instead_of_failing(self):
+        # This database has only the AllAlleles outlier columns, and no NumRepeatsInReference,
+        # gene_region or population columns
+        for query, expected_total in (
+                ("outlier_type=all&min_expansion=1", 0),
+                ("outlier_type=all&gene_regions=cds", 0),
+                ("outlier_type=all&require_above_population=all&include_loci_without_population_data=true", 2),
+                # An exclusion has nothing to exclude without the column
+                ("outlier_type=all&exclude_gene_regions=cds", 2),
+                ("outlier_type=short&min_expansion=1", 0),
+                ("outlier_type=short&sample_id_keyword=sampleA", 0),
+                ("outlier_type=short&sample_id_like=sample", 0),
+                ("outlier_type=short&apply_pathogenic_threshold=true", 0),
+                ("outlier_type=short&require_above_population=all&include_loci_without_population_data=true", 0)):
+            response = self.client.get(f"/api/v1/loci?{query}")
+            self.assertEqual(response.status_code, 200, (query, response.get_data(as_text=True)))
+            self.assertEqual(response.get_json()["total"], expected_total, query)
+
 
 def _load_results_server_without_locus_annotations():
     """Import a second copy of results_server.py with locus_annotations unimportable.
@@ -1491,10 +1522,10 @@ class DegradedModeFallbackTests(unittest.TestCase):
     def test_the_fallback_really_is_a_stub(self):
         # If this fails the import did not raise and the assertions below would be testing the
         # real locus_annotations functions rather than the fallbacks.
-        self.assertEqual(self.degraded.load_known_disease_loci("ignored"), ({}, {}, {}))
+        self.assertEqual(self.degraded.load_known_disease_loci("ignored"), ({}, {}))
 
     def test_a_locus_matches_no_known_disease_locus(self):
-        lookups = {"locus": {}, "disease_trees": {}, "strchive_trees": {}}
+        lookups = {"disease_trees": {}, "strchive_trees": {}}
         row = {"LocusId": "chr1-100-110-AT", "Chrom": "chr1", "Start0Based": 100, "End1Based": 110, "Motif": "AT"}
         self.assertIsNone(self.degraded.compute_known_disease_info(row, lookups))
         self.assertIsNone(self.degraded.known_disease_pathogenic_min("chr1", 100, 110, "AT", {}, {}))
@@ -1613,6 +1644,16 @@ class RequestCheckTests(MinimalDatabaseTestCase):
         with mock.patch.object(results_server.socket, "gethostname", return_value="labhost.local"), \
                 mock.patch.object(results_server.socket, "getfqdn", return_value="labhost.local"):
             self.assertEqual(results_server.find_this_machines_host_names(), {"labhost.local"})
+
+    def test_a_named_input_file_that_does_not_exist_stops_the_server(self):
+        existing_path = os.path.join(self.tmpdir, "results.duckdb")
+        results_server.exit_if_a_supplied_input_file_is_missing(
+            {"--sample-table": None, "--known-loci-json": existing_path, "--strchive-loci-json": None})
+        with mock.patch("builtins.print") as printed, self.assertRaises(SystemExit) as raised:
+            results_server.exit_if_a_supplied_input_file_is_missing(
+                {"--sample-table": os.path.join(self.tmpdir, "no_such_samples.tsv"), "--known-loci-json": None})
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("--sample-table file not found", printed.call_args.args[0])
 
     def test_filters_applied_is_the_same_in_the_list_and_the_json_export(self):
         query = ("outlier_type=all&min_pli=0.5&motif_size=2&search=GENE1&reference_region=chr1:100-110"
@@ -1835,6 +1876,39 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
         self._swim_rows("")
         self.assertFalse([sql for sql in recorded_queries if "FROM loci" in sql])
 
+    def test_min_delta_population_compares_the_gate_cohorts_as_the_results_table_does(self):
+        # A: allele 20, long-read 99th percentiles 10, TenK10K 30. Its Δpop is 10 against the
+        # long-read cohorts but -10 against every cohort, so min Δpop 5 keeps it only when the
+        # cohorts are the long-read gate's. B: allele 20 with every percentile at 10.
+        db_path = os.path.join(self.tmpdir, "population.duckdb")
+        conn = duckdb_compat.connect(db_path)
+        conn.execute("""CREATE TABLE loci (
+            LocusId TEXT, Chrom TEXT, Start0Based INTEGER, End1Based INTEGER, Motif TEXT, MotifSize INTEGER,
+            OutlierSampleIds_AllAlleles TEXT, FirstAffectedAlleleSize_AllAlleles INTEGER,
+            HPRC256_99thPercentile DOUBLE, AoU1027_99thPercentile DOUBLE, TenK10K_99thPercentile DOUBLE)""")
+        population_percentiles = {"A": (10, 10, 30), "B": (10, 10, 10)}
+        conn.executemany("INSERT INTO loci VALUES (?, 'chr1', ?, ?, 'AT', 2, ?, 20, ?, ?, ?)", [
+            (locus_id, index * 100, index * 100 + 10, f"20x:sample{locus_id}", *percentiles)
+            for index, (locus_id, percentiles) in enumerate(population_percentiles.items())])
+        result_database.write_swim_plot(
+            conn,
+            [make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="2bp", allele_size=20,
+                                sample_id=f"sample{locus_id}", LocusId=locus_id, Motif="AT", MotifSize=2,
+                                HPRC256_99thPercentile=hprc, AoU1027_99thPercentile=aou,
+                                TenK10K_99thPercentile=tenk10k)
+             for locus_id, (hprc, aou, tenk10k) in population_percentiles.items()],
+            columns=swim_plot.SWIM_PLOT_COLUMNS,
+        )
+        conn.commit()
+        conn.close()
+        self.configure_server(db_path)
+        self.addCleanup(self.configure_server, self.db_path)
+
+        for gate, expected_loci in (("long-read", {"A", "B"}), ("all", {"B"})):
+            query = f"require_above_population={gate}&min_repeats_above_population=5"
+            self.assertEqual(self._loci(query), expected_loci, query)
+            self.assertEqual({locus_id for locus_id, _ in self._swim_rows(query)}, expected_loci, query)
+
 
 def _build_db_with_population_percentiles(path, population_gate_cohorts):
     """One locus whose only outlier, an affected 20, is above HPRC256 and AoU1027 but not TenK10K.
@@ -1962,11 +2036,11 @@ class KnownDiseaseMatchTests(ServerTestCase):
         strchive_path = os.path.join(cls.tmpdir, "STRchive-loci.json")
         with open(strchive_path, "w") as output_file:
             json.dump(STRCHIVE_TEST_LOCI, output_file)
-        cls.disease_trees, cls.strchive_trees, cls.locus_lookup = locus_annotations.load_known_disease_loci(
-            catalog_path, strchive_filepath=strchive_path, build_locus_lookup=True)
+        cls.disease_trees, cls.strchive_trees = locus_annotations.load_known_disease_loci(
+            catalog_path, strchive_filepath=strchive_path)
 
     def _detail(self, chrom, start, end, motif):
-        lookups = {"locus": {}, "disease_trees": self.disease_trees, "strchive_trees": self.strchive_trees}
+        lookups = {"disease_trees": self.disease_trees, "strchive_trees": self.strchive_trees}
         return results_server.compute_known_disease_info(
             {"LocusId": "query", "Chrom": chrom, "Start0Based": start, "End1Based": end, "Motif": motif}, lookups)
 
@@ -2004,7 +2078,7 @@ class KnownDiseaseMatchTests(ServerTestCase):
             "LocusId": "DISEASE_AT",
             "Diseases": [{"Name": "DiseaseX"}],
         })
-        lookups = {"locus": {}, "disease_trees": {"1": tree}, "strchive_trees": {}}
+        lookups = {"disease_trees": {"1": tree}, "strchive_trees": {}}
         result = results_server.compute_known_disease_info(
             {"LocusId": "q", "Chrom": "chr1", "Start0Based": 100, "End1Based": 110, "Motif": "AT"}, lookups)
         self.assertEqual(result["locus_id"], "DISEASE_AT")

@@ -13,7 +13,16 @@
         integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4" crossorigin="anonymous"></script>
 
 <script>
-// Used by index_page_template.html and swim_plot_template.html, which both include this header.
+// Every page includes this header. API_BASE_URL is used by all of them; the rest is used by
+// index_page_template.html and swim_plot_template.html.
+
+// The results server's API
+const API_BASE_URL = window.location.origin + '/api/v1';
+
+// URL of a locus's full detail
+function buildLocusDetailUrl(locusId) {
+    return `${API_BASE_URL}/loci/${encodeURIComponent(locusId)}`;
+}
 
 // TRExplorer columns the locus links open with (TRExplorer's showColumns URL parameter)
 const TREXPLORER_LINK_COLUMNS = [
@@ -52,6 +61,10 @@ const POPULATION_COHORTS = ['HPRC256', 'AoU1027', 'TenK10K'];
 // (OutlierSampleIds_AllAlleles, ...): results_server.py's OUTLIER_TYPE_MAP
 const OUTLIER_TYPE_MAP = {all: 'AllAlleles', short: 'ShortAlleles', hemi: 'HemizygousAlleles'};
 
+// The gene_regions / exclude_gene_regions filter values, one include and one exclude checkbox
+// each on both pages: results_server.py's GENE_REGION_MAP keys
+const GENE_REGIONS = ['cds', 'promoter', 'utr', 'intron', 'exon', 'intergenic'];
+
 // Make each gene region's include and exclude checkboxes mutually exclusive: checking one
 // unchecks the other. namePrefix is what the page puts before the checkbox names
 // ('<namePrefix>gene_region_cds', '<namePrefix>exclude_gene_region_cds', ...).
@@ -87,8 +100,8 @@ function fillSampleIdDropdown($dropdown, schema) {
     setupDropdownMenu($dropdown, (schema.sample_ids || []).map(id => ({ name: id, value: id })));
 }
 
-// Annotation writes (a locus's note and tags)
-const ANNOTATIONS_API_URL = window.location.origin + '/api/v1/annotations';
+// A locus's note and tags
+const ANNOTATIONS_API_URL = `${API_BASE_URL}/annotations`;
 
 // The annotation write routes explain every failure in the response body: a "detail" field for
 // the read-only-server 403 (the results_server.restrict_writes before_request hook) and an "error" field for the
@@ -620,6 +633,9 @@ body {
 }
 #results-table .sample-subtable tr { border-bottom: 1px solid #f0f0f0; }
 #results-table .sample-subtable td { padding: 2px 6px; white-space: nowrap; }
+/* The detail panel's phenotype-scores table is nested the same way, so its header would also stick
+   and draw over the main header; the transparent background lets its header row's green show */
+#results-table .phenotype-scores-table thead th { position: static; background: transparent; }
 
 /* Row coloring by affected/analysis status */
 .sample-affected-unsolved { color: #c62828; font-weight: 600; }

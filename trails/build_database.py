@@ -16,11 +16,12 @@ fully-tested unit):
   3. ``input_tables.read_phenotypes``            -> participant -> HPO terms (optional)
   4. ``input_tables.read_gene_table`` + ``read_gene_disease_phenotypes`` (optional)
   5. ``allele_histograms.build_histograms_and_outliers`` -> per-locus records
-  6. ``locus_annotations.add_derived_locus_columns``     -> coordinate / motif columns, then
+  6. ``locus_annotations.add_derived_locus_columns``     -> coordinate / motif columns,
+     including ``CanonicalMotif``, then
      ``trexplorer_annotations.add_trexplorer_annotations`` -> population statistics, gene
      region, variation cluster (for columns the matrix left empty), then
      ``locus_annotations.add_population_stdev_percentile_columns``
-  7. known-disease-locus match + ``CanonicalMotif`` + ``IsKnownMotif`` + ``IsInMendelianGene``
+  7. known-disease-locus match + ``IsKnownMotif`` + ``IsInMendelianGene``
   8. ``analysis_columns.add_gene_columns``               -> pLI / inheritance
   9. ``analysis_columns.add_all_outlier_columns``        -> the affected/unaffected analysis
      + the affected_unsolved_outliers_above_unaffected rows
@@ -175,12 +176,18 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
         print(f"  {num_matched_by_locus_id:,} loci matched a TRExplorer locus by id, "
               f"{num_matched_by_overlap:,} by overlap, and "
               f"{len(records) - num_matched_by_locus_id - num_matched_by_overlap:,} matched none")
+    else:
+        print(f"  WARNING: no TRExplorer annotations database was supplied, so the loci get no "
+              f"population statistics from TRExplorer. Unless the repeat-copy-numbers TSV has its own "
+              f"{' / '.join(f'{cohort}_99thPercentile' for cohort in population_gate_cohorts)} "
+              f"columns, the #Aff / #Fam counts (NumAffectedUnsolved*) and the phenotype scores "
+              f"will not be population-gated.")
     locus_annotations.add_population_stdev_percentile_columns(records)
 
     # Stage 7: known-disease-locus match + IsKnownMotif + IsInMendelianGene.
     print("Annotating known-disease loci and known motifs ...")
     if known_loci_json or strchive_loci_json:
-        interval_trees, strchive_trees, _locus_lookup = locus_annotations.load_known_disease_loci(
+        interval_trees, strchive_trees = locus_annotations.load_known_disease_loci(
             known_loci_json, strchive_filepath=strchive_loci_json)
         known_canonical_motifs = locus_annotations.collect_known_disease_canonical_motifs(
             interval_trees, strchive_trees)

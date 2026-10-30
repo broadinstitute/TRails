@@ -6,6 +6,8 @@ asserts the resulting database has the expected tables, row counts, column order
 and populated outlier columns — and that a re-run is idempotent.
 """
 
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -201,6 +203,15 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_a_build_without_trexplorer_annotations_warns_that_the_population_gate_is_off(self):
+        # Without TRExplorer's 99th percentiles (and none in the matrix), no locus is gated, so
+        # the #Aff / #Fam counts and phenotype scores come out larger rather than empty.
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            build_database.build(self.matrix_path, self.metadata_path, self.db_path)
+        self.assertIn("WARNING: no TRExplorer annotations database was supplied", output.getvalue())
+        self.assertIn("HPRC256_99thPercentile / AoU1027_99thPercentile", output.getvalue())
+
 
 def read_counts_implied_by_affected_unsolved_outliers_table(connection):
     """Recounts NumAffectedUnsolved{Samples,Families}AboveUnaffected from the outlier table.
@@ -346,7 +357,7 @@ class StrchiveOnlyCatalogTests(unittest.TestCase):
                    [["S1", "male", "affected"], ["S2", "female", "unaffected"]])
         with open(self.strchive_path, "w") as handle:
             handle.write(
-                '[{"locus_id": "STR_A", "disease": "DiseaseA", "chrom": "chr2", '
+                '[{"id": "STR_A", "disease": "DiseaseA", "chrom": "chr2", '
                 '"start_hg38": 500, "stop_hg38": 530, '
                 '"reference_motif_reference_orientation": ["CAG"]}]')
 

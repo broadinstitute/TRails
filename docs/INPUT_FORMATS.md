@@ -2,7 +2,8 @@
 
 This documents every input TRails reads, how to produce the ones you must supply, and which
 inputs TRails downloads for you vs. which are your own data. **Only a few columns are required,
-and a missing optional column never stops the run.** Most missing columns just turn off the
+and a missing optional column never stops the run** (an unrecognized value in a status or `sex`
+column does; see section 2). Most missing columns just turn off the
 feature that depends on them. The exception is a sample's `affected_status` and
 `analysis_status`: a sample not marked unaffected or solved is still a candidate, so with these
 columns missing every sample counts as affected and unsolved (see section 2). Column-name
@@ -19,8 +20,12 @@ still join exactly.
 | **C** | Your own cohort data | repeat-copy-numbers TSV; sample-metadata & phenotype TSVs; the generated result DB | NEVER bundled; you supply these |
 
 Your class C tables plus the class A downloads are everything TRails needs. A class A download
-that fails (e.g. offline) only leaves the columns that depend on it empty; the build still runs.
-All coordinates are GRCh38 (hg38).
+that fails (e.g. offline) does not stop the build, and it leaves the columns that depend on it
+empty, with one exception: without TRExplorer's data no locus has the population 99th
+percentiles that gate the `NumAffectedUnsolved*` (#Aff / #Fam) counts, the
+`affected_unsolved_outliers_above_unaffected` table and the phenotype scores (unless your matrix
+supplies them; see "Population gate" below). Those are then computed without the population gate
+and can hold larger values, and the build prints a warning. All coordinates are GRCh38 (hg38).
 
 ---
 
@@ -138,13 +143,19 @@ PMGRC-1-2-1    Unaffected        Unaffected        FAM1                         
 |--------|-----------|------------------|
 | `sample_id` | **required** | joins to the sample columns of the repeat-copy-numbers TSV; may not contain `:` or `,` (both are delimiters in the packed `OutlierSampleIds_*` strings, so either one aborts the build with a `ValueError`) |
 | `affected_status` | optional | affected-vs-unaffected comparison + affected-unsolved prioritization. `Affected` / `Possibly Affected` (treated as `Affected`) / `Unaffected` / `Unknown`. A blank, absent or `Unknown` value counts as affected (see below) |
-| `analysis_status` | optional | solved/unsolved filtering + counts. `Solved` / `Unsolved` / `Unknown` / `Probably Solved` / `Partially Solved`. A blank, absent or `Unknown` value counts as unsolved (see below) |
+| `analysis_status` | optional | solved/unsolved filtering + counts. `Solved` / `Unsolved` / `Unknown` / `Unaffected` / `Probably Solved` / `Partially Solved`, and the codes `rncc` and `rcpc` (read as `Unsolved`) and `s_kgfp` (read as `Solved`). A blank, absent or `Unknown` value counts as unsolved (see below) |
 | `family_id` | optional | distinct-family outlier counts |
 | `maternal_id`, `paternal_id` | optional | Mendelian-violation QC (requires trios) |
 | `sex` | optional | displayed only: shown in the sample tables (in the swim plot's outlier table only for chrX/chrY loci). No filter or calculation reads it; hemizygosity comes from the genotype having a single allele. `Male` / `Female` / `Unknown` |
 | `phenotype_description` | optional | free-text shown in the UI |
 
-Any additional columns are accepted and ignored. (Status values are case-insensitive.)
+Any additional columns are accepted and ignored. The `affected_status`, `analysis_status` and
+`sex` values are case-insensitive, surrounding spaces are ignored, and a blank cell (or `.`, `NA`,
+`N/A`, `null`, `none`, `nan`) means no value. Any other value in those three columns that is not
+listed above stops the build with a `ValueError` naming the column, the value and the sample (up
+to 20 per column), so recode e.g. `M` / `F` to `Male` / `Female` first. The allowed sets are
+`ALLOWED_AFFECTED_STATUS`, `ALLOWED_ANALYSIS_STATUS`, `ALLOWED_SEX` and `ANALYSIS_STATUS_REMAP`
+in `trails/input_tables.py`.
 
 A sample counts as an affected, unsolved candidate (in the `NumAffectedUnsolved*` counts, the
 `First/Second/ThirdAffected*` columns and the phenotype scores) unless its `affected_status` is
@@ -193,10 +204,14 @@ documented here only as the internal data model, for contributors. Each record c
 | `NumRepeatsInReference` | reference allele size in repeat units; your matrix's value when it has one, otherwise computed |
 | `gene_id`, `gene_region` | your matrix's `gene_id` / `gene_region`, or its `GencodeGeneId` / `GencodeGeneRegion` aliases when those are absent; otherwise TRExplorer's Gencode gene id and region; NULL when neither has one |
 
-**Other annotation keys** (when absent, the matching output column is NULL): the `TRExplorer*`
-fields of the matched TRExplorer locus, RepeatMasker intervals, the variation cluster fields, and
-per-cohort population-stat columns (`HPRC256_*`, `AoU1027_*`, `TenK10K_*`). These come from
-TRExplorer's catalog, or from annotation columns of your matrix.
+**Other annotation keys**: the `TRExplorer*` fields of the matched TRExplorer locus, RepeatMasker
+intervals, the variation cluster fields, and per-cohort population-stat columns (`HPRC256_*`,
+`AoU1027_*`, `TenK10K_*`). These come from TRExplorer's catalog, or from annotation columns of
+your matrix. A record without one of these keys gets NULL in that column, as long as at least one
+other record has the key. A key that no record has is left out of the `loci` table altogether,
+so a query that names it fails instead of returning NULL. That happens, for example, to every
+`TRExplorer*` and population column when no TRExplorer database was used and the matrix supplies
+none. A build with no loci at all writes the full output schema instead.
 
 ### 5. Generated result database  *(server input; built for you)*
 

@@ -80,15 +80,17 @@ def _has_module(name):
         return False
 
 
-def virtual_environment_python_works():
-    """Return True if TRails' virtual environment exists and its Python starts.
+def virtual_environment_python_and_pip_work():
+    """Return True if TRails' virtual environment exists and its Python starts and can import pip.
 
     A virtual environment keeps pointing at the Python it was made from, so it stops working
-    when that Python is removed (e.g. by a Homebrew upgrade); such an environment is recreated.
+    when that Python is removed (e.g. by a Homebrew upgrade). One whose creation stopped part way
+    has a Python but no pip: on Debian or Ubuntu without the python3-venv package, `venv` creates
+    the interpreter and then fails to install pip. Either kind is recreated.
     """
     if not os.path.exists(VIRTUAL_ENVIRONMENT_PYTHON):
         return False
-    return subprocess.run([VIRTUAL_ENVIRONMENT_PYTHON, "-c", "import sys"],
+    return subprocess.run([VIRTUAL_ENVIRONMENT_PYTHON, "-c", "import pip"],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
@@ -99,7 +101,7 @@ def ensure_running_in_trails_virtual_environment():
     """
     if os.path.realpath(sys.prefix) == os.path.realpath(VIRTUAL_ENVIRONMENT_DIRECTORY):
         return
-    if not virtual_environment_python_works():
+    if not virtual_environment_python_and_pip_work():
         print(f"Creating a Python virtual environment in {VIRTUAL_ENVIRONMENT_DIRECTORY} ...")
         if subprocess.run([sys.executable, "-m", "venv", "--clear", VIRTUAL_ENVIRONMENT_DIRECTORY]).returncode != 0:
             sys.exit("ERROR: could not create a Python virtual environment. On Debian or Ubuntu, "
@@ -369,9 +371,9 @@ def main():
     ensure_dependencies()
     print(f"TRails reference-data setup -> {args.reference_data_dir}")
     reference = trails_setup.fetch_reference_data(args.reference_data_dir)
-    genes_to_phenotype = args.genes_to_phenotype or reference.get("genes_to_phenotype.txt")
-    known_loci_json = args.known_loci_json or reference.get("variant_catalog_without_offtargets.GRCh38.json")
-    strchive_loci_json = args.strchive_loci_json or reference.get("STRchive-loci.json")
+    genes_to_phenotype = args.genes_to_phenotype or reference.get(trails_setup.HPO_GENES_TO_PHENOTYPE_NAME)
+    known_loci_json = args.known_loci_json or reference.get(trails_setup.STR_ANALYSIS_KNOWN_LOCI_CATALOG_NAME)
+    strchive_loci_json = args.strchive_loci_json or reference.get(trails_setup.STRCHIVE_LOCI_NAME)
     gene_table = args.gene_table or reference.get(trails_setup.GENELOOKUP_GENE_TABLE_NAME)
     trexplorer_annotations_database = reference.get(trails_setup.TREXPLORER_ANNOTATIONS_DATABASE_NAME)
 

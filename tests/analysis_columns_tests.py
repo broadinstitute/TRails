@@ -18,6 +18,7 @@ from analysis_columns import (
     is_missing_outlier_value,
     is_unaffected_or_solved_status,
     list_affected_unsolved_outliers,
+    normalize_affected_status_for_logic,
     parse_outlier_entries,
     parse_population_gate_cohorts,
 )
@@ -38,7 +39,7 @@ class ParseOutlierEntriesTests(unittest.TestCase):
         self.assertTrue(all(isinstance(allele, int) for allele, _ in entries))
 
     def test_missing_values(self):
-        for missing in ["", ".", "NA", "N/A", "nan", "NaN", "None", "null", None, float("nan")]:
+        for missing in ["", ".", "NA", "N/A", "nan", "NaN", "None", "null", "NULL", None, float("nan")]:
             self.assertTrue(is_missing_outlier_value(missing), missing)
             self.assertEqual(parse_outlier_entries(missing), [])
 
@@ -82,11 +83,27 @@ class StatusTruthTableTests(unittest.TestCase):
 class BlankMetadataValueTests(unittest.TestCase):
 
     def test_blank_to_none(self):
-        for blank in (None, float("nan"), "", "   ", "NA", " na ", "N/A", "nan", "None", "NULL"):
+        for blank in (None, float("nan"), "", "   ", ".", " . ", "NA", " na ", "N/A", "nan", "None", "NULL"):
             self.assertIsNone(blank_to_none(blank), repr(blank))
         self.assertEqual(blank_to_none("F1"), "F1")
         self.assertEqual(blank_to_none(" F1 "), " F1 ")
         self.assertEqual(blank_to_none("NAFAM"), "NAFAM")
+        self.assertEqual(blank_to_none(".."), "..")
+
+    def test_normalize_affected_status_for_logic(self):
+        for blank in (None, float("nan"), "", ".", "NA", "null"):
+            self.assertIsNone(normalize_affected_status_for_logic(blank), repr(blank))
+        self.assertEqual(normalize_affected_status_for_logic(" Possibly Affected "), "affected")
+        self.assertEqual(normalize_affected_status_for_logic("Affected"), "affected")
+        self.assertEqual(normalize_affected_status_for_logic("UNAFFECTED"), "unaffected")
+        self.assertEqual(normalize_affected_status_for_logic("Unknown"), "unknown")
+
+    def test_one_list_of_missing_spellings(self):
+        # Sample metadata, OutlierSampleIds_* fields and matrix annotation cells share one list.
+        for spelling in analysis_columns.MISSING_VALUE_SPELLINGS:
+            for value in (spelling, spelling.upper(), f" {spelling} "):
+                self.assertIsNone(blank_to_none(value), repr(value))
+                self.assertTrue(is_missing_outlier_value(value), repr(value))
 
     def test_get_family_id(self):
         sample_lookup = {"a": {"family_id": "F1"}, "b": {"family_id": ""},

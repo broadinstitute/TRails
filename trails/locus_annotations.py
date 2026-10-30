@@ -4,11 +4,11 @@ This module owns the two annotation stages that decorate each per-locus record
 after the allele histograms have been built:
 
   * Stage 6 -- derived coordinate / motif columns parsed straight out of the
-    ``LocusId`` (``add_derived_locus_columns``), plus the gene-region rank
-    lookup.
+    ``LocusId`` (``add_derived_locus_columns``), including the canonical-motif
+    column, plus the gene-region rank lookup.
   * Stage 7 -- known-disease-locus matching against a cached class-A variant
-    catalog (and, optionally, a cached STRchive locus set), the canonical-motif
-    column, and the ``IsKnownMotif`` / ``IsInMendelianGene`` flags.
+    catalog (and, optionally, a cached STRchive locus set), and the
+    ``IsKnownMotif`` / ``IsInMendelianGene`` flags.
 
 Design choices:
   * Motif primitives come from ``motif_utilities``.
@@ -28,12 +28,8 @@ import re
 import intervaltree
 
 # Result of load_known_disease_loci. interval_trees / strchive_trees are
-# chrom -> IntervalTree (disease loci, payload in .data). locus_lookup maps a
-# disease locus's LocusId and a "chrom-start0-end1-RepeatUnit" coordinate key to
-# its catalog dict; it is built only when build_locus_lookup=True (the serving
-# path needs it for the locus-detail page; the build path leaves it empty).
-KnownDiseaseLoci = collections.namedtuple(
-    "KnownDiseaseLoci", ["interval_trees", "strchive_trees", "locus_lookup"])
+# chrom -> IntervalTree (disease loci, payload in .data).
+KnownDiseaseLoci = collections.namedtuple("KnownDiseaseLoci", ["interval_trees", "strchive_trees"])
 
 from analysis_columns import blank_to_none
 from motif_utilities import COMPLEMENT, compute_canonical_motif
@@ -147,27 +143,7 @@ def _build_strchive_trees(loci):
     return dict(interval_trees)
 
 
-def normalize_affected_status_for_logic(value):
-    """Normalize an affected-status cell so comparisons don't depend on its spelling.
-
-    Both the build (input_tables.read_sample_metadata) and the server compare affected statuses,
-    and they must agree on what "Possibly Affected" means, so this is the one definition.
-
-    Args:
-        value: An affected-status cell, which may be None, NaN or any of the blank spellings in
-            analysis_columns.BLANK_STATUS_VALUES.
-
-    Returns:
-        None for a blank value (``blank_to_none``), "affected" for "possibly affected", and the
-        lower-cased stripped value otherwise.
-    """
-    if blank_to_none(value) is None:
-        return None
-    normalized = str(value).strip().lower()
-    return "affected" if normalized == "possibly affected" else normalized
-
-
-def load_known_disease_loci(filepath=None, strchive_filepath=None, build_locus_lookup=False):
+def load_known_disease_loci(filepath=None, strchive_filepath=None):
     """Load known disease loci into chrom -> IntervalTree(s) for matching.
 
     Reads the cached class-A variant catalog JSON (e.g.
@@ -187,17 +163,11 @@ def load_known_disease_loci(filepath=None, strchive_filepath=None, build_locus_l
             the STRchive fallback (``interval_trees`` is then empty).
         strchive_filepath: Optional path to a cached STRchive-loci.json file. If
             given, STRchive trees are built from it.
-        build_locus_lookup: When True, also build ``locus_lookup`` (keyed by each
-            locus's ``LocusId`` and by a ``"chrom-start0-end1-RepeatUnit"``
-            coordinate key) for the serving path's locus-detail lookups. The
-            build pipeline does not need it and leaves it ``{}`` (default).
 
     Returns:
-        A ``KnownDiseaseLoci`` namedtuple ``(interval_trees, strchive_trees,
-        locus_lookup)``. ``interval_trees`` and ``strchive_trees`` map a
+        A ``KnownDiseaseLoci`` namedtuple ``(interval_trees, strchive_trees)``. Both map a
         chromosome (without ``chr`` prefix) to an ``intervaltree.IntervalTree``;
-        ``strchive_trees`` is ``{}`` when no STRchive source was provided and
-        ``locus_lookup`` is ``{}`` unless ``build_locus_lookup`` was True.
+        ``strchive_trees`` is ``{}`` when no STRchive source was provided.
     """
     loci = []
     if filepath is not None:
@@ -205,11 +175,8 @@ def load_known_disease_loci(filepath=None, strchive_filepath=None, build_locus_l
             loci = json.load(input_file)
 
     interval_trees = collections.defaultdict(intervaltree.IntervalTree)
-    locus_lookup = {}
     count = 0
     for locus_data in loci:
-        if build_locus_lookup and "LocusId" in locus_data:
-            locus_lookup[locus_data["LocusId"]] = locus_data
         if not any(disease.get("Name") for disease in locus_data.get("Diseases", [])):
             continue
         reference_region = locus_data.get("MainReferenceRegion", "")
@@ -221,8 +188,6 @@ def load_known_disease_loci(filepath=None, strchive_filepath=None, build_locus_l
         start_0based = int(start_str)
         end_1based = int(end_str)
         interval_trees[chrom].addi(start_0based, end_1based, data=locus_data)
-        if build_locus_lookup:
-            locus_lookup[f"{chrom}-{start_0based}-{end_1based}-{locus_data.get('RepeatUnit', '')}"] = locus_data
         count += 1
 
     print(f"Loaded {count:,d} variant catalog disease loci")
@@ -232,7 +197,7 @@ def load_known_disease_loci(filepath=None, strchive_filepath=None, build_locus_l
         with open(strchive_filepath, "rt") as input_file:
             strchive_trees = _build_strchive_trees(json.load(input_file))
 
-    return KnownDiseaseLoci(dict(interval_trees), strchive_trees, locus_lookup)
+    return KnownDiseaseLoci(dict(interval_trees), strchive_trees)
 
 
 def strchive_locus_motifs(locus_data):
@@ -324,7 +289,7 @@ def matches_disease_locus(locus_id, interval_trees, strchive_trees=None):
 
     Returns:
         The matching disease locus identifier (the catalog ``LocusId`` or, for
-        STRchive, its ``locus_id``/``id``), or None if nothing matches.
+        STRchive, its ``id``, e.g. ``"HD_HTT"``), or None if nothing matches.
     """
     chrom, start, end, motif = locus_id.split("-")
     locus_data, source = find_matching_disease_locus(
@@ -333,7 +298,7 @@ def matches_disease_locus(locus_id, interval_trees, strchive_trees=None):
         return None
     if source == "variant_catalog":
         return locus_data["LocusId"]
-    return locus_data.get("locus_id", locus_data.get("id"))
+    return locus_data.get("id")
 
 
 def collect_known_disease_canonical_motifs(interval_trees, strchive_trees=None):
@@ -469,7 +434,8 @@ def add_derived_locus_columns(locus_records, source_label="", repeat_copy_number
       * ``MotifSize`` -- length of ``Motif``.
       * ``NumRepeatsInReference`` -- ``(End1Based - Start0Based) // len(Motif)``,
         unless already present in the record.
-      * ``Source`` -- the supplied ``source_label`` (default ``""``).
+      * ``Source`` -- the matrix's ``Source`` value when present, otherwise
+        ``source_label`` (default ``""``).
       * ``CanonicalMotif`` -- canonical form of ``Motif`` (with reverse
         complement).
       * ``gene_id`` / ``gene_region`` -- pass-through from the record (also
@@ -486,8 +452,8 @@ def add_derived_locus_columns(locus_records, source_label="", repeat_copy_number
     Args:
         locus_records: A list of per-locus dicts, each with at least ``LocusId``
             and ``Motif`` keys. Mutated in place.
-        source_label: The value to store in the ``Source`` column. Defaults to
-            the empty string.
+        source_label: The ``Source`` value for a record the matrix gave no
+            ``Source``. Defaults to the empty string.
         repeat_copy_numbers_tsv: Path of the matrix the records came from, named
             in the error messages raised for a malformed ``LocusId`` or
             ``Motif``. None when the caller does not know it.

@@ -27,6 +27,7 @@ HPO term-id strings (as produced by ``input_tables.read_phenotypes``).
 from analysis_columns import (
     OUTLIER_TYPES,
     POPULATION_P99_GATE_COHORTS,
+    blank_to_none,
     find_affected_unsolved_samples_above_unaffected,
     parse_outlier_entries_by_type,
 )
@@ -215,10 +216,11 @@ def score_patient_vs_gene_filtered(patient_hpo_ids, gene_symbol, gene_disease_da
 
     Args:
         patient_hpo_ids: Iterable of the patient's HPO term ids.
-        gene_symbol: The gene symbol to score against; must be a key of
-            ``gene_disease_data``.
-        gene_disease_data: Mapping
-            ``{gene_symbol: {disease_id: {"phenotypes": set, "inheritance": set}}}``.
+        gene_symbol: The upper-cased gene symbol to score against; must be a key
+            of ``gene_disease_data``.
+        gene_disease_data: Mapping ``{upper_cased_gene_symbol: {disease_id:
+            {"phenotypes": set, "inheritance": set}}}`` (see
+            ``input_tables.read_gene_disease_phenotypes``).
         allowed_inheritance: Set of inheritance codes compatible with the outlier
             type (e.g. {"AD", "XD"}).
 
@@ -332,8 +334,10 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
             add the MaxGenePhenoSim_*/SumPairwiseSim_* columns.
         participant_to_hpo: Mapping of sample_id -> set of HPO term ids.
         gene_lookup: Mapping of gene_id -> dict carrying at least ``gene_symbol``.
-        gene_disease_data: Mapping
-            ``{gene_symbol: {disease_id: {"phenotypes": set, "inheritance": set}}}``.
+        gene_disease_data: Mapping ``{upper_cased_gene_symbol: {disease_id:
+            {"phenotypes": set, "inheritance": set}}}`` (see
+            ``input_tables.read_gene_disease_phenotypes``). A locus's gene symbol is
+            matched against it case-insensitively.
         affected_lookup: Mapping of sample_id -> affected_status.
         analysis_lookup: Mapping of sample_id -> analysis_status.
         population_gate_cohorts: The cohorts whose 99th percentiles a scored allele
@@ -357,6 +361,10 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
         gene_symbol = None
         if gene_id and gene_id in gene_lookup:
             gene_symbol = gene_lookup[gene_id].get("gene_symbol")
+        # gene_disease_data is keyed by upper-cased symbol, since the gene table and HPO can spell
+        # a symbol differently (C9ORF72 and C9orf72). A blank symbol (NaN from read_gene_table)
+        # matches nothing.
+        gene_disease_key = None if blank_to_none(gene_symbol) is None else str(gene_symbol).upper()
 
         # Set every aggregate to None up front (as analysis_columns.add_all_outlier_columns does
         # for its own columns), so an outlier type with no qualifying samples leaves the key
@@ -378,9 +386,9 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
             pairwise_shared_ic = []
 
             for index, (sample_id, allele_size, hpo_terms) in enumerate(qualifying):
-                if gene_symbol and gene_symbol in gene_disease_data:
+                if gene_disease_key in gene_disease_data:
                     score_result = score_patient_vs_gene_filtered(
-                        hpo_terms, gene_symbol, gene_disease_data,
+                        hpo_terms, gene_disease_key, gene_disease_data,
                         OUTLIER_TYPE_INHERITANCE[outlier_type],
                     )
                     gene_similarity = score_result["best_similarity"]

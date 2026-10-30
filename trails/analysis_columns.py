@@ -28,14 +28,14 @@ Two behaviors worth calling out, both load-bearing:
 # The three outlier types used throughout the analysis.
 OUTLIER_TYPES = ["AllAlleles", "ShortAlleles", "HemizygousAlleles"]
 
-# Outlier-field values that should be treated as "no outlier data".
-MISSING_OUTLIER_STRINGS = {"", "NA", "N/A", "nan", "NaN", "None", "null"}
-
-# Lower-cased, stripped cell values that mean "nothing was recorded" in a sample-metadata
-# column (family_id, sex, affected_status, analysis_status, maternal_id, ...). Defined here,
-# in a module with no third-party imports, so every module that reads sample metadata, and
-# the results server, can share it. Most code tests a value with blank_to_none instead.
-BLANK_STATUS_VALUES = {"", "nan", "none", "na", "n/a", "null"}
+# Lower-cased, stripped cell values that mean "nothing was recorded", the one list for every
+# input: a sample-metadata column (family_id, sex, affected_status, analysis_status,
+# maternal_id, ...), an annotation column of the matrix (input_tables._coerce_annotation_value)
+# and an OutlierSampleIds_* field. "." is TRails' own missing marker, as in the matrix's
+# no-call cells and the gene table. Defined here, in a module with no third-party imports, so
+# every module that reads these inputs can share it. Most code tests a value with blank_to_none
+# instead.
+MISSING_VALUE_SPELLINGS = {"", ".", "na", "n/a", "nan", "none", "null"}
 
 # The cohorts whose 99th percentiles gate the NumAffectedUnsolved* counts and the phenotype
 # scores by default (get_population_p99_threshold): the long-read
@@ -65,23 +65,44 @@ def blank_to_none(value):
     """Return None for a missing or blank value, else the value unchanged.
 
     read_sample_metadata reads with keep_default_na=False, so an empty metadata cell
-    arrives as '' and a cell written as NA, N/A, null, ... arrives as that string. This
-    maps None, a float NaN and every BLANK_STATUS_VALUES spelling to None, so every table
-    stores a blank metadata field as NULL, and samples whose family_id cells all say "NA"
-    are not counted as one family.
+    arrives as '' and a cell written as NA, N/A, null, "." ... arrives as that string.
+    This maps None, a float NaN and every MISSING_VALUE_SPELLINGS spelling to None, so every
+    table stores a blank metadata field as NULL, and samples whose family_id cells all
+    say "NA" are not counted as one family.
 
     Args:
         value: A metadata value (a string, None, or a float NaN).
 
     Returns:
         None for None, a float NaN, or a string whose stripped, lower-cased form is in
-        BLANK_STATUS_VALUES (which includes the empty string); otherwise value.
+        MISSING_VALUE_SPELLINGS (which includes the empty string); otherwise value.
     """
     if is_none_or_nan(value):
         return None
-    if isinstance(value, str) and value.strip().lower() in BLANK_STATUS_VALUES:
+    if isinstance(value, str) and value.strip().lower() in MISSING_VALUE_SPELLINGS:
         return None
     return value
+
+
+def normalize_affected_status_for_logic(value):
+    """Normalize an affected-status cell so comparisons don't depend on its spelling.
+
+    The build and the server both read the sample table through
+    input_tables.read_sample_metadata, which applies this, so they agree on what
+    "Possibly Affected" means.
+
+    Args:
+        value: An affected-status cell, which may be None, NaN or any of the blank
+            spellings in MISSING_VALUE_SPELLINGS.
+
+    Returns:
+        None for a blank value (``blank_to_none``), "affected" for "possibly affected",
+        and the lower-cased stripped value otherwise.
+    """
+    if blank_to_none(value) is None:
+        return None
+    normalized = str(value).strip().lower()
+    return "affected" if normalized == "possibly affected" else normalized
 
 
 def is_missing_outlier_value(value):
@@ -91,16 +112,10 @@ def is_missing_outlier_value(value):
         value: The raw outlier-column value (a string, None, or a float NaN).
 
     Returns:
-        True for None, a float NaN, or a string that (stripped) is one of the
-        recognized missing markers (``""``, ``"."``, ``"NA"``, ``"nan"``, ...).
+        True for None, a float NaN, or a string that is a MISSING_VALUE_SPELLINGS
+        spelling (``""``, ``"."``, ``"NA"``, ``"nan"``, ... in any case).
     """
-    if is_none_or_nan(value):
-        return True
-    if isinstance(value, str) and value.strip() in MISSING_OUTLIER_STRINGS:
-        return True
-    if isinstance(value, str) and value.strip() == ".":
-        return True
-    return False
+    return blank_to_none(value) is None
 
 
 def parse_outlier_entries(value, locus_id=None, column=None):
@@ -110,9 +125,12 @@ def parse_outlier_entries(value, locus_id=None, column=None):
     entries, the format ``allele_histograms.convert_sample_ids_to_string`` writes.
     The trailing ``x`` on the allele is stripped before the int conversion.
 
-    Entries are sorted DESCENDING by allele size, so downstream consumers that
-    rely on traversal order (First/Second/Third affected, the above-unaffected
-    counts, consecutive-id dedup) always see the largest alleles first.
+    Entries are sorted DESCENDING by allele size, so the consumers that rely on
+    that order see the largest alleles first: the First/Second/Third affected and
+    unaffected ranking (``collect_samples_single_pass``), the walk that stops at
+    the first unaffected or sub-threshold allele
+    (``find_affected_unsolved_samples_above_unaffected``), and keeping each sample
+    at its largest allele.
 
     Args:
         value: The outlier string, or a missing marker (see

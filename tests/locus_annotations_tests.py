@@ -283,10 +283,8 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
         os.remove(self.catalog_path)
 
     def test_only_named_disease_loci_with_regions_are_loaded(self):
-        interval_trees, strchive_trees, locus_lookup = locus_annotations.load_known_disease_loci(
-            self.catalog_path)
+        interval_trees, strchive_trees = locus_annotations.load_known_disease_loci(self.catalog_path)
         self.assertEqual(strchive_trees, {})
-        self.assertEqual(locus_lookup, {})  # not built unless build_locus_lookup=True
         self.assertIn("1", interval_trees)
         # MainReferenceRegion's start is already 0-based, so it is stored as it is.
         intervals = sorted(interval_trees["1"])
@@ -295,14 +293,6 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
         self.assertEqual(intervals[0].end, 1030)
         self.assertEqual(intervals[0].data["LocusId"], "DISEASE_A")
 
-    def test_build_locus_lookup_keys_by_locus_id_and_coordinate(self):
-        _trees, _strchive, locus_lookup = locus_annotations.load_known_disease_loci(
-            self.catalog_path, build_locus_lookup=True)
-        # Keyed by LocusId and by "chrom-start0-end1-RepeatUnit".
-        self.assertIn("DISEASE_A", locus_lookup)
-        self.assertIn("1-1000-1030-CAG", locus_lookup)
-        self.assertEqual(locus_lookup["DISEASE_A"]["LocusId"], "DISEASE_A")
-
     def test_null_pathogenic_motifs_still_match_by_repeat_unit(self):
         # Most loci of the real catalog (e.g. HTT, FMR1) have "PathogenicMotifs": null.
         catalog_path = _make_catalog_file([{
@@ -310,7 +300,7 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
             "PathogenicMotifs": None, "Diseases": [{"Name": "Disease X"}],
         }])
         try:
-            interval_trees, _, _ = locus_annotations.load_known_disease_loci(catalog_path)
+            interval_trees, _ = locus_annotations.load_known_disease_loci(catalog_path)
         finally:
             os.remove(catalog_path)
         self.assertEqual(
@@ -320,13 +310,13 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
 
     def test_cached_strchive_file_builds_trees_without_network(self):
         strchive = [{
-            "locus_id": "STR_A", "disease": "Some Disease", "chrom": "chr2",
+            "id": "STR_A", "disease": "Some Disease", "chrom": "chr2",
             "start_hg38": 500, "stop_hg38": 530,
             "reference_motif_reference_orientation": ["CAG"],
         }]
         strchive_path = _make_catalog_file(strchive)
         try:
-            _trees, strchive_trees, _lookup = locus_annotations.load_known_disease_loci(
+            _trees, strchive_trees = locus_annotations.load_known_disease_loci(
                 self.catalog_path, strchive_filepath=strchive_path)
             self.assertIn("2", strchive_trees)
             intervals = sorted(strchive_trees["2"])
@@ -339,14 +329,14 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
         # Several STRchive loci expand as a motif that differs from the reference unit. Matching
         # only reference_motif_reference_orientation would miss exactly those expansions.
         strchive = [{
-            "locus_id": "STR_B", "disease": "Some Disease", "chrom": "chr2",
+            "id": "STR_B", "disease": "Some Disease", "chrom": "chr2",
             "start_hg38": 500, "stop_hg38": 530,
             "reference_motif_reference_orientation": ["CAG"],
             "pathogenic_motif_reference_orientation": ["CCG"],
         }]
         strchive_path = _make_catalog_file(strchive)
         try:
-            _trees, strchive_trees, _lookup = locus_annotations.load_known_disease_loci(
+            _trees, strchive_trees = locus_annotations.load_known_disease_loci(
                 self.catalog_path, strchive_filepath=strchive_path)
             self.assertEqual(
                 locus_annotations.matches_disease_locus("chr2-500-530-CCG", {}, strchive_trees),
@@ -374,8 +364,8 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
             "pathogenic_motif_reference_orientation": ["CAG"],
         }])
         try:
-            interval_trees, strchive_trees, locus_lookup = locus_annotations.load_known_disease_loci(
-                catalog_path, strchive_filepath=strchive_path, build_locus_lookup=True)
+            interval_trees, strchive_trees = locus_annotations.load_known_disease_loci(
+                catalog_path, strchive_filepath=strchive_path)
         finally:
             os.remove(catalog_path)
             os.remove(strchive_path)
@@ -383,7 +373,6 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
             [interval] = trees["4"]
             self.assertEqual((interval.begin, interval.end), (3074876, 3074933))
             self.assertEqual((interval.end - interval.begin) % len("CAG"), 0)
-        self.assertEqual(locus_lookup["4-3074876-3074933-CAG"]["LocusId"], "HTT")
         self.assertEqual(
             locus_annotations.matches_disease_locus("4-3074876-3074933-CAG", interval_trees), "HTT")
         self.assertEqual(
@@ -403,7 +392,7 @@ class MatchesDiseaseLocusTests(unittest.TestCase):
             "Diseases": [{"Name": "Test ataxia"}],
         }]
         self.catalog_path = _make_catalog_file(self.catalog)
-        self.interval_trees, _, _ = locus_annotations.load_known_disease_loci(
+        self.interval_trees, _ = locus_annotations.load_known_disease_loci(
             self.catalog_path)
         # Stored interval is [1000, 1030).
 
@@ -465,7 +454,7 @@ class MatchesDiseaseLocusTests(unittest.TestCase):
             "9": intervaltree.IntervalTree(),
         }
         strchive_trees["9"].addi(999, 1030, data={
-            "locus_id": "STR_FALLBACK",
+            "id": "STR_FALLBACK",
             "reference_motif_reference_orientation": ["CAG"],
         })
         self.assertEqual(
@@ -478,7 +467,7 @@ class MatchesDiseaseLocusTests(unittest.TestCase):
         # exists for: matching only the reference motif would miss the expansion.
         strchive_trees = {"9": intervaltree.IntervalTree()}
         strchive_trees["9"].addi(999, 1030, data={
-            "locus_id": "STR_PATHOGENIC",
+            "id": "STR_PATHOGENIC",
             "reference_motif_reference_orientation": ["AAAAG"],
             "pathogenic_motif_reference_orientation": ["AAGGG"],
         })
@@ -525,7 +514,7 @@ class KnownMotifAndMendelianGeneTests(unittest.TestCase):
             "Diseases": [{"Name": "D"}],
         }]
         self.catalog_path = _make_catalog_file(self.catalog)
-        self.interval_trees, _, _ = locus_annotations.load_known_disease_loci(
+        self.interval_trees, _ = locus_annotations.load_known_disease_loci(
             self.catalog_path)
 
     def tearDown(self):

@@ -315,8 +315,6 @@
 // Swim Plot Page
 // =========================================================================
 
-const SWIM_API_BASE = window.location.origin + '/api/v1';
-
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
 const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
 // 99th-percentile outlier warnings, keyed by sample_id
@@ -368,14 +366,14 @@ function getSwimParams() {
 
     // Gene regions (include)
     const regions = [];
-    ['cds','promoter','utr','intron','exon','intergenic'].forEach(r => {
+    GENE_REGIONS.forEach(r => {
         if ($(`input[name="swim_gene_region_${r}"]`).parent().checkbox('is checked')) regions.push(r);
     });
     if (regions.length) params.gene_regions = regions.join(',');
 
     // Gene regions (exclude)
     const exRegions = [];
-    ['cds','promoter','utr','intron','exon','intergenic'].forEach(r => {
+    GENE_REGIONS.forEach(r => {
         if ($(`input[name="swim_exclude_gene_region_${r}"]`).parent().checkbox('is checked')) exRegions.push(r);
     });
     if (exRegions.length) params.exclude_gene_regions = exRegions.join(',');
@@ -407,7 +405,7 @@ async function loadSwimPlot() {
     const requestId = ++swimLoadSeq;
     const params = getSwimParams();
     const qs = new URLSearchParams(params).toString();
-    const url = `${SWIM_API_BASE}/swim_plot_data?${qs}`;
+    const url = `${API_BASE_URL}/swim_plot_data?${qs}`;
 
     $('#swim-loading').show();
     $('#swim-load-btn').addClass('disabled');
@@ -751,8 +749,8 @@ function showDotDetail(item) {
     // have changed the outlier-type radio without reloading, which would otherwise fetch detail
     // for a different outlier type than the plotted dot belongs to (wrong details or 404).
     const params = swimLoadedParams || getSwimParams();
-    const detailUrl = `${SWIM_API_BASE}/loci/${encodeURIComponent(item.LocusId)}`;
-    const statsUrl = `${SWIM_API_BASE}/sample_outlier_stats?sample_id=${encodeURIComponent(item.sample_id)}&locus_id=${encodeURIComponent(item.LocusId)}&outlier_type=${encodeURIComponent(params.outlier_type)}`;
+    const detailUrl = buildLocusDetailUrl(item.LocusId);
+    const statsUrl = `${API_BASE_URL}/sample_outlier_stats?sample_id=${encodeURIComponent(item.sample_id)}&locus_id=${encodeURIComponent(item.LocusId)}&outlier_type=${encodeURIComponent(params.outlier_type)}`;
 
     const detailPromise = fetch(detailUrl).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
     const statsPromise = fetch(statsUrl).then(r => r.ok ? r.json() : null).catch(() => null);
@@ -1090,7 +1088,7 @@ $(document).ready(function() {
         fullTextSearch: true,
         forceSelection: false,
     });
-    fetchJsonOrNull(SWIM_API_BASE + '/schema', 'Load schema').then(schema => {
+    fetchJsonOrNull(`${API_BASE_URL}/schema`, 'Load schema').then(schema => {
         if (schema) fillSampleIdDropdown($('#swim-sample-id-filter'), schema);
     });
 

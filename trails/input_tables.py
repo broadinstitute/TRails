@@ -32,7 +32,6 @@ import gzip
 import pandas
 
 import analysis_columns
-import locus_annotations
 
 
 # Allowed normalized values for sample-metadata status columns. A value outside
@@ -132,15 +131,16 @@ _NORMALIZED_OUTPUT_COLUMNS = {
 def _coerce_annotation_value(value):
     """Coerce a raw string annotation cell to int/float when numeric, else str/None.
 
-    Missing cells (empty, or a recognized TSV missing marker such as ``.`` /
-    ``NA`` / ``N/A`` / ``NaN`` / ``None`` / ``null``, case-insensitively) become
-    None; integer-looking values become int; other numeric values become float;
-    everything else is left as the original string. Normalizing missing markers
-    matters because the population-stat columns feed numeric comparisons
-    downstream (e.g. the p99 thresholds in analysis_columns), where a leftover
-    ``.``/``NA`` string would raise a TypeError against the numeric cohort values.
+    Missing cells (empty, or a missing marker in analysis_columns.MISSING_VALUE_SPELLINGS
+    such as ``.`` / ``NA`` / ``N/A`` / ``NaN`` / ``None`` / ``null``,
+    case-insensitively) become None; integer-looking values become int; other
+    numeric values become float; everything else is left as the original string.
+    Normalizing missing markers matters because the population-stat columns feed
+    numeric comparisons downstream (e.g. the p99 thresholds in analysis_columns),
+    where a leftover ``.``/``NA`` string would raise a TypeError against the numeric
+    cohort values.
     """
-    if value is None or str(value).strip().lower() in ("", ".", "na", "n/a", "nan", "none", "null"):
+    if analysis_columns.blank_to_none(value) is None:
         return None
     try:
         return int(value)
@@ -317,7 +317,7 @@ def read_sample_metadata(path):
     for record in df.to_dict(orient="records"):
         sample_id = record["sample_id"]
         sample_lookup[sample_id] = dict(record)
-        affected_lookup[sample_id] = locus_annotations.normalize_affected_status_for_logic(
+        affected_lookup[sample_id] = analysis_columns.normalize_affected_status_for_logic(
             record.get("affected_status"))
         analysis_lookup[sample_id] = record.get("analysis_status")
 
@@ -400,7 +400,7 @@ def read_gene_table(path):
         return {}
 
     # Missing markers: pandas' defaults ("", "NA", "N/A", "null", "nan", ...) plus TRails' own
-    # ".", which the rest of the pipeline honors (see _coerce_annotation_value). Without it a "."
+    # ".", which the other inputs honor too (analysis_columns.MISSING_VALUE_SPELLINGS). Without it a "."
     # in pLI_v2/pLI_v4 arrives as the literal string and analysis_columns.add_gene_columns dies on
     # float(".").
     df = pandas.read_table(path, na_values=["."])
@@ -490,11 +490,16 @@ def read_gene_disease_phenotypes(path):
     ``INHERITANCE_HPO_TERMS``) populate each disease's ``inheritance`` set;
     every other HPO id populates its ``phenotypes`` set.
 
+    Gene symbols are upper-cased, because the gene table and HPO can spell the same
+    symbol differently: HPO writes the HGNC symbol "C9orf72", while the default gene
+    table (genelookup's) upper-cases it to "C9ORF72". Callers look a symbol up by its
+    upper-cased form.
+
     Args:
         path: Path to the genes_to_phenotype table (optionally gzipped), or None.
 
     Returns:
-        A dict ``{gene_symbol: {disease_id: {"phenotypes": set,
+        A dict ``{upper_cased_gene_symbol: {disease_id: {"phenotypes": set,
         "inheritance": set}}}``. Returns an empty dict if ``path`` is None.
     """
     if path is None:
@@ -508,7 +513,7 @@ def read_gene_disease_phenotypes(path):
             fields = line.rstrip("\n").split("\t")
             if len(fields) < 6:
                 continue
-            disease_entry = gene_disease_data.setdefault(fields[1], {}).setdefault(
+            disease_entry = gene_disease_data.setdefault(fields[1].upper(), {}).setdefault(
                 fields[5], {"phenotypes": set(), "inheritance": set()}
             )
             if fields[2] in INHERITANCE_HPO_TERMS:

@@ -69,8 +69,6 @@
 // QC2 Page - Mendelian Violations Box Plots
 // =========================================================================
 
-const QC2_API_BASE = window.location.origin + '/api/v1';
-
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
 // This page shows only the Mendelian-violation part of a sample's warning (its
 // renderMendelianWarning call passes mendelianOnly: true), so the 99th-percentile outlier
@@ -183,7 +181,7 @@ function createChartsForSection(containerId, data, bins, section) {
 // Fetch data and render charts
 async function loadQC2Data() {
     try {
-        const response = await fetch(`${QC2_API_BASE}/qc2_data`);
+        const response = await fetch(`${API_BASE_URL}/qc2_data`);
         if (!response.ok) {
             const errData = await response.json().catch(() => ({}));
             throw new Error(errData.detail || `HTTP ${response.status}`);

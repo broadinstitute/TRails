@@ -607,7 +607,6 @@ $(document).ready(function() {
 // =========================================================================
 
 // Default State
-const API_BASE_URL = window.location.origin + '/api/v1';
 
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
 const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
@@ -776,7 +775,7 @@ function applyStateToUI() {
 
     // Gene region checkboxes
     const regions = currentState.gene_regions ? currentState.gene_regions.split(',') : [];
-    for (const r of ['cds', 'promoter', 'utr', 'intron', 'exon', 'intergenic']) {
+    for (const r of GENE_REGIONS) {
         const cb = $(`input[name="gene_region_${r}"]`).parent();
         regions.includes(r) ? cb.checkbox('check') : cb.checkbox('uncheck');
     }
@@ -784,7 +783,7 @@ function applyStateToUI() {
     // Exclude gene region checkboxes
     const exRegions = currentState.exclude_gene_regions
         ? currentState.exclude_gene_regions.split(',') : [];
-    for (const r of ['cds', 'promoter', 'utr', 'intron', 'exon', 'intergenic']) {
+    for (const r of GENE_REGIONS) {
         const cb = $(`input[name="exclude_gene_region_${r}"]`).parent();
         exRegions.includes(r) ? cb.checkbox('check') : cb.checkbox('uncheck');
     }
@@ -837,7 +836,7 @@ function readStateFromUI() {
 
     // Gene regions
     const geneRegions = [];
-    for (const r of ['cds', 'promoter', 'utr', 'intron', 'exon', 'intergenic']) {
+    for (const r of GENE_REGIONS) {
         if ($(`input[name="gene_region_${r}"]`).parent().checkbox('is checked')) {
             geneRegions.push(r);
         }
@@ -846,7 +845,7 @@ function readStateFromUI() {
 
     // Exclude gene regions
     const exGeneRegions = [];
-    for (const r of ['cds', 'promoter', 'utr', 'intron', 'exon', 'intergenic']) {
+    for (const r of GENE_REGIONS) {
         if ($(`input[name="exclude_gene_region_${r}"]`).parent().checkbox('is checked')) {
             exGeneRegions.push(r);
         }
@@ -1122,6 +1121,14 @@ async function performSearch() {
         }
         const data = await response.json();
         if (requestId !== searchRequestSeq) return;  // superseded while parsing the response
+        // The server returns a page past the last one empty, and the pager would read e.g.
+        // "Showing 51-50 of 50". That happens when the only row on the last page leaves the
+        // results (removing the filtered-by tag from it) or a URL names a page that no longer
+        // exists, so show the last page instead.
+        if (data.total_pages > 0 && data.page > data.total_pages) {
+            currentState.page = data.total_pages;
+            return performSearch();
+        }
         if (grouped) renderGroupedResults(data); else renderResults(data);
         renderSummaryCharts(data);
         updatePaginationControls(data);
@@ -1732,20 +1739,12 @@ function renderLocusRow(locus, rowIndex) {
     const canonicalMotif = locus.CanonicalMotif || '';
     const motifMain = locus.Motif || '';
     const motifTruncLen = 12;
-    let motifMainHtml;
-    if (motifMain.length > motifTruncLen) {
-        motifMainHtml = `<span class="motif-truncated" title="Click to see full motif" data-full-motif="${escapeHtml(motifMain)}">${escapeHtml(motifMain.substring(0, motifTruncLen))}... (${motifMain.length}bp)</span>`;
-    } else {
-        motifMainHtml = `${escapeHtml(motifMain)} (${escapeHtml(String(motifSize))})`;
-    }
-    let motifSubHtml = '';
-    if (canonicalMotif && canonicalMotif !== motifMain) {
-        if (canonicalMotif.length > motifTruncLen) {
-            motifSubHtml = `canon: <span class="motif-truncated" title="Click to see full motif" data-full-motif="${escapeHtml(canonicalMotif)}">${escapeHtml(canonicalMotif.substring(0, motifTruncLen))}... (${canonicalMotif.length}bp)</span>`;
-        } else {
-            motifSubHtml = `canon: ${escapeHtml(canonicalMotif)}`;
-        }
-    }
+    const motifMainHtml = motifMain.length > motifTruncLen
+        ? formatMotifForDisplay(motifMain, motifTruncLen)
+        : `${escapeHtml(motifMain)} (${escapeHtml(String(motifSize))})`;
+    const motifSubHtml = (canonicalMotif && canonicalMotif !== motifMain)
+        ? `canon: ${formatMotifForDisplay(canonicalMotif, motifTruncLen)}`
+        : '';
     const motifCell = `<div class="cell-main">${motifMainHtml}</div>${motifSubHtml ? `<div class="cell-sub">${motifSubHtml}</div>` : ''}`;
 
     // Locus cell: ID (truncate motif portion if long) + known motif badge + known locus badge
@@ -1769,7 +1768,7 @@ function renderLocusRow(locus, rowIndex) {
     if (trexHref) {
         locusIdDisplay = `<a href="${trexHref}" target="_blank" title="${escapeHtml(locusIdRaw)} — open in TRExplorer" style="color: #2185d0; text-decoration: none;">${locusIdText}</a>`;
     } else if (locusIdTruncated) {
-        locusIdDisplay = `<span class="motif-truncated" title="Click to see full locus ID" data-full-motif="${escapeHtml(locusIdRaw)}">${locusIdText}</span>`;
+        locusIdDisplay = renderFullTextPopupTrigger(locusIdRaw, locusIdText, 'Click to see full locus ID');
     } else {
         locusIdDisplay = locusIdText;
     }
@@ -1944,11 +1943,19 @@ $('#results-table thead th[data-sort]').on('click', function() {
 // Locus Detail Inline Expansion
 // =========================================================================
 
+// Shortened text that opens the full text in a popup when clicked (the .motif-truncated click
+// handler below reads data-full-motif). shortenedHtml is the already-escaped text to show; used
+// for long motifs and long locus ids.
+function renderFullTextPopupTrigger(fullText, shortenedHtml, title) {
+    return `<span class="motif-truncated" title="${title}" data-full-motif="${escapeHtml(fullText)}">${shortenedHtml}</span>`;
+}
+
 // A motif longer than maxLength shows its first maxLength bases, "..." and its size, e.g.
 // "TCTTGTGGGACTTCAGGCACTTGAAAGATA... (235bp)"; clicking it opens the full-motif popup.
 function formatMotifForDisplay(motif, maxLength = 30) {
     if (!motif || motif.length <= maxLength) return escapeHtml(motif || '');
-    return `<span class="motif-truncated" title="Click to see full motif" data-full-motif="${escapeHtml(motif)}">${escapeHtml(motif.substring(0, maxLength))}... (${motif.length}bp)</span>`;
+    return renderFullTextPopupTrigger(motif, `${escapeHtml(motif.substring(0, maxLength))}... (${motif.length}bp)`,
+                                      'Click to see full motif');
 }
 
 // Motif truncation click handler — show full motif in a popup
@@ -2009,12 +2016,7 @@ $(document).on('click', 'td.col-expand', async function() {
     refreshCollapseAllButton();
 
     try {
-        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}`);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const detail = await response.json();
-        const html = renderLocusDetail(detail, currentState.outlier_type);
-        $loadingRow.children('td').html(html);
-        highlightGroupSamplesInDetail($row, $loadingRow);
+        await loadLocusDetailInto(locusId, $row);
     } catch (error) {
         // Keep the chevron expanded so it stays consistent with the error detail row left in
         // the DOM; otherwise the next click "collapses" the error row instead of retrying.
@@ -2251,7 +2253,7 @@ function renderLocusDetail(detail, outlierType) {
 
         // Per-sample scores table
         if (outlierScoresForType.length > 0) {
-            html += '<table style="width: 100%; font-size: 0.88em; border-collapse: collapse; margin-top: 4px;">';
+            html += '<table class="phenotype-scores-table" style="width: 100%; font-size: 0.88em; border-collapse: collapse; margin-top: 4px;">';
             html += '<thead><tr style="background: #c8e6c9;">';
             html += '<th style="padding: 3px 6px; text-align: left;">Sample</th>';
             html += '<th style="padding: 3px 6px; text-align: right;">Allele</th>';
@@ -2575,21 +2577,27 @@ function highlightGroupSamplesInDetail($locusRow, $detailRow) {
     }).addClass('selected-group-sample');
 }
 
+// Fetch a locus's detail and render it into the detail row under each of the given locus rows
+// that has one open, highlighting that row's own sample under a grouped row (the same locus can be
+// open under several). Shared by the expand handler and refreshDetailPanel; a failed request
+// throws, and each caller reports it its own way.
+async function loadLocusDetailInto(locusId, $locusRows) {
+    const response = await fetchWithTimeout(buildLocusDetailUrl(locusId));
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const html = renderLocusDetail(await response.json(), currentState.outlier_type);
+    $locusRows.each(function() {
+        const $detailRow = $(this).next('.locus-detail-row');
+        $detailRow.children('td').html(html);
+        highlightGroupSamplesInDetail($(this), $detailRow);
+    });
+}
+
 async function refreshDetailPanel(locusId) {
-    const $row = $(`tr.locus-row[data-locus-id="${locusId}"]`);
-    const $detailRow = $row.next('.locus-detail-row');
-    if ($detailRow.length === 0) return;
+    const $rows = $(`tr.locus-row[data-locus-id="${locusId}"]`);
+    if ($rows.next('.locus-detail-row').length === 0) return;
 
     try {
-        const response = await fetchWithTimeout(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}`);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const detail = await response.json();
-        const html = renderLocusDetail(detail, currentState.outlier_type);
-        $detailRow.children('td').html(html);
-        // The same locus can be open under several grouped rows, each with its own sample.
-        $row.each(function() {
-            highlightGroupSamplesInDetail($(this), $(this).next('.locus-detail-row'));
-        });
+        await loadLocusDetailInto(locusId, $rows);
     } catch (error) {
         console.error('Refresh detail error:', error);
     }
@@ -2606,7 +2614,7 @@ function renderAnnotationBadges(tags, hasNote) {
 
 async function refreshRowAnnotations(locusId) {
     try {
-        const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}`);
+        const response = await fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`);
         if (!response.ok) return;
         const ann = await response.json();
         const $row = $(`tr.locus-row[data-locus-id="${locusId}"]`);
@@ -2719,7 +2727,7 @@ $(document).on('click', '.add-tag-btn', async function() {
 // Helper function to fetch tags for a locus
 async function fetchLocusTags(locusId) {
     try {
-        const response = await fetch(`${API_BASE_URL}/annotations/${encodeURIComponent(locusId)}`);
+        const response = await fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`);
         if (!response.ok) return [];
         const data = await response.json();
         return data.tags || [];
@@ -2806,7 +2814,7 @@ $(document).on('click', '.badge-known-locus', async function(e) {
     const locusId = $(this).data('locus-id');
 
     try {
-        const response = await fetch(`${API_BASE_URL}/loci/${encodeURIComponent(locusId)}`);
+        const response = await fetch(buildLocusDetailUrl(locusId));
         if (!response.ok) throw new Error('Failed to fetch locus details');
         const data = await response.json();
         const knownDisease = data.annotations?.known_disease_locus;

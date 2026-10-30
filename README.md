@@ -81,7 +81,8 @@ starts with when it is opened with no saved filters, e.g. `all` for a short-read
 ## Inputs
 
 TRails reads **two** tables you supply (a third is optional). **Only a handful of columns are
-required, and a missing optional column never causes an error.** Most missing columns just turn
+required, and a missing optional column never causes an error** (an unrecognized value in a
+status or `sex` column does; see the sample metadata table below). Most missing columns just turn
 off the feature that depends on them. The exception is a sample's `affected_status` and
 `analysis_status`: a sample that is not marked unaffected or solved is still a candidate, so with
 these columns missing every sample counts as affected and unsolved (see the sample metadata
@@ -137,13 +138,16 @@ PMGRC-1-2-1    Unaffected        Unaffected        FAM1                         
 |--------|-----------|-----------------|
 | `sample_id` | **required** | joins to the sample columns of the repeat-copy-numbers TSV; may not contain `:` or `,`, which are the delimiters of the packed outlier-sample strings (either character aborts the build) |
 | `affected_status` | optional | affected-vs-unaffected outlier comparison + affected-unsolved prioritization. Values: `Affected`, `Possibly Affected` (treated as `Affected`), `Unaffected`, `Unknown`. A sample counts as affected and unsolved unless its `affected_status` is `Unaffected` or its `analysis_status` is `Solved`, `Probably Solved` or `Unaffected`, so a blank, absent or `Unknown` value counts as affected |
-| `analysis_status` | optional | solved/unsolved filtering + counts. Values: `Solved`, `Unsolved`, `Unknown`, … A blank, absent or `Unknown` value counts as unsolved |
+| `analysis_status` | optional | solved/unsolved filtering + counts. Values: `Solved`, `Unsolved`, `Unknown`, `Unaffected`, `Probably Solved`, `Partially Solved`, and the codes `rncc` and `rcpc` (read as `Unsolved`) and `s_kgfp` (read as `Solved`). A blank, absent or `Unknown` value counts as unsolved |
 | `family_id` | optional | distinct-family outlier counts; pairs with the parent ids for trio QC |
 | `maternal_id`, `paternal_id` | optional | Mendelian-violation QC (needs trios) |
 | `sex` | optional | displayed only: shown in the sample tables (the swim plot shows it for chrX/chrY loci). Nothing filters or computes on it. Values: `Male`, `Female`, `Unknown` |
 | `phenotype_description` | optional | free-text shown in the UI |
 
-Any extra columns are ignored.
+Any extra columns are ignored. The `affected_status`, `analysis_status` and `sex` values are not
+case-sensitive, and a blank cell (or `.`, `NA`, `N/A`, `null`, `none`, `nan`) means no value. Any other
+value in those three columns that is not listed above stops the build with an error naming the
+column, the value and the sample, so recode e.g. `M` / `F` to `Male` / `Female` first.
 
 ### 3. Phenotype TSV — `--phenotypes-table`  *(optional)*
 
@@ -167,7 +171,11 @@ Extra columns (e.g. `age_of_onset`, `modifier`) are accepted and ignored.
 ## Reference data (downloaded for you)
 
 `install.sh` and `trails.py` download these public files into `reference_data/`, once. A
-download that fails (e.g. offline) only leaves the columns that depend on it empty.
+download that fails (e.g. offline) does not stop the build: it leaves the columns that depend on
+it empty, with one exception. Without TRExplorer's data, the population 99th percentiles that gate
+the #Aff / #Fam counts and the phenotype scores are missing (unless your repeat-copy-numbers TSV
+supplies them), so those counts and scores are computed without the population gate and can be
+larger. The build prints a warning when that happens.
 
 | Data | Source | Used for |
 |------|--------|----------|

@@ -151,6 +151,15 @@ class FetchReferenceDataTests(unittest.TestCase):
         self.assertIn(trails_setup.GENELOOKUP_GENE_TABLE_NAME, names)
         self.assertIn(trails_setup.TREXPLORER_CATALOG_VERSION, trails_setup.TREXPLORER_ANNOTATIONS_TSV_URL)
 
+    def test_every_downloaded_file_has_the_name_constant_trails_py_looks_it_up_by(self):
+        # trails_launcher.main finds each file in fetch_reference_data's result by these names, and
+        # a name that matched nothing there would silently turn that input off.
+        self.assertEqual(
+            sorted(name for name, _source, _fetch, _trails_option in trails_setup.REFERENCE_FILES),
+            sorted([trails_setup.HPO_GENES_TO_PHENOTYPE_NAME, trails_setup.STR_ANALYSIS_KNOWN_LOCI_CATALOG_NAME,
+                    trails_setup.STRCHIVE_LOCI_NAME, trails_setup.TREXPLORER_ANNOTATIONS_DATABASE_NAME,
+                    trails_setup.GENELOOKUP_GENE_TABLE_NAME]))
+
 
 class TRExplorerAnnotationsDatabaseCacheTests(unittest.TestCase):
 

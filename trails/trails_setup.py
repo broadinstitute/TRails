@@ -128,18 +128,23 @@ def _export_genelookup_gene_table(sql, dest):
         os.replace(tmp, dest)
 
 
+# The local file names of the other reference files, which trails_launcher looks them up by.
+HPO_GENES_TO_PHENOTYPE_NAME = "genes_to_phenotype.txt"
+STR_ANALYSIS_KNOWN_LOCI_CATALOG_NAME = "variant_catalog_without_offtargets.GRCh38.json"
+STRCHIVE_LOCI_NAME = "STRchive-loci.json"
+
 # (local filename, source, function that fetches source into the file, the trails.py option that
 # takes a local copy of the file instead or None): one class-A file per entry. The source is what
 # the reference-versions manifest below records. TRExplorer's database has no trails.py option:
 # trails.py reads it only from the reference-data directory.
 REFERENCE_FILES = [
-    ("genes_to_phenotype.txt",
+    (HPO_GENES_TO_PHENOTYPE_NAME,
      f"https://github.com/obophenotype/human-phenotype-ontology/releases/download/{HPO_RELEASE}/genes_to_phenotype.txt",
      _download, "--genes-to-phenotype"),
-    ("variant_catalog_without_offtargets.GRCh38.json",
+    (STR_ANALYSIS_KNOWN_LOCI_CATALOG_NAME,
      f"https://raw.githubusercontent.com/broadinstitute/str-analysis/{STR_ANALYSIS_COMMIT}/str_analysis/variant_catalogs/variant_catalog_without_offtargets.GRCh38.json",
      _download, "--known-loci-json"),
-    ("STRchive-loci.json",
+    (STRCHIVE_LOCI_NAME,
      f"https://raw.githubusercontent.com/dashnowlab/STRchive/{STRCHIVE_COMMIT}/data/STRchive-loci.json",
      _download, "--strchive-loci-json"),
     (TREXPLORER_ANNOTATIONS_DATABASE_NAME,

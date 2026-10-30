@@ -52,8 +52,6 @@
 // Sample QC Page - Separate plots per motif bin
 // =========================================================================
 
-const QC_API_BASE = window.location.origin + '/api/v1';
-
 // Mendelian violation warnings (samples with >10% violation rate on autosome or chrX)
 const MENDELIAN_WARNINGS = {{ mendelian_warnings | tojson }};
 // 99th-percentile outlier warnings, keyed by sample_id
@@ -120,7 +118,7 @@ function createChartsForSection(containerId, data) {
 // Fetch data and render charts
 async function loadSampleQCData() {
     try {
-        const response = await fetch(`${QC_API_BASE}/sample_qc_data`);
+        const response = await fetch(`${API_BASE_URL}/sample_qc_data`);
         if (!response.ok) {
             const errData = await response.json().catch(() => ({}));
             throw new Error(errData.detail || `HTTP ${response.status}`);

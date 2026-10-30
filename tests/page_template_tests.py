@@ -163,7 +163,7 @@ class DetailRowCellSpecificityTests(unittest.TestCase):
         self.assertIn("#results-table tbody tr.locus-detail-row > td {", self.header)
         self.assertNotIn("#results-table tbody tr.locus-detail-row td {", self.header)
 
-    def test_the_detail_row_still_has_exactly_one_direct_cell(self):
+    def test_the_detail_row_has_exactly_one_direct_cell(self):
         # The child combinator is only equivalent for the outer cell because the row is built
         # with a single colspan td that the detail HTML is dropped into.
         template = read_template("index_page_template.html")
@@ -176,7 +176,7 @@ class DetailRowCellSpecificityTests(unittest.TestCase):
         self.assertIn(".invisible-table td,\n#results-table .invisible-table td {", self.header)
         self.assertIn("#results-table tbody td {", self.header)
 
-    def test_the_compact_sub_table_rules_are_still_the_ones_that_should_win(self):
+    def test_the_compact_sub_table_rules_win(self):
         self.assertIn("#results-table .sample-subtable td { padding: 2px 6px;", self.header)
 
 
@@ -293,7 +293,7 @@ class ExpandHandlerScopeTests(unittest.TestCase):
         self.assertIn("$(document).on('click', 'td.col-expand'", template)
         self.assertNotIn("$(document).on('click', '.col-expand'", template)
 
-    def test_header_cell_still_carries_the_class(self):
+    def test_header_cell_carries_the_class(self):
         # The th keeps the class for column sizing, which is why the handler has to be scoped.
         self.assertIn('<th class="col-expand">', read_template("index_page_template.html"))
 
@@ -341,7 +341,7 @@ class SharedJsHeaderTests(unittest.TestCase):
 class UnknownMotifBinTests(unittest.TestCase):
     """The 'Unknown' motif-size bin the server emits must reach the charts and the popup."""
 
-    def test_the_server_still_emits_an_unknown_bin(self):
+    def test_the_server_emits_an_unknown_bin(self):
         self.assertIn("Unknown", server_motif_bins())
 
     def test_sample_qc_charts_cover_every_bin_the_server_emits(self):
@@ -589,7 +589,7 @@ class VariationClusterDetailPanelTests(unittest.TestCase):
         self.row = js_function_body(template, "function renderLocusRow(locus, rowIndex) {")
         self.detail = js_function_body(template, "function renderLocusDetail(detail, outlierType) {")
 
-    def test_the_row_cell_still_has_both_states(self):
+    def test_the_row_cell_has_both_states(self):
         self.assertIn("} else if (locus.VariationClusterFilterReason) {", self.row)
         self.assertIn("times circle outline icon", self.row)
 
@@ -608,7 +608,7 @@ class VariationClusterDetailPanelTests(unittest.TestCase):
         self.assertIn(guard, self.detail)
         self.assertIn("Number.isFinite(", self.detail)
 
-    def test_the_unfiltered_state_is_still_a_size_in_bp(self):
+    def test_the_unfiltered_state_is_a_size_in_bp(self):
         self.assertIn("Variation Cluster: ${vcsSign}${vcsDiff.toLocaleString('en-US')}bp", self.detail)
 
 
@@ -629,15 +629,16 @@ class DetailRowOuterCellTests(unittest.TestCase):
         for number, line in enumerate(self.template.split("\n"), start=1):
             if line.strip().startswith("//"):
                 continue
-            self.assertNotIn("find('td')", line, "line %d still selects descendant cells" % number)
+            self.assertNotIn("find('td')", line, "line %d selects descendant cells" % number)
             self.assertNotIn("$td.find('.slide-wrapper')", line,
-                             "line %d still selects descendant wrappers" % number)
+                             "line %d selects descendant wrappers" % number)
 
     def test_every_detail_cell_lookup_targets_a_direct_child(self):
-        # Toggle off, the loading row's two renders, collapse one, collapse all, and the
-        # post-annotation refresh, plus the two colspans (a locus detail row's and a grouped row's)
-        # that count the cells of the row they open under.
-        self.assertEqual(8, self.template.count(".children('td')"))
+        # Toggle off, the loading row's error message, the detail render (loadLocusDetailInto,
+        # shared by the expand handler and the post-annotation refresh), collapse one and collapse
+        # all, plus the two colspans (a locus detail row's and a grouped row's) that count the
+        # cells of the row they open under.
+        self.assertEqual(7, self.template.count(".children('td')"))
         self.assertEqual(2, self.template.count("colspan=\"${$row.children('td').length}\""))
         # One slide wrapper per row: toggle off, collapse one, collapse all.
         self.assertEqual(3, self.template.count(".children('.slide-wrapper')"))
@@ -750,9 +751,10 @@ class MinDeltaPopFilterTests(unittest.TestCase):
     def test_the_server_accepts_min_pli_for_api_callers(self):
         self.assertIn('request.args.get("min_pli")', read_template("results_server.py"))
 
-    def test_an_old_bookmark_with_min_pli_is_normalized_in_place(self):
+    def test_a_url_with_a_parameter_the_page_does_not_use_is_normalized_in_place(self):
         # readStateFromUrl keeps only DEFAULT_STATE keys, and then always rewrites the arrival
-        # hash in place, so a bookmark carrying min_pli neither keeps it nor traps Back.
+        # hash in place, so a URL carrying a parameter the page does not use (e.g. min_pli)
+        # neither keeps it nor traps Back.
         read_state = js_function_body(self.template, "function readStateFromUrl(")
         self.assertIn("if (key in DEFAULT_STATE) {", read_state)
         self.assertIn("    replaceStateInUrl();\n\n    applyStateToUI();", read_state)
@@ -1085,6 +1087,110 @@ class CdnIntegrityTests(unittest.TestCase):
         for name in sorted(os.listdir(CODE_DIRECTORY)):
             if name.endswith(".html") and name != "header_template.html":
                 self.assertNotRegex(read_template(name), self.CDN_TAG_PATTERN, name)
+
+
+class PagePastTheLastPageTests(unittest.TestCase):
+    """A search that lands past the last page (its only row left the results, or a URL names a page
+    that no longer exists) shows the last page instead of an empty one."""
+
+    def test_the_search_retries_on_the_last_page_before_rendering(self):
+        search = js_function_body(read_template("index_page_template.html"), "async function performSearch(")
+        self.assertIn("if (data.total_pages > 0 && data.page > data.total_pages) {\n"
+                      "            currentState.page = data.total_pages;\n"
+                      "            return performSearch();", search)
+        self.assertLess(search.index("data.page > data.total_pages"), search.index("renderResults(data)"))
+        # The server reports the page count the check compares against
+        self.assertIn('"total_pages": total_pages,', read_template("results_server.py"))
+
+
+class NestedTableHeaderTests(unittest.TestCase):
+    """Every table nested in #results-table overrides the main header's sticky positioning."""
+
+    def test_every_nested_table_header_is_static(self):
+        header = read_template("header_template.html")
+        for table_class in ("group-loci-table", "sample-subtable", "phenotype-scores-table"):
+            self.assertRegex(header, r"#results-table \.%s thead th \{[^}]*position: static;" % table_class)
+        self.assertIn("#results-table .phenotype-scores-table thead th { position: static; background: transparent; }",
+                      header)
+        self.assertIn('<table class="phenotype-scores-table"', read_template("index_page_template.html"))
+
+
+class LocusDetailLoadTests(unittest.TestCase):
+    """The expand handler and the post-edit refresh load a locus's detail through one function, and
+    every page builds the detail URL with header_template.html's buildLocusDetailUrl."""
+
+    def setUp(self):
+        self.template = read_template("index_page_template.html")
+
+    def test_both_paths_use_the_shared_loader(self):
+        self.assertIn("await loadLocusDetailInto(locusId, $row);", self.template)
+        self.assertIn("await loadLocusDetailInto(locusId, $rows);",
+                      js_function_body(self.template, "async function refreshDetailPanel("))
+        loader = js_function_body(self.template, "async function loadLocusDetailInto(")
+        self.assertIn("fetchWithTimeout(buildLocusDetailUrl(locusId))", loader)
+        self.assertIn("highlightGroupSamplesInDetail($(this), $detailRow);", loader)
+
+    def test_every_detail_request_uses_the_shared_url(self):
+        self.assertIn("function buildLocusDetailUrl(locusId) {", read_template("header_template.html"))
+        # The shared loader and the known-locus popup; the swim plot's detail modal
+        self.assertEqual(2, self.template.count("fetchWithTimeout(buildLocusDetailUrl(locusId))")
+                         + self.template.count("fetch(buildLocusDetailUrl(locusId))"))
+        self.assertIn("const detailUrl = buildLocusDetailUrl(item.LocusId);", read_template("swim_plot_template.html"))
+
+
+class ApiBaseUrlTests(unittest.TestCase):
+    """Every page calls the API through header_template.html's one API_BASE_URL."""
+
+    def test_the_base_url_is_defined_once_in_the_header_every_page_includes(self):
+        header = read_template("header_template.html")
+        self.assertIn("const API_BASE_URL = window.location.origin + '/api/v1';", header)
+        self.assertIn("const ANNOTATIONS_API_URL = `${API_BASE_URL}/annotations`;", header)
+        all_templates = ""
+        for name in sorted(os.listdir(CODE_DIRECTORY)):
+            if not name.endswith(".html"):
+                continue
+            template = read_template(name)
+            all_templates += template
+            if name.endswith("_template.html") and name != "header_template.html":
+                self.assertIn('{% include "header_template.html" %}', template, name)
+                self.assertIn("API_BASE_URL", template, name)
+        self.assertEqual(1, all_templates.count("window.location.origin + '/api/v1'"))
+
+    def test_the_results_page_reads_annotations_from_the_shared_url(self):
+        self.assertEqual(2, read_template("index_page_template.html").count(
+            "fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`)"))
+
+
+class GeneRegionListTests(unittest.TestCase):
+    """Both pages take the gene regions from one list, header_template.html's GENE_REGIONS."""
+
+    def test_the_list_matches_the_server_and_both_pages_checkboxes(self):
+        regions = js_string_list(read_template("header_template.html"), "GENE_REGIONS")
+        server = read_template("results_server.py")
+        server_map = server[server.index("GENE_REGION_MAP = {"):]
+        self.assertEqual(regions, re.findall(r'^    "(\w+)": \[', server_map[:server_map.index("\n}\n")], re.MULTILINE))
+        for name, prefix in (("index_page_template.html", ""), ("swim_plot_template.html", "swim_")):
+            template = read_template(name)
+            for kind in ("gene_region_", "exclude_gene_region_"):
+                self.assertEqual(regions, re.findall(r'name="%s%s(\w+)"' % (prefix, kind), template), (name, kind))
+
+    def test_both_pages_loop_over_it(self):
+        # applyStateToUI and readStateFromUI, each for include and exclude; getSwimParams likewise
+        self.assertEqual(4, read_template("index_page_template.html").count("for (const r of GENE_REGIONS) {"))
+        self.assertEqual(2, read_template("swim_plot_template.html").count("GENE_REGIONS.forEach(r => {"))
+
+
+class FullTextPopupTests(unittest.TestCase):
+    """One function writes the click-to-see-the-full-text span the .motif-truncated handler reads."""
+
+    def test_every_shortened_motif_and_locus_id_goes_through_it(self):
+        template = read_template("index_page_template.html")
+        self.assertEqual(1, template.count('class="motif-truncated"'))
+        self.assertIn('class="motif-truncated"', js_function_body(template, "function renderFullTextPopupTrigger("))
+        row = js_function_body(template, "function renderLocusRow(locus, rowIndex) {")
+        self.assertIn("formatMotifForDisplay(motifMain, motifTruncLen)", row)
+        self.assertIn("formatMotifForDisplay(canonicalMotif, motifTruncLen)", row)
+        self.assertIn("renderFullTextPopupTrigger(locusIdRaw, locusIdText, 'Click to see full locus ID')", row)
 
 
 class DetailPanelMotifTests(unittest.TestCase):

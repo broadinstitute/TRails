@@ -237,16 +237,22 @@ def write_table_from_dicts(connection, table_name, rows, column_order=None,
 def write_loci_table(connection, records, output_columns, extra_columns=None):
     """Writes the wide ``loci`` table from the in-memory locus records.
 
-    Columns are written in ``output_columns`` order, restricted to the columns
-    that are actually present across the records (so an absent annotation column
-    is simply not created rather than written as an all-NULL column). A locus
-    record missing a present column gets ``NULL`` for it.
+    The schema columns are written in ``output_columns`` order, restricted to the
+    columns that are present (as a key, even one holding None) in at least one
+    record, so a column no record has is not created rather than written as an
+    all-NULL column. With no records at all, the full ``output_columns`` schema is
+    written instead. The ``extra_columns`` that are present and not already in
+    ``output_columns`` follow, sorted by name. A locus record missing a written
+    column gets ``NULL`` for it.
 
     Args:
         connection: An open duckdb_compat connection.
         records: A list of per-locus record dicts (the build's in-memory rows).
         output_columns: The full ordered ``OUTPUT_COLUMNS`` schema; the written
-            column order is this list filtered to columns present in ``records``.
+            schema columns are this list filtered to columns present in ``records``.
+        extra_columns: Optional names of annotation columns the input matrix
+            supplied outside ``output_columns`` (e.g. ``HPRC256_Mode``). Those
+            present in the records are appended, sorted, after the schema columns.
 
     Returns:
         The number of rows written.

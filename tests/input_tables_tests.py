@@ -7,6 +7,7 @@ import unittest
 
 import pandas
 
+import analysis_columns
 import input_tables
 
 
@@ -138,6 +139,18 @@ class ReadSampleMetadataTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._read([["S1", "intersex"]], ["sample_id", "sex"])
 
+    def test_dot_is_a_blank_cell(self):
+        # "." is TRails' missing marker in the matrix and the gene table too, so it is a blank
+        # status (not an invalid one) and a blank family_id.
+        sample_lookup, affected, analysis = self._read(
+            [["S1", ".", ".", ".", "."], ["S2", ".", "affected", "unsolved", "male"]],
+            ["sample_id", "family_id", "affected_status", "analysis_status", "sex"],
+        )
+        self.assertIsNone(affected["S1"])
+        self.assertEqual(analysis["S1"], "unknown")
+        self.assertIsNone(analysis_columns.get_family_id("S1", sample_lookup))
+        self.assertIsNone(analysis_columns.get_family_id("S2", sample_lookup))
+
     def test_full_metadata_lookup_fields(self):
         sample_lookup, _, _ = self._read(
             [["S1", "male", "F1", "M1", "P1", "ataxia", "affected", "unsolved"]],
@@ -205,6 +218,12 @@ class ReadGeneDiseasePhenotypesTests(unittest.TestCase):
         data = input_tables.read_gene_disease_phenotypes(path)
         self.assertEqual(data["FMR1"]["OMIM:1"]["phenotypes"], {"HP:0001250"})
         self.assertEqual(data["FMR1"]["OMIM:1"]["inheritance"], {"AD"})
+
+    def test_gene_symbols_are_upper_cased(self):
+        # HPO writes the HGNC symbol C9orf72; the gene table's C9ORF72 must find it.
+        rows = [["203228", "C9orf72", "HP:0002145", "Frontotemporal dementia", "-", "OMIM:105550"]]
+        path = _write_tsv(self, rows, ["ncbi", "gene", "hpo", "name", "freq", "disease"])
+        self.assertEqual(list(input_tables.read_gene_disease_phenotypes(path)), ["C9ORF72"])
 
 
 class CoerceAnnotationValueTests(unittest.TestCase):

@@ -753,7 +753,7 @@ class DiseaseCatalogStartupTests(ServerTestCase):
         cls.strchive_path = os.path.join(cls.tmpdir, "STRchive-loci.json")
         with open(cls.strchive_path, "wt") as output_file:
             json.dump([{
-                "locus_id": "FMR1_test",
+                "id": "FMR1_test",
                 "disease": "Test syndrome",
                 "chrom": "chr1",
                 "start_hg38": 100,
@@ -784,7 +784,6 @@ class DiseaseCatalogStartupTests(ServerTestCase):
         lookups = self._configure()
         self.assertEqual(lookups["strchive_trees"], {})
         self.assertEqual(lookups["disease_trees"], {})
-        self.assertEqual(lookups["locus"], {})
 
 
 # LocusId, Chrom, Start0Based, End1Based, Motif, CanonicalMotif, MotifSize, gene symbol, Ensembl

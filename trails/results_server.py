@@ -31,13 +31,17 @@ from flask import Flask, request, Response
 from werkzeug.exceptions import HTTPException
 import jinja2
 import numpy as np
+import pandas as pd
 
 # The only module that imports duckdb; everything here goes through its sqlite3-shaped API.
 import duckdb_compat
 
 # get_population_p99_threshold, the build's population bar, which the exports apply too, and
-# BLANK_STATUS_VALUES, the spellings of a status cell that mean nothing was recorded
+# blank_to_none, which says whether a metadata cell records anything
 import analysis_columns
+
+# read_sample_metadata, the build's sample-table reader, which load_sample_table reuses
+import input_tables
 
 # Canonical motifs, and the bases they are defined for
 from motif_utilities import COMPLEMENT, compute_canonical_motif
@@ -62,13 +66,13 @@ except ImportError as import_error:
     # drifted, which would otherwise disable the known-disease annotations without a word.
     print(f"WARNING: falling back to the built-in known-disease stubs: {import_error}")
 
-    def load_known_disease_loci(filepath, strchive_filepath=None, build_locus_lookup=False):
-        """Disabled fallback: no disease catalog available -> empty trees/lookup.
+    def load_known_disease_loci(filepath, strchive_filepath=None):
+        """Disabled fallback: no disease catalog available -> empty trees.
 
-        Mirrors the real loader's (interval_trees, strchive_trees, locus_lookup)
-        return shape so the startup call site unpacks identically.
+        Mirrors the real loader's (interval_trees, strchive_trees) return shape so the startup
+        call site unpacks identically.
         """
-        return {}, {}, {}
+        return {}, {}
 
     def find_matching_disease_locus(chrom, start, end, motif, interval_trees, strchive_trees=None):
         """Disabled fallback: with no disease catalog, no locus matches -> (None, None)."""
@@ -474,12 +478,9 @@ def chromosome_name_variants(chrom):
 _original_jsonify = flask.jsonify
 
 
-def jsonify(*args, **kwargs):
+def jsonify(data):
     """Custom jsonify that converts NaN/Infinity to null."""
-    if args:
-        data = sanitize_for_json(args[0]) if len(args) == 1 else sanitize_for_json(args)
-        return _original_jsonify(data, **kwargs)
-    return _original_jsonify(**{k: sanitize_for_json(v) for k, v in kwargs.items()})
+    return _original_jsonify(sanitize_for_json(data))
 
 
 TEMPLATE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -630,6 +631,22 @@ def validate_database(path):
         conn.close()
 
 
+def exit_if_a_supplied_input_file_is_missing(input_file_paths_by_option):
+    """Stop with an error when an optional input file was named but does not exist.
+
+    A path left out is fine, but a mistyped one would otherwise start the server without the
+    sample metadata or disease annotations the user asked for.
+
+    Args:
+        input_file_paths_by_option: dict mapping each command-line option, e.g. "--sample-table",
+            to the path given for it, or None when it was not given.
+    """
+    for option, path in input_file_paths_by_option.items():
+        if path and not os.path.exists(path):
+            print(f"Error: {option} file not found: {path}")
+            sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Data loading functions
 # ---------------------------------------------------------------------------
@@ -651,11 +668,6 @@ def load_sample_table(filepath):
     Returns:
         Tuple (sample_id_to_row, affected_status_lookup, analysis_status_lookup).
     """
-    # Imported here rather than at the top: input_tables imports locus_annotations, which needs
-    # intervaltree, and the server runs without it as long as no sample table is given.
-    import input_tables
-    import pandas as pd
-
     sample_id_to_row, affected_status_lookup, analysis_status_lookup = input_tables.read_sample_metadata(filepath)
 
     raw_df = pd.read_table(filepath, dtype=str, keep_default_na=False)
@@ -1312,6 +1324,21 @@ def population_datasets_compared(require_above_population):
     return POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION.get(require_above_population, POPULATION_DATASETS)
 
 
+def population_metric_column_suffix(params):
+    """Return the suffix of the population columns the population_metric parameter selects.
+
+    Δpop, the require_above_population filter and the min_repeats_above_population filter all
+    read their population values through this, so they compare the same columns.
+
+    Args:
+        params: dict of validated query parameters.
+
+    Returns:
+        "MaxAllele" for population_metric=max, otherwise "99thPercentile".
+    """
+    return "MaxAllele" if params.get("population_metric") == "max" else "99thPercentile"
+
+
 def compute_delta_population(allele_size, locus_row, params):
     """An allele minus the largest population value, as the page's Δpop column computes it.
 
@@ -1325,7 +1352,7 @@ def compute_delta_population(allele_size, locus_row, params):
     Returns:
         The difference, or None when the allele or every population value is missing.
     """
-    metric = "MaxAllele" if params.get("population_metric") == "max" else "99thPercentile"
+    metric = population_metric_column_suffix(params)
     values = []
     for dataset in population_datasets_compared(params.get("require_above_population")):
         value = locus_row.get(f"{dataset}_{metric}")
@@ -1490,7 +1517,7 @@ def build_require_above_population_clause(params, table_name, allele_size_column
         The clause to append to a WHERE clause, or None when it would check nothing.
     """
     source_columns = app.config["DB_COLUMNS_SET"]
-    m = "MaxAllele" if params.get("population_metric") == "max" else "99thPercentile"
+    m = population_metric_column_suffix(params)
     pop_datasets = POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION[params["require_above_population"]]
     present = [d for d in pop_datasets if f"{d}_{m}" in source_columns]
     above_terms = [f"({table_name}.{d}_{m} IS NULL OR {table_name}.{allele_size_column} > {table_name}.{d}_{m})"
@@ -1546,10 +1573,10 @@ def build_api_where_clause(params):
     ot = OUTLIER_TYPE_MAP[params["outlier_type"]]
     source_columns = app.config["DB_COLUMNS_SET"]
 
-    # The loci with an outlier of the requested type. Guarded like every filter: a database built
-    # without this outlier type simply has no rows for it, which is not the same thing as a SQL
-    # error. OUTLIER_TYPE_MAP advertises all three types regardless of what the loaded database
-    # actually contains.
+    # The loci with an outlier of the requested type. Guarded like every filter in
+    # build_locus_filter_clauses: a database built without this outlier type simply has no rows
+    # for it, which is not the same thing as a SQL error. OUTLIER_TYPE_MAP advertises all three
+    # types regardless of what the loaded database actually contains.
     if f"OutlierSampleIds_{ot}" in source_columns:
         clauses = [f"(loci.OutlierSampleIds_{ot} IS NOT NULL AND loci.OutlierSampleIds_{ot} != '')"]
     else:
@@ -1570,7 +1597,7 @@ def build_api_where_clause(params):
     return " AND ".join(clauses + filter_clauses), sql_params
 
 
-def build_locus_filter_clauses(params):
+def build_locus_filter_clauses(params, filters_applied_elsewhere=()):
     """Build the SQL of every locus filter set in validated API query parameters.
 
     Only the filters: build_api_where_clause adds the restriction to the loci with an outlier of
@@ -1579,6 +1606,11 @@ def build_locus_filter_clauses(params):
 
     Args:
         params: dict of validated query parameters from validate_params().
+        filters_applied_elsewhere: Names of filters whose own clause is left out because the
+            caller applies them some other way, as the swim plot applies its allele-level and
+            sample-level filters to each row. Their values still count where another filter
+            reads them: min_repeats_above_population takes its cohorts from
+            require_above_population either way.
 
     Returns:
         Tuple (clauses, sql_params): conditions on the `loci` table, to be ANDed together, and
@@ -1588,10 +1620,21 @@ def build_locus_filter_clauses(params):
     source_columns = app.config["DB_COLUMNS_SET"]
     clauses = []
     sql_params = []
+    # Every filter is guarded on the optional columns it reads (REQUIRED_COLUMNS are always there),
+    # like the outlier-type restriction in build_api_where_clause: a filter whose column the
+    # database lacks matches no locus (or, for an exclusion, excludes none) instead of failing the
+    # whole query.
+    has_first_affected_allele_column = f"FirstAffectedAlleleSize_{ot}" in source_columns
 
-    if "min_expansion" in params:
-        clauses.append(f"loci.FirstAffectedAlleleSize_{ot} >= loci.NumRepeatsInReference + ?")
-        sql_params.append(params["min_expansion"])
+    def is_set_here(filter_name):
+        return filter_name in params and filter_name not in filters_applied_elsewhere
+
+    if is_set_here("min_expansion"):
+        if has_first_affected_allele_column and "NumRepeatsInReference" in source_columns:
+            clauses.append(f"loci.FirstAffectedAlleleSize_{ot} >= loci.NumRepeatsInReference + ?")
+            sql_params.append(params["min_expansion"])
+        else:
+            clauses.append("1=0")
 
     if "require_above_unaffected" in params:
         clauses.append(build_above_unaffected_clause(
@@ -1603,10 +1646,13 @@ def build_locus_filter_clauses(params):
             f"{AFFECTED_ALLELE_COLUMN_PREFIXES[params['require_families_above_unaffected']]}AffectedAlleleSize_{ot}_ByFamily",
             ot, source_columns))
 
-    if "require_above_population" in params:
-        clause = build_require_above_population_clause(params, "loci", f"FirstAffectedAlleleSize_{ot}")
-        if clause:
-            clauses.append(clause)
+    if is_set_here("require_above_population"):
+        if has_first_affected_allele_column:
+            clause = build_require_above_population_clause(params, "loci", f"FirstAffectedAlleleSize_{ot}")
+            if clause:
+                clauses.append(clause)
+        else:
+            clauses.append("1=0")
 
     if "motif" in params:
         if "CanonicalMotif" in source_columns:
@@ -1621,7 +1667,7 @@ def build_locus_filter_clauses(params):
             sql_params.extend(sorted(all_variants))
 
     if "min_repeats_threshold" in params:
-        if f"FirstAffectedAlleleSize_{ot}" in source_columns:
+        if has_first_affected_allele_column:
             clauses.append(f"loci.FirstAffectedAlleleSize_{ot} >= ?")
             sql_params.append(params["min_repeats_threshold"])
         else:
@@ -1635,10 +1681,10 @@ def build_locus_filter_clauses(params):
     # because the page rounds Δpop to a whole number and some TenK10K percentiles are fractional: a
     # difference rounds to N or more exactly when it is at least N - 0.5.
     if "min_repeats_above_population" in params:
-        m = "MaxAllele" if params.get("population_metric") == "max" else "99thPercentile"
+        m = population_metric_column_suffix(params)
         pop_columns = [f"loci.{d}_{m}" for d in population_datasets_compared(params.get("require_above_population"))
                        if f"{d}_{m}" in source_columns]
-        if pop_columns and f"FirstAffectedAlleleSize_{ot}" in source_columns:
+        if pop_columns and has_first_affected_allele_column:
             has_population_data = " OR ".join(f"{c} IS NOT NULL" for c in pop_columns)
             above_terms = " AND ".join(f"({c} IS NULL OR loci.FirstAffectedAlleleSize_{ot} - {c} >= ?)"
                                        for c in pop_columns)
@@ -1648,18 +1694,23 @@ def build_locus_filter_clauses(params):
             clauses.append("1=0")  # no population columns (or no affected allele) -> no locus has a Δpop
 
     if "gene_regions" in params:
-        db_regions = []
-        for region in params["gene_regions"]:
-            db_regions.extend(GENE_REGION_MAP[region])
-        clauses.append(f"loci.gene_region IN ({','.join('?' * len(db_regions))})")
-        sql_params.extend(db_regions)
+        if "gene_region" in source_columns:
+            db_regions = []
+            for region in params["gene_regions"]:
+                db_regions.extend(GENE_REGION_MAP[region])
+            clauses.append(f"loci.gene_region IN ({','.join('?' * len(db_regions))})")
+            sql_params.extend(db_regions)
+        else:
+            clauses.append("1=0")
 
-    if "exclude_gene_regions" in params:
+    # NULL NOT IN (...) is unknown in SQL, which would drop unannotated (NULL gene_region) loci;
+    # keep them since they are not in the excluded set. A database with no gene_region column at
+    # all has no locus in the excluded set either, so it gets no clause, as the
+    # variation-cluster exclusions below do.
+    if "exclude_gene_regions" in params and "gene_region" in source_columns:
         db_regions = []
         for region in params["exclude_gene_regions"]:
             db_regions.extend(GENE_REGION_MAP[region])
-        # NULL NOT IN (...) is unknown in SQL, which would drop unannotated
-        # (NULL gene_region) loci; keep them since they are not in the excluded set.
         clauses.append(f"(loci.gene_region IS NULL OR loci.gene_region NOT IN ({','.join('?' * len(db_regions))}))")
         sql_params.extend(db_regions)
 
@@ -1678,10 +1729,13 @@ def build_locus_filter_clauses(params):
             clauses.append(f"LocusId IN ({','.join('?' * len(known_ids))})")
             sql_params.extend(sorted(known_ids))
 
-    if params.get("apply_pathogenic_threshold"):
-        clause, threshold_params = build_pathogenic_threshold_clause("loci", f"FirstAffectedAlleleSize_{ot}")
-        clauses.append(clause)
-        sql_params.extend(threshold_params)
+    if is_set_here("apply_pathogenic_threshold"):
+        if has_first_affected_allele_column:
+            clause, threshold_params = build_pathogenic_threshold_clause("loci", f"FirstAffectedAlleleSize_{ot}")
+            clauses.append(clause)
+            sql_params.extend(threshold_params)
+        else:
+            clauses.append("1=0")
 
     if params.get("known_motifs_only"):
         clauses.append("loci.IsKnownMotif = 1" if "IsKnownMotif" in source_columns else "1=0")
@@ -1707,7 +1761,7 @@ def build_locus_filter_clauses(params):
             # silently ignoring the filter.
             clauses.append("1=0")
 
-    if "phenotype_keyword" in params:
+    if is_set_here("phenotype_keyword"):
         # A keyword selects a locus when ANY of its outlier samples carries that phenotype. The
         # per-outlier phenotypes live in swim_plot, one row per outlier entry, so the filter is
         # answered from there whenever the database has that table: the loci table's
@@ -1739,29 +1793,37 @@ def build_locus_filter_clauses(params):
                 # No phenotype column at all: match no rows rather than ignoring the filter.
                 clauses.append("1=0")
 
-    if "sample_id_keyword" in params:
+    has_outlier_sample_ids_column = f"OutlierSampleIds_{ot}" in source_columns
+
+    if is_set_here("sample_id_keyword"):
         # These are exact sample ids picked from a dropdown, matched by ILIKE only because the ids
         # are packed into one "{n}x:{sample_id},..." string. A comma is added at the end so every
         # sample id sits between ":" and ",". Sample ids routinely contain "_", which is ILIKE's
         # single-character wildcard, so escape the metacharacters; otherwise "sample_1" would also
         # match the unrelated "sampleX1".
-        kw_clauses = [f"((OutlierSampleIds_{ot} || ',') ILIKE ? ESCAPE '\\')" for _ in params["sample_id_keyword"]]
-        clauses.append(f"({' OR '.join(kw_clauses)})")
-        sql_params.extend(f"%:{escape_like_wildcards(kw)},%" for kw in params["sample_id_keyword"])
+        if has_outlier_sample_ids_column:
+            kw_clauses = [f"((OutlierSampleIds_{ot} || ',') ILIKE ? ESCAPE '\\')" for _ in params["sample_id_keyword"]]
+            clauses.append(f"({' OR '.join(kw_clauses)})")
+            sql_params.extend(f"%:{escape_like_wildcards(kw)},%" for kw in params["sample_id_keyword"])
+        else:
+            clauses.append("1=0")
 
-    if "sample_id_like" in params:
+    if is_set_here("sample_id_like"):
         # ILIKE against the whole packed string would also match allele sizes and the "x:"
         # delimiters ("15" matching "15x:sampleA"), so split it into entries and match inside each
         # entry's sample-id field only, which is its second ":"-separated field. Wildcards are
         # escaped for the same reason as in sample_id_keyword above: a keyword such as "sample_1"
         # means a literal underscore, not ILIKE's single-character wildcard.
-        kw_clauses = [
-            f"len(list_filter(string_split(OutlierSampleIds_{ot}, ','),"
-            f" lambda entry: split_part(entry, ':', 2) ILIKE ? ESCAPE '\\')) > 0"
-            for _ in params["sample_id_like"]
-        ]
-        clauses.append(f"({' OR '.join(kw_clauses)})")
-        sql_params.extend([f"%{escape_like_wildcards(kw)}%" for kw in params["sample_id_like"]])
+        if has_outlier_sample_ids_column:
+            kw_clauses = [
+                f"len(list_filter(string_split(OutlierSampleIds_{ot}, ','),"
+                f" lambda entry: split_part(entry, ':', 2) ILIKE ? ESCAPE '\\')) > 0"
+                for _ in params["sample_id_like"]
+            ]
+            clauses.append(f"({' OR '.join(kw_clauses)})")
+            sql_params.extend([f"%{escape_like_wildcards(kw)}%" for kw in params["sample_id_like"]])
+        else:
+            clauses.append("1=0")
 
     if "locus_id" in params:
         clauses.append(f"LocusId IN ({','.join('?' * len(params['locus_id']))})")
@@ -2001,7 +2063,7 @@ def describe_sample(sample_id, sample_lookup, affected_lookup, analysis_lookup):
     # swim_plot.generate_swim_plot_table mirrors this). Fall back to affected_lookup
     # when the sample has no usable raw status.
     affected_raw = str(sample_row.get("affected_status") or "").strip()
-    if affected_raw.lower() in analysis_columns.BLANK_STATUS_VALUES:
+    if analysis_columns.blank_to_none(affected_raw) is None:
         affected_raw = affected_lookup.get(sample_id, "unknown") or "unknown"
     if affected_raw.lower() == "affected":
         affected_display = "Affected"
@@ -2126,30 +2188,20 @@ def lowest_catalog_pathogenic_min(disease_locus):
 def compute_known_disease_info(row, lookups):
     """Look up known-disease-locus info for a locus.
 
-    Looks the locus up by LocusId and by coordinates in the variant catalog first, then matches
-    it the way the build does (locus_annotations.find_matching_disease_locus). Returns a dict
-    with disease info or None when no match is found.
+    Matches the locus the way the build does (locus_annotations.find_matching_disease_locus), so
+    the locus-detail page, the pathogenic-threshold filter and the build's KnownDiseaseLocus agree.
+    Returns a dict with disease info or None when no match is found.
     """
-    locus_id = row.get("LocusId", "")
-    chrom = row.get("Chrom", "")
-    chrom_key = chrom.replace("chr", "") if chrom else ""
-    start_0based = row.get("Start0Based")
-    end_1based = row.get("End1Based")
-    motif = row.get("Motif", "")
-
-    disease_info = (lookups["locus"].get(locus_id)
-                    or lookups["locus"].get(f"{chrom_key}-{start_0based}-{end_1based}-{motif}"))
-    source = "variant_catalog"
-    if not disease_info:
-        disease_info, source = find_matching_disease_locus(
-            chrom, start_0based, end_1based, motif, lookups["disease_trees"], lookups.get("strchive_trees"))
+    disease_info, source = find_matching_disease_locus(
+        row.get("Chrom", ""), row.get("Start0Based"), row.get("End1Based"), row.get("Motif", ""),
+        lookups["disease_trees"], lookups.get("strchive_trees"))
 
     if not disease_info:
         return None
 
     if source == "STRchive":
         return {
-            "locus_id": disease_info.get("locus_id", disease_info.get("id")),
+            "locus_id": disease_info.get("id"),
             "pathogenic_min": disease_info.get("pathogenic_min"),
             # Every record in the shipped STRchive file stores inheritance as a list, but an
             # older cached file may store a bare string, so accept both and always report the
@@ -2391,35 +2443,43 @@ def get_annotations(locus_id):
 
 
 # Flask serves requests on several threads, so two annotation writes can overlap, and DuckDB raises
-# on a second concurrent writer instead of waiting for it. Every write to the annotations database
-# therefore runs under this one process-wide lock, which is enough because that database is only
-# ever written from here.
+# on a second concurrent writer instead of waiting for it. Every write to the annotations database,
+# and the matching change to the in-memory copy in app.config["ANNOTATIONS"], therefore runs under
+# this one process-wide lock, which is enough because that database is only ever written from here.
 ANNOTATION_WRITE_LOCK = threading.Lock()
 
 
-def execute_annotation_write(statement, values):
-    """Run one write against the annotations database, serialized against the other writers.
+def execute_annotation_write(statement, values, update_cached_annotations):
+    """Run one write against the annotations database and apply it to the in-memory copy.
+
+    Both run under ANNOTATION_WRITE_LOCK, so overlapping writes change the in-memory copy in the
+    order they were committed, and it always matches the database.
 
     Args:
         statement: The SQL statement to run.
         values: Its bind parameters.
+        update_cached_annotations: Function that takes app.config["ANNOTATIONS"], makes the same
+            change to it, and returns the route's response data. Called only when the write
+            succeeded.
 
     Returns:
-        None when the write succeeded, or a string describing why it failed.
+        Tuple (error, response_data): error is None when the write succeeded, or a string
+        describing why it failed; response_data is what update_cached_annotations returned, or
+        None when the write failed.
     """
     with ANNOTATION_WRITE_LOCK:
         try:
             conn = duckdb_compat.connect(app.config["ANNOTATIONS_DB_PATH"])
         except Exception as e:
-            return str(e)
+            return str(e), None
         try:
             conn.execute(statement, values)
             conn.commit()
         except Exception as e:
-            return str(e)
+            return str(e), None
         finally:
             conn.close()
-    return None
+        return None, update_cached_annotations(app.config["ANNOTATIONS"])
 
 
 @app.route("/api/v1/annotations/<path:locus_id>/note", methods=["PUT"])
@@ -2431,26 +2491,34 @@ def upsert_note(locus_id):
         return jsonify({"error": "note_text is required and cannot be empty"}), 400
 
     now = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
-    error = execute_annotation_write(
+
+    def update_cached_annotations(annotations):
+        annotations["notes"][locus_id] = {"note_text": note_text, "updated_at": now}
+        return {"locus_id": locus_id, "note": dict(annotations["notes"][locus_id])}
+
+    error, response_data = execute_annotation_write(
         "INSERT INTO notes (locus_id, note_text, created_at, updated_at) VALUES (?, ?, ?, ?) "
         "ON CONFLICT(locus_id) DO UPDATE SET note_text=excluded.note_text, updated_at=excluded.updated_at",
         (locus_id, note_text, now, now),
+        update_cached_annotations,
     )
     if error:
         return jsonify({"error": "Could not save the note", "detail": error}), 500
-
-    app.config["ANNOTATIONS"]["notes"][locus_id] = {"note_text": note_text, "updated_at": now}
-    return jsonify({"locus_id": locus_id, "note": app.config["ANNOTATIONS"]["notes"][locus_id]})
+    return jsonify(response_data)
 
 
 @app.route("/api/v1/annotations/<path:locus_id>/note", methods=["DELETE"])
 def delete_note(locus_id):
     """Delete a note for a locus."""
-    error = execute_annotation_write("DELETE FROM notes WHERE locus_id = ?", (locus_id,))
+    def update_cached_annotations(annotations):
+        annotations["notes"].pop(locus_id, None)
+        return {"locus_id": locus_id, "deleted": True}
+
+    error, response_data = execute_annotation_write(
+        "DELETE FROM notes WHERE locus_id = ?", (locus_id,), update_cached_annotations)
     if error:
         return jsonify({"error": "Could not delete the note", "detail": error}), 500
-    app.config["ANNOTATIONS"]["notes"].pop(locus_id, None)
-    return jsonify({"locus_id": locus_id, "deleted": True})
+    return jsonify(response_data)
 
 
 @app.route("/api/v1/annotations/<path:locus_id>/tags", methods=["POST"])
@@ -2462,40 +2530,43 @@ def add_tag(locus_id):
         return jsonify({"error": "tag is required and cannot be empty"}), 400
 
     now = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
-    error = execute_annotation_write(
+
+    def update_cached_annotations(annotations):
+        annotations["tags"].setdefault(locus_id, [])
+        if tag not in annotations["tags"][locus_id]:
+            annotations["tags"][locus_id].append(tag)
+        annotations["tag_to_loci"].setdefault(tag, set()).add(locus_id)
+        annotations["all_tags"] = sorted(annotations["tag_to_loci"].keys())
+        return {"locus_id": locus_id, "tags": list(annotations["tags"][locus_id])}
+
+    error, response_data = execute_annotation_write(
         "INSERT OR IGNORE INTO tags (locus_id, tag, created_at) VALUES (?, ?, ?)",
-        (locus_id, tag, now))
+        (locus_id, tag, now), update_cached_annotations)
     if error:
         return jsonify({"error": "Could not add the tag", "detail": error}), 500
-
-    annotations = app.config["ANNOTATIONS"]
-    annotations["tags"].setdefault(locus_id, [])
-    if tag not in annotations["tags"][locus_id]:
-        annotations["tags"][locus_id].append(tag)
-    annotations["tag_to_loci"].setdefault(tag, set()).add(locus_id)
-    annotations["all_tags"] = sorted(annotations["tag_to_loci"].keys())
-    return jsonify({"locus_id": locus_id, "tags": annotations["tags"][locus_id]})
+    return jsonify(response_data)
 
 
 @app.route("/api/v1/annotations/<path:locus_id>/tags/<path:tag>", methods=["DELETE"])
 def remove_tag(locus_id, tag):
     """Remove a user tag from a locus."""
-    error = execute_annotation_write(
-        "DELETE FROM tags WHERE locus_id = ? AND tag = ?", (locus_id, tag))
+    def update_cached_annotations(annotations):
+        if locus_id in annotations["tags"]:
+            annotations["tags"][locus_id] = [t for t in annotations["tags"][locus_id] if t != tag]
+            if not annotations["tags"][locus_id]:
+                del annotations["tags"][locus_id]
+        if tag in annotations["tag_to_loci"]:
+            annotations["tag_to_loci"][tag].discard(locus_id)
+            if not annotations["tag_to_loci"][tag]:
+                del annotations["tag_to_loci"][tag]
+        annotations["all_tags"] = sorted(annotations["tag_to_loci"].keys())
+        return {"locus_id": locus_id, "tags": list(annotations["tags"].get(locus_id, []))}
+
+    error, response_data = execute_annotation_write(
+        "DELETE FROM tags WHERE locus_id = ? AND tag = ?", (locus_id, tag), update_cached_annotations)
     if error:
         return jsonify({"error": "Could not remove the tag", "detail": error}), 500
-
-    annotations = app.config["ANNOTATIONS"]
-    if locus_id in annotations["tags"]:
-        annotations["tags"][locus_id] = [t for t in annotations["tags"][locus_id] if t != tag]
-        if not annotations["tags"][locus_id]:
-            del annotations["tags"][locus_id]
-    if tag in annotations["tag_to_loci"]:
-        annotations["tag_to_loci"][tag].discard(locus_id)
-        if not annotations["tag_to_loci"][tag]:
-            del annotations["tag_to_loci"][tag]
-    annotations["all_tags"] = sorted(annotations["tag_to_loci"].keys())
-    return jsonify({"locus_id": locus_id, "tags": annotations["tags"].get(locus_id, [])})
+    return jsonify(response_data)
 
 
 # ---------------------------------------------------------------------------
@@ -3061,12 +3132,12 @@ def row_to_export_dict(row, ot, tags_by_locus):
 def export_json(conn, query, count_query, sql_params, ot, params):
     """JSON format: {"metadata": {...}, "loci": [...]}.
 
-    Every locus is always enriched with a "Samples" key listing every qualifying
-    outlier sample (allele size, sample/family id, sex, ancestry, affected/analysis
-    status, phenotype, and phenotype-similarity scores), whatever the size of the
-    result set. The exported loci's phenotype scores are bulk-loaded
-    once up front (fetch_per_outlier_phenotype_scores_of_loci) rather than per row. Rows
-    still stream from the cursor.
+    A locus with qualifying outlier samples (build_sample_details) gets a "Samples" key listing
+    each of them (allele size, sample/family id, sex, ancestry, affected/analysis status,
+    phenotype, and phenotype-similarity scores); a locus without any has no "Samples" key. The
+    exported loci's phenotype scores are bulk-loaded once up front
+    (fetch_per_outlier_phenotype_scores_of_loci) rather than per row. Rows still stream from the
+    cursor.
     """
     tags_by_locus = app.config["ANNOTATIONS"]["tags"]
     lookups = app.config["LOOKUPS"]
@@ -3157,9 +3228,10 @@ def compute_plot_thresholds(row_dict, all_allele_outliers_str, short_allele_outl
 def export_expansion_hunter(conn, query, count_query, sql_params, ot, params):
     """ExpansionHunter variant catalog format, streamed.
 
-    Every locus carries its read-visualization thresholds (compute_plot_thresholds) and its
-    qualifying outlier samples (build_sample_details), whatever the size of the export. As in
-    export_json, the exported loci's phenotype scores are loaded once up front rather than per row.
+    A locus gets a "PlotReadVisualization" key when it has read-visualization thresholds
+    (compute_plot_thresholds), and a "Samples" key when it has qualifying outlier samples
+    (build_sample_details); a locus without them lacks that key. As in export_json, the exported
+    loci's phenotype scores are loaded once up front rather than per row.
     """
     tags_by_locus = app.config["ANNOTATIONS"]["tags"]
     lookups = app.config["LOOKUPS"]
@@ -3299,10 +3371,9 @@ def get_swim_plot_data():
       * the sample-level filters (SAMPLE_LEVEL_FILTERS) keep the rows of the matching samples;
       * the SWIM_PLOT_ALLELE_LEVEL_FILTERS compare each row's own allele, where /api/v1/loci
         compares the locus's largest affected allele;
-      * every other filter keeps the rows of the loci /api/v1/loci returns for the parameters
-        without those two kinds (build_locus_filter_clauses). min_repeats_above_population
-        therefore compares every population cohort, as /api/v1/loci does without
-        require_above_population.
+      * every other filter keeps the rows of the loci /api/v1/loci returns for it
+        (build_locus_filter_clauses), reading the same parameters: min_repeats_above_population
+        compares the cohorts require_above_population names, as the results table does.
     """
     params, error = validate_params()
     if error:
@@ -3362,7 +3433,7 @@ def get_swim_plot_data():
     # columns, and this endpoint runs one query per motif category, so the matching loci are picked
     # once, into the swim_plot_matching_loci temp table, after the connection is opened.
     locus_filter_clauses, locus_filter_params = build_locus_filter_clauses(
-        {k: v for k, v in params.items() if k not in SAMPLE_LEVEL_FILTERS + SWIM_PLOT_ALLELE_LEVEL_FILTERS})
+        params, filters_applied_elsewhere=SAMPLE_LEVEL_FILTERS + SWIM_PLOT_ALLELE_LEVEL_FILTERS)
     if locus_filter_clauses:
         row_clauses.append("swim_plot.LocusId IN (SELECT LocusId FROM swim_plot_matching_loci)")
 
@@ -3710,8 +3781,8 @@ def configure_app(db_path, sample_table=None, known_loci_json=None,
     db_path = os.path.abspath(db_path)
     app.config["DB_PATH"] = db_path
 
-    # Sample metadata (optional).
-    if sample_table and os.path.exists(sample_table):
+    # Sample metadata (optional; main() has checked that a supplied path exists).
+    if sample_table:
         sample_lookup, affected_lookup, analysis_lookup = load_sample_table(sample_table)
     else:
         sample_lookup, affected_lookup, analysis_lookup = {}, {}, {}
@@ -3720,23 +3791,17 @@ def configure_app(db_path, sample_table=None, known_loci_json=None,
     # supplied, adds the detail-page fallback. Either catalog is enough on its own:
     # load_known_disease_loci takes filepath=None to load only the STRchive fallback, so a
     # STRchive-only invocation still gets its disease details.
-    known_loci_path = known_loci_json if known_loci_json and os.path.exists(known_loci_json) else None
-    strchive_path = strchive_loci_json if strchive_loci_json and os.path.exists(strchive_loci_json) else None
-    if known_loci_path or strchive_path:
-        disease_trees, strchive_trees, locus_lookup = load_known_disease_loci(
-            known_loci_path,
-            strchive_filepath=strchive_path,
-            build_locus_lookup=True,
-        )
+    if known_loci_json or strchive_loci_json:
+        disease_trees, strchive_trees = load_known_disease_loci(
+            known_loci_json, strchive_filepath=strchive_loci_json)
     else:
-        disease_trees, strchive_trees, locus_lookup = {}, {}, {}
+        disease_trees, strchive_trees = {}, {}
 
     app.config["LOOKUPS"] = {
         "sample": sample_lookup,
         "affected": affected_lookup,
         "analysis": analysis_lookup,
         "disease_trees": disease_trees,
-        "locus": locus_lookup,
         "strchive_trees": strchive_trees,
     }
 
@@ -3850,6 +3915,11 @@ def configure_app(db_path, sample_table=None, known_loci_json=None,
 def main():
     args = parse_args()
     validate_database(args.db)
+    exit_if_a_supplied_input_file_is_missing({
+        "--sample-table": args.sample_table,
+        "--known-loci-json": args.known_loci_json,
+        "--strchive-loci-json": args.strchive_loci_json,
+    })
 
     print(f"Loading database: {args.db}")
     if args.sample_table:

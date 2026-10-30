@@ -7,9 +7,12 @@ PyhpoUnknownTermTests builds and uses the real pyhpo ontology, and is skipped wh
 pyhpo is not installed.
 """
 
+import os
+import tempfile
 import unittest
 
 import analysis_columns
+import input_tables
 import phenotype_scoring
 from phenotype_scoring import (
     OUTLIER_TYPE_INHERITANCE,
@@ -348,6 +351,33 @@ class ComputePhenotypeScoresTests(ForceJaccardTestCase):
         self.assertIsNone(locus_row["max_gene_phenotype_similarity"])
         # pairwise still computed.
         self.assertEqual(locus_row["sum_pairwise_similarity"], 1.0)
+
+    def test_mixed_case_gene_symbol_is_matched_case_insensitively(self):
+        # HPO's genes_to_phenotype.txt writes the HGNC symbol "C9orf72", while genelookup's gene
+        # table upper-cases it to "C9ORF72"; the ALS/FTD repeat locus must still be scored.
+        handle = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        handle.write("ncbi_gene_id\tgene_symbol\thpo_id\thpo_name\tfrequency\tdisease_id\n"
+                     "203228\tC9orf72\tHP:0000006\tAutosomal dominant inheritance\t-\tOMIM:105550\n"
+                     "203228\tC9orf72\tHP:A\tphenotype A\t-\tOMIM:105550\n"
+                     "203228\tC9orf72\tHP:B\tphenotype B\t-\tOMIM:105550\n")
+        handle.close()
+        self.addCleanup(os.remove, handle.name)
+        gene_disease_data = input_tables.read_gene_disease_phenotypes(handle.name)
+        affected, analysis = self._lookups()
+        participant_to_hpo = {"s1": {"HP:A", "HP:B"}, "s2": {"HP:A", "HP:B"}, "s3": {"HP:C"}}
+
+        for gene_table_symbol in ("C9ORF72", "C9orf72"):
+            records = self._records()
+            per_outlier, _ = compute_phenotype_scores(
+                records, participant_to_hpo, {"ENSG_X": {"gene_symbol": gene_table_symbol}},
+                gene_disease_data, affected, analysis)
+            all_alleles_rows = [r for r in per_outlier if r["outlier_type"] == "AllAlleles"]
+            self.assertEqual([r["gene_phenotype_similarity"] for r in all_alleles_rows],
+                             [1.0, 1.0, 0.0], gene_table_symbol)
+            self.assertEqual(all_alleles_rows[0]["best_matching_disease"], "OMIM:105550")
+            # The rows keep the gene table's spelling of the symbol.
+            self.assertEqual(all_alleles_rows[0]["gene_symbol"], gene_table_symbol)
+            self.assertEqual(records[0]["MaxGenePhenoSim_AllAlleles"], 1.0)
 
 
 @unittest.skipUnless(pyhpo_is_installed(), "pyhpo is not installed")

@@ -1,9 +1,12 @@
 """Unit tests for trails_launcher.py, the launcher the top-level trails.py hands over to."""
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -117,7 +120,8 @@ class VirtualEnvironmentTests(unittest.TestCase):
     def run_check(self, prefix, environment_works):
         """Returns the os.execv arguments the check would use, or None if it returned."""
         with mock.patch.object(trails_launcher.sys, "prefix", prefix), \
-                mock.patch.object(trails_launcher, "virtual_environment_python_works", return_value=environment_works), \
+                mock.patch.object(trails_launcher, "virtual_environment_python_and_pip_work",
+                                  return_value=environment_works), \
                 mock.patch.object(trails_launcher.subprocess, "run") as run, \
                 mock.patch.object(trails_launcher.os, "execv") as execv:
             run.return_value.returncode = 0
@@ -144,6 +148,34 @@ class VirtualEnvironmentTests(unittest.TestCase):
         # remove the marker too, or no later run would try to install them again.
         self.assertEqual(os.path.dirname(trails_launcher.OPTIONAL_INSTALL_MARKER),
                          trails_launcher.VIRTUAL_ENVIRONMENT_DIRECTORY)
+
+
+class VirtualEnvironmentHealthCheckTests(unittest.TestCase):
+    """An environment counts as working only if its Python starts and can import pip."""
+
+    def check(self, python_path):
+        with mock.patch.object(trails_launcher, "VIRTUAL_ENVIRONMENT_PYTHON", python_path):
+            return trails_launcher.virtual_environment_python_and_pip_work()
+
+    def test_a_missing_python_does_not_work(self):
+        self.assertFalse(self.check("/nonexistent/.venv/bin/python"))
+
+    def test_an_environment_left_without_pip_does_not_work(self):
+        # What `python3 -m venv` leaves on Debian or Ubuntu without python3-venv: the interpreter
+        # is created, then installing pip fails. Such an environment has to be recreated, or
+        # every later pip install in it fails with "No module named pip".
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        environment = os.path.join(directory, ".venv")
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", environment], check=True)
+        python_path = os.path.join(environment, "bin", "python")
+        self.assertEqual(subprocess.run([python_path, "-c", "import sys"]).returncode, 0)
+        self.assertFalse(self.check(python_path))
+
+    def test_a_python_that_can_import_pip_works(self):
+        if importlib.util.find_spec("pip") is None:
+            self.skipTest("the Python running the tests has no pip")
+        self.assertTrue(self.check(sys.executable))
 
 
 class InitialRequireAbovePopulationTests(unittest.TestCase):

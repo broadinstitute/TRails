@@ -174,9 +174,11 @@ mkdir -p "$REF_DIR"
 # the PATH: recent Homebrew and Linux system Pythons refuse pip installs outside a virtual
 # environment ("externally-managed-environment"). trails.py re-runs itself with .venv's Python.
 # An environment whose base Python has since been removed (e.g. by a Homebrew upgrade) no longer
-# starts, so it is rebuilt.
+# starts, and one whose creation stopped part way has a Python but no pip (on Debian or Ubuntu
+# without python3-venv, venv creates the interpreter and then fails to install pip). Either kind
+# is rebuilt.
 VENV_PYTHON="$TRAILS_DIR/.venv/bin/python"
-if ! "$VENV_PYTHON" -c "import sys" >/dev/null 2>&1; then
+if ! "$VENV_PYTHON" -c "import pip" >/dev/null 2>&1; then
   echo "Creating a Python virtual environment in $TRAILS_DIR/.venv ..."
   python3 -m venv --clear "$TRAILS_DIR/.venv" || {
     echo "ERROR: could not create a Python virtual environment. On Debian or Ubuntu, install the" >&2
