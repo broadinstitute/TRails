@@ -1,14 +1,13 @@
 """Unit tests for input_tables.py."""
 
-import gzip
-import os
-import tempfile
+import re
 import unittest
 
 import pandas
 
 import analysis_columns
 import input_tables
+from tests.temp_file_helpers import write_temporary_file
 
 
 class NormalizeColumnNameTests(unittest.TestCase):
@@ -35,29 +34,10 @@ class MatchColumnsTests(unittest.TestCase):
         self.assertEqual(matches["sample_id"], "sample_id")
 
 
-def _write(test_case, text, suffix=".tsv"):
-    """Write text to a temporary file that is removed when test_case finishes.
-
-    Args:
-        test_case: The running unittest.TestCase, which registers the cleanup.
-        text: The file contents.
-        suffix: The file name suffix; a name ending in ".gz" is written gzipped.
-
-    Returns:
-        The file's path.
-    """
-    handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-    handle.close()
-    test_case.addCleanup(os.remove, handle.name)
-    with (gzip.open if suffix.endswith(".gz") else open)(handle.name, "wt") as output_file:
-        output_file.write(text)
-    return handle.name
-
-
 def _write_tsv(test_case, rows, header):
-    """Write a header line and rows as a temporary TSV (see _write) and return its path."""
-    return _write(test_case, "".join("\t".join(str(cell) for cell in line) + "\n"
-                                     for line in [header] + rows))
+    """Write a header line and rows as a temporary TSV (see write_temporary_file) and return its path."""
+    return write_temporary_file(test_case, "".join("\t".join(str(cell) for cell in line) + "\n"
+                                                   for line in [header] + rows))
 
 
 class ReadRepeatCopyNumbersTests(unittest.TestCase):
@@ -75,7 +55,7 @@ class ReadRepeatCopyNumbersTests(unittest.TestCase):
         self.assertEqual(locus_rows[0]["genotypes"], {"SampleA": "12,40", "SampleB": "21"})
 
     def test_gzip_read(self):
-        path = _write(self, "trid\tmotif\tS1\nchr2-5-11-AAT\tAAT\t3\n", suffix=".tsv.gz")
+        path = write_temporary_file(self, "trid\tmotif\tS1\nchr2-5-11-AAT\tAAT\t3\n", suffix=".tsv.gz")
         locus_rows, sample_ids = input_tables.read_repeat_copy_numbers(path)
         self.assertEqual(sample_ids, ["S1"])
         self.assertEqual(locus_rows[0]["genotypes"], {"S1": "3"})
@@ -210,6 +190,34 @@ class ReadGeneTableTests(unittest.TestCase):
         self.assertEqual(gene_lookup["ENSG1"]["gene_symbol"], "FMR1")
         self.assertEqual(gene_lookup["ENSG1"]["inheritance"], "AD")
 
+    def test_header_spellings_dot_cells_and_numeric_hgnc_ids(self):
+        # Headers match case/underscore-insensitively; "." is a missing value (a literal "."
+        # pLI would make add_gene_columns fail on float(".")); and a blank cell, which upcasts
+        # the hgnc_gene_id column to float, must not turn 1100 into "1100.0".
+        path = _write_tsv(
+            self,
+            [["ENSG1", "FMR1", ".", "0.95", "1100"], ["ENSG2", "HTT", "0.5", ".", ""]],
+            ["Gene_ID", "gene symbol", "PLI_V4", "pLI_v2", "hgnc_gene_id"],
+        )
+        gene_lookup = input_tables.read_gene_table(path)
+        self.assertEqual(set(gene_lookup["ENSG1"]), {"gene_symbol", "pLI_v2", "pLI_v4", "hgnc_gene_id"})
+        self.assertEqual(gene_lookup["ENSG1"]["gene_symbol"], "FMR1")
+        self.assertTrue(pandas.isna(gene_lookup["ENSG1"]["pLI_v4"]))
+        self.assertEqual(gene_lookup["ENSG1"]["pLI_v2"], 0.95)
+        self.assertTrue(pandas.isna(gene_lookup["ENSG2"]["pLI_v2"]))
+        self.assertEqual(gene_lookup["ENSG1"]["hgnc_gene_id"], "1100")
+        self.assertTrue(pandas.isna(gene_lookup["ENSG2"]["hgnc_gene_id"]))
+
+    def test_gene_id_on_more_than_one_row_is_rejected(self):
+        # A gene-disease table with one row per gene-disease pair; the rows disagree.
+        path = _write_tsv(
+            self,
+            [["ENSG1", "FMR1", "AD"], ["ENSG1", "FMR1", "AR"], ["ENSG2", "HTT", "AD"]],
+            ["gene_id", "gene_symbol", "inheritance"],
+        )
+        with self.assertRaisesRegex(ValueError, f"Gene table {re.escape(path)} lists 1 gene_id .*: ENSG1\\. "):
+            input_tables.read_gene_table(path)
+
 
 class ReadGeneDiseasePhenotypesTests(unittest.TestCase):
 
@@ -248,7 +256,7 @@ class CoerceAnnotationValueTests(unittest.TestCase):
         self.assertEqual(input_tables._coerce_annotation_value("CAG"), "CAG")
 
     def test_dot_in_population_column_does_not_survive(self):
-        path = _write(
+        path = write_temporary_file(
             self,
             "trid\tmotif\tHPRC256_99thPercentile\tS1\n"
             "chr1-100-115-CAG\tCAG\t.\t12,40\n")
@@ -261,7 +269,7 @@ class InheritanceHPOTermsTests(unittest.TestCase):
     """Inheritance HPO terms without a Mendelian code enter neither the inheritance set nor the phenotypes."""
 
     def test_unmapped_inheritance_term_dropped(self):
-        path = _write(
+        path = write_temporary_file(
             self,
             "ncbi_gene_id\tgene_symbol\thpo_id\thpo_name\tfrequency\tdisease_id\n"
             "1\tADD1\tHP:0001426\tNon-Mendelian\t-\tOMIM:145500\n"   # unmapped -> dropped
@@ -278,7 +286,7 @@ class InheritanceHPOTermsTests(unittest.TestCase):
         # The ATXN3 rows of genes_to_phenotype.txt (v2025-05-06) list genetic anticipation
         # alongside the mode of inheritance; both are descendants of HP:0000005 Mode of
         # inheritance, so only the ataxia remains a phenotype to compare patients against.
-        path = _write(
+        path = write_temporary_file(
             self,
             "ncbi_gene_id\tgene_symbol\thpo_id\thpo_name\tfrequency\tdisease_id\n"
             "4287\tATXN3\tHP:0000006\tAutosomal dominant inheritance\t-\tOMIM:109150\n"
@@ -294,16 +302,16 @@ class AnnotationColumnPrefixTests(unittest.TestCase):
     """A sample column named like a cohort must not be swallowed as annotation."""
 
     def test_bare_cohort_sample_ids_are_samples(self):
-        self.assertIsNone(input_tables._is_annotation_column("AoU_0001"))
-        self.assertIsNone(input_tables._is_annotation_column("HG002"))
+        self.assertIsNone(input_tables._get_canonical_annotation_column_name_or_none("AoU_0001"))
+        self.assertIsNone(input_tables._get_canonical_annotation_column_name_or_none("HG002"))
 
     def test_real_cohort_stat_columns_still_recognized(self):
         for column in ("HPRC256_99thPercentile", "AoU1027_MaxAllele",
                        "TenK10K_MaxAllele", "TRExplorerMotif"):
-            self.assertEqual(input_tables._is_annotation_column(column), column)
+            self.assertEqual(input_tables._get_canonical_annotation_column_name_or_none(column), column)
 
     def test_aou_sample_column_kept_as_sample(self):
-        path = _write(
+        path = write_temporary_file(
             self,
             "trid\tmotif\tAoU_0001\tHG002\n"
             "chr1-100-115-CAG\tCAG\t5,60\t5,6\n")
@@ -315,7 +323,7 @@ class AnnotationColumnClassificationTests(unittest.TestCase):
     """Recognized annotation columns annotate the locus instead of being read as samples."""
 
     def test_annotation_columns_separated_from_samples(self):
-        path = _write(
+        path = write_temporary_file(
             self,
             "trid\tmotif\tgene_id\tHPRC256_99thPercentile\tSAMPLE_A\tSAMPLE_B\n"
             "chr1-100-115-CAG\tCAG\tENSG001\t30\t12,40\t11,12\n")
@@ -329,8 +337,20 @@ class AnnotationColumnClassificationTests(unittest.TestCase):
         self.assertEqual(row["extra_columns"]["gene_id"], "ENSG001")
         self.assertEqual(row["extra_columns"]["HPRC256_99thPercentile"], 30)
 
+    def test_cohort_stat_header_is_stored_under_its_canonical_spelling(self):
+        # get_population_p99_threshold reads the exact OUTPUT_COLUMNS name, so a lowercase or
+        # underscored header must not become a separate raw column that no longer gates.
+        path = write_temporary_file(
+            self,
+            "trid\tmotif\thprc256_99thpercentile\tTenK10K_99th_Percentile\tS1\n"
+            "chr1-100-115-CAG\tCAG\t30\t25\t12,40\n")
+        locus_rows, sample_id_list = input_tables.read_repeat_copy_numbers(path)
+        self.assertEqual(sample_id_list, ["S1"])
+        self.assertEqual(locus_rows[0]["extra_columns"],
+                         {"HPRC256_99thPercentile": 30, "TenK10K_99thPercentile": 25})
+
     def test_gencode_alias_and_case_insensitive(self):
-        path = _write(
+        path = write_temporary_file(
             self,
             "trid\tmotif\tGencodeGeneId\tGencode_Gene_Region\tS1\n"
             "chr1-100-115-CAG\tCAG\tENSG9\tCDS\t10,10\n")

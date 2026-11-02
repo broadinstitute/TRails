@@ -146,13 +146,7 @@ function createChartsForSection(containerId, data, bins, section) {
     // a measured 0% violation rate, so drop it rather than plotting a dot and folding it into the
     // box statistics, percentiles and shared scale below.
     const measured = data.filter(item => item.total > 0);
-
-    // Group data by bin
-    const binData = {};
-    bins.forEach(bin => { binData[bin] = []; });
-    measured.forEach(item => {
-        if (binData[item.bin] !== undefined) binData[item.bin].push(item);
-    });
+    const binData = groupRowsByBin(measured, bins);
 
     // Compute global max across all bins for shared y-axis (round up to nearest 5%)
     const allFractions = measured.map(d => d.fraction);
@@ -179,39 +173,14 @@ function createChartsForSection(containerId, data, bins, section) {
 }
 
 // Fetch data and render charts
-async function loadQC2Data() {
-    try {
-        const response = await fetch(`${API_BASE_URL}/qc2_data`);
-        if (!response.ok) throw await errorFromResponse(response);
-        const data = await response.json();
+drawQCPageOnLoad('qc2_data', 'QC2 data', ['section-motif', 'section-chrom', 'section-center-motif', 'section-center-chrom'], data => {
+    // Per-sample charts
+    createChartsForSection('motif-charts-row', data.by_motif || [], MOTIF_BINS, TRIO_SECTION);
+    createChartsForSection('chrom-charts-row', data.by_chrom || [], CHROM_BINS, TRIO_SECTION);
 
-        // Hide loading, show sections
-        document.getElementById('qc-loading').style.display = 'none';
-        document.getElementById('section-motif').style.display = 'block';
-        document.getElementById('section-chrom').style.display = 'block';
-        document.getElementById('section-center-motif').style.display = 'block';
-        document.getElementById('section-center-chrom').style.display = 'block';
-
-        // Create per-sample charts
-        createChartsForSection('motif-charts-row', data.by_motif || [], MOTIF_BINS, TRIO_SECTION);
-        createChartsForSection('chrom-charts-row', data.by_chrom || [], CHROM_BINS, TRIO_SECTION);
-
-        // Create center-aggregated charts
-        createChartsForSection('center-motif-charts-row', data.by_center_motif || [], MOTIF_BINS, CENTER_SECTION);
-        createChartsForSection('center-chrom-charts-row', data.by_center_chrom || [], CHROM_BINS, CENTER_SECTION);
-
-    } catch (err) {
-        console.error('QC2 load error:', err);
-        document.getElementById('qc-loading').style.display = 'none';
-        document.getElementById('qc-error').style.display = 'block';
-        document.getElementById('qc-error').textContent = 'Failed to load QC2 data: ' + err.message;
-    }
-}
-
-
-// Initialize on page load
-document.addEventListener('DOMContentLoaded', function() {
-    loadQC2Data();
+    // Center-aggregated charts
+    createChartsForSection('center-motif-charts-row', data.by_center_motif || [], MOTIF_BINS, CENTER_SECTION);
+    createChartsForSection('center-chrom-charts-row', data.by_center_chrom || [], CHROM_BINS, CENTER_SECTION);
 });
 </script>
 

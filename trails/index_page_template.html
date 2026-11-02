@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html>
+{%- from "filter_control_macros.html" import gene_region_checkboxes, population_filter_field %}
 {% include "header_template.html" %}
 
 <div class="ui grid">
@@ -81,36 +82,12 @@
     </div>
 
     <!-- Require Affected Allele > Population Alleles -->
-    <div class="field">
-        <label style="display: inline;">Require Affected Allele &gt; Population Allele</label><span style="display:inline-block; margin-bottom:10px; margin-left: 4px; font-weight: normal;">( <label style="font-weight: normal; cursor: pointer;"><input type="radio" name="population_metric" value="99th" checked style="vertical-align: middle;"> 99th % </label> <label style="font-weight: normal; cursor: pointer; margin-left: 5px;"><input type="radio" name="population_metric" value="max" style="vertical-align: middle;"> max</label> <i class="question circle outline icon help-popup" style="color: #999; cursor: pointer;" data-variation="wide" data-position="top center" data-html="<b>99th %:</b> require the affected allele to exceed each population dataset's 99th-percentile allele size at a given locus. <br /><br /><b>max:</b> require it to exceed each dataset's largest observed allele at a given locus. This is a more stringent filter, but also more susceptible to noise if the max allele in one of the population datasets was overestimated."></i>)</span>
-        <div class="radio-group">
-            <div class="ui radio checkbox">
-                <input type="radio" name="require_above_population" value="" checked>
-                <label>No</label>
-            </div>
-            <div class="ui radio checkbox">
-                <input type="radio" name="require_above_population" value="long-read">
-                <label>Long-read (HPRC256, AoU1027)</label>
-            </div>
-            <div class="ui radio checkbox">
-                <input type="radio" name="require_above_population" value="short-read">
-                <label>Short-read (TenK10K)</label>
-            </div>
-            <div class="ui radio checkbox">
-                <input type="radio" name="require_above_population" value="all">
-                <label>All (long-read and TenK10K)</label>
-            </div>
-        </div>
-        <div class="ui checkbox" style="margin-top: 0.5em; margin-left: 1em;">
-            <input type="checkbox" name="include_loci_without_population_data">
-            <label>Also show loci without population data</label>
-        </div>
-    </div>
+    {{ population_filter_field('', 'name') | indent(4) }}
 
     <!-- Group Results By: one row per locus, or per unsolved affected sample or family -->
     <div class="field">
         {# The cohort names are escaped twice in data-html: the attribute decodes one level, and the popup inserts the rest as HTML #}
-        <label style="display: inline;">Group Results By</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="<b>Locus:</b> one row per locus, expanding to the samples at that locus.<br /><br /><b>Unsolved affected sample / family:</b> one row per sample (or family) that <b>#Aff</b> counts at one or more of the loci matching the filters, i.e. affected and not solved, with an allele larger than every unaffected or solved sample's and above the 99th percentiles of the population cohorts the database was built with ({{ population_gate_cohorts | join(', ') | forceescape | forceescape }}). A row expands to those loci.<br /><br />The Sample Id and Phenotype filters then pick the samples (in the family view, the families with such a sample) instead of the loci."></i>
+        <label style="display: inline;">Group Results By</label><i class="question circle outline icon help-popup" style="color: #999; cursor: pointer; margin-left: 2px;" data-variation="wide" data-position="top center" data-html="<b>Locus:</b> one row per locus, expanding to the samples at that locus.<br /><br /><b>Unsolved affected sample / family:</b> one row per sample (or family) that <b>#Aff</b> counts at one or more of the loci matching the filters, i.e. neither unaffected nor solved (a sample with an unknown affected status counts too), with an allele larger than every unaffected or solved sample's and above the 99th percentiles of the population cohorts the database was built with ({{ population_gate_cohorts | join(', ') | forceescape | forceescape }}). A row expands to those loci.<br /><br />The Sample Id and Phenotype filters then pick the samples (in the family view, the families with such a sample) instead of the loci."></i>
         <div class="radio-group">
             <div class="ui radio checkbox">
                 <input type="radio" name="group_by" value="locus" checked>
@@ -176,12 +153,7 @@
     <div class="field">
         <label>Include Gene Regions</label>
         <div class="checkbox-group">
-            <div class="ui checkbox"><input type="checkbox" name="gene_region_cds"><label>CDS</label></div>
-            <div class="ui checkbox"><input type="checkbox" name="gene_region_promoter"><label>Promoter</label></div>
-            <div class="ui checkbox"><input type="checkbox" name="gene_region_utr"><label>UTR</label></div>
-            <div class="ui checkbox"><input type="checkbox" name="gene_region_intron"><label>Intron</label></div>
-            <div class="ui checkbox"><input type="checkbox" name="gene_region_exon"><label>Exon</label></div>
-            <div class="ui checkbox"><input type="checkbox" name="gene_region_intergenic"><label>Intergenic</label></div>
+            {{ gene_region_checkboxes('gene_region_') | indent(12) }}
         </div>
     </div>
 
@@ -189,12 +161,7 @@
     <div class="field">
         <label>Exclude Gene Regions</label>
         <div class="checkbox-group">
-            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_cds"><label>CDS</label></div>
-            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_promoter"><label>Promoter</label></div>
-            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_utr"><label>UTR</label></div>
-            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_intron"><label>Intron</label></div>
-            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_exon"><label>Exon</label></div>
-            <div class="ui checkbox"><input type="checkbox" name="exclude_gene_region_intergenic"><label>Intergenic</label></div>
+            {{ gene_region_checkboxes('exclude_gene_region_') | indent(12) }}
         </div>
     </div>
 
@@ -450,9 +417,14 @@
     </div>
 </div>
 
-{# Shared QC helpers (escapeHtml, renderMendelianWarning, the box-plot stats and the
-   Mendelian-warning popup). Included rather than copied so a fix reaches every page. #}
+{# Shared helpers this page takes from qc_shared_js.html: escapeHtml, isAffectedStatus, the
+   escaping dropdown settings (ESCAPING_ADDITIONS_DROPDOWN_SETTINGS), setupDropdownMenu and
+   getDropdownValue (also called by header_template.html's dropdown helpers), and
+   renderMendelianWarning with its popup. Included rather than copied so a fix reaches every page. #}
 {% include "qc_shared_js.html" %}
+
+{# The note editor (openNoteEditor), shared with the swim plot #}
+{% include "note_editor.html" %}
 
 <script>
 // =========================================================================
@@ -537,18 +509,11 @@ $(document).ready(function() {
         $(this).closest('.ui.message').hide();
     });
 
-    // Initialize tag dropdown
-    $('#tag-filter').dropdown({
-        allowAdditions: false,
-        clearable: true,
-        fullTextSearch: true,
-        maxResults: 10,
-    });
-    // Kept as a promise because the startup restore below has to wait for it: applyStateToUI
-    // selects the saved tag by value, and a 'set selected' for a value the menu does not contain
-    // yet is a silent no-op, so the next Search or Export (both re-read the dropdown through
-    // readStateFromUI) would drop the tag.
-    const tagDropdownReady = refreshTagFilterDropdown($('#tag-filter'));
+    // Initialize tag dropdown. Its fill is kept as a promise because the startup restore below has
+    // to wait for it: applyStateToUI selects the saved tag by value, and a 'set selected' for a
+    // value the menu does not contain yet is a silent no-op, so the next Search or Export (both
+    // re-read the dropdown through readStateFromUI) would drop the tag.
+    const tagDropdownReady = setUpTagFilterDropdown($('#tag-filter'));
 
     // Initialize the Group Results By sort dropdown. Choosing a column also picks its natural
     // direction (GROUP_SORT_NATURAL_DIRECTIONS), which the ASC / DESC radios can then override.
@@ -559,15 +524,8 @@ $(document).ready(function() {
         },
     });
 
-    // Initialize sample ID dropdown. applyStateToUI restores it from the URL, so a typed-in value
-    // is escaped wherever Semantic UI shows it (ESCAPING_ADDITIONS_DROPDOWN_SETTINGS, qc_shared_js.html).
-    $('#sample-id-filter').dropdown({
-        ...ESCAPING_ADDITIONS_DROPDOWN_SETTINGS,
-        allowAdditions: true,
-        clearable: true,
-        fullTextSearch: true,
-        forceSelection: false,
-    });
+    // Initialize sample ID dropdown (applyStateToUI restores it from the URL)
+    setUpSampleIdFilterDropdown($('#sample-id-filter'));
 
     // Initialize add-tag dropdown (in modal)
     $('#add-tag-dropdown').dropdown({
@@ -653,6 +611,18 @@ const DEFAULT_STATE = {
     page: 1,
     page_size: 50,
 };
+
+// The filter controls that applyStateToUI restores from currentState and readStateFromUI reads
+// back, one list per kind of control, so that adding a filter here covers both. Each name is both
+// the input's name and its currentState key.
+const TEXT_FILTER_INPUTS = ['min_expansion', 'min_repeats_threshold', 'min_repeats_above_population',
+                            'min_sigma_percentile', 'motif_size', 'motif',
+                            'phenotype_keyword', 'sample_id_like',
+                            'search', 'max_variation_cluster_size_diff'];
+const CHECKBOX_FILTERS = ['apply_pathogenic_threshold', 'known_loci_only', 'known_motifs_only', 'mendelian_genes_only',
+                          'exclude_vc_depth_filtered', 'exclude_vc_size_filtered', 'include_loci_without_population_data'];
+// [currentState key, name prefix of its checkboxes], e.g. gene_region_cds for 'cds' in gene_regions
+const GENE_REGION_FILTERS = [['gene_regions', 'gene_region_'], ['exclude_gene_regions', 'exclude_gene_region_']];
 
 let currentState = JSON.parse(JSON.stringify(DEFAULT_STATE));
 
@@ -777,25 +747,18 @@ function applyStateToUI() {
     inputsWithValue('population_metric', currentState.population_metric || '99th').prop('checked', true);
 
     // Boolean checkboxes
-    for (const name of ['apply_pathogenic_threshold', 'known_loci_only', 'known_motifs_only', 'mendelian_genes_only',
-                        'exclude_vc_depth_filtered', 'exclude_vc_size_filtered', 'include_loci_without_population_data']) {
+    for (const name of CHECKBOX_FILTERS) {
         const cb = $(`input[name="${name}"]`).parent();
         currentState[name] ? cb.checkbox('check') : cb.checkbox('uncheck');
     }
 
-    // Gene region checkboxes
-    const regions = currentState.gene_regions ? currentState.gene_regions.split(',') : [];
-    for (const r of GENE_REGIONS) {
-        const cb = $(`input[name="gene_region_${r}"]`).parent();
-        regions.includes(r) ? cb.checkbox('check') : cb.checkbox('uncheck');
-    }
-
-    // Exclude gene region checkboxes
-    const exRegions = currentState.exclude_gene_regions
-        ? currentState.exclude_gene_regions.split(',') : [];
-    for (const r of GENE_REGIONS) {
-        const cb = $(`input[name="exclude_gene_region_${r}"]`).parent();
-        exRegions.includes(r) ? cb.checkbox('check') : cb.checkbox('uncheck');
+    // Include and exclude gene region checkboxes
+    for (const [key, namePrefix] of GENE_REGION_FILTERS) {
+        const regions = currentState[key] ? currentState[key].split(',') : [];
+        for (const r of GENE_REGIONS) {
+            const cb = $(`input[name="${namePrefix}${r}"]`).parent();
+            regions.includes(r) ? cb.checkbox('check') : cb.checkbox('uncheck');
+        }
     }
 
     // Tag dropdown
@@ -806,10 +769,7 @@ function applyStateToUI() {
     }
 
     // Text/number inputs
-    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_repeats_above_population',
-                        'min_sigma_percentile', 'motif_size', 'motif',
-                        'phenotype_keyword', 'sample_id_like',
-                        'search', 'max_variation_cluster_size_diff']) {
+    for (const name of TEXT_FILTER_INPUTS) {
         $(`input[name="${name}"]`).val(currentState[name]);
     }
 
@@ -831,36 +791,21 @@ function readStateFromUI() {
     currentState.require_families_above_unaffected = $('input[name="require_families_above_unaffected"]:checked').val() || '';
     currentState.require_above_population = $('input[name="require_above_population"]:checked').val() || '';
     currentState.population_metric = $('input[name="population_metric"]:checked').val() || '99th';
-    currentState.include_loci_without_population_data = $('input[name="include_loci_without_population_data"]').parent().checkbox('is checked');
     currentState.group_by = $('input[name="group_by"]:checked').val() || DEFAULT_STATE.group_by;
     currentState.group_sort = getDropdownValue($('#group-sort-dropdown')) || DEFAULT_STATE.group_sort;
     currentState.group_sort_direction = $('input[name="group_sort_direction"]:checked').val() || DEFAULT_STATE.group_sort_direction;
 
     // Boolean checkboxes
-    currentState.apply_pathogenic_threshold = $('input[name="apply_pathogenic_threshold"]').parent().checkbox('is checked');
-    currentState.known_loci_only = $('input[name="known_loci_only"]').parent().checkbox('is checked');
-    currentState.known_motifs_only = $('input[name="known_motifs_only"]').parent().checkbox('is checked');
-    currentState.mendelian_genes_only = $('input[name="mendelian_genes_only"]').parent().checkbox('is checked');
-    currentState.exclude_vc_depth_filtered = $('input[name="exclude_vc_depth_filtered"]').parent().checkbox('is checked');
-    currentState.exclude_vc_size_filtered = $('input[name="exclude_vc_size_filtered"]').parent().checkbox('is checked');
-
-    // Gene regions
-    const geneRegions = [];
-    for (const r of GENE_REGIONS) {
-        if ($(`input[name="gene_region_${r}"]`).parent().checkbox('is checked')) {
-            geneRegions.push(r);
-        }
+    for (const name of CHECKBOX_FILTERS) {
+        currentState[name] = $(`input[name="${name}"]`).parent().checkbox('is checked');
     }
-    currentState.gene_regions = geneRegions.join(',');
 
-    // Exclude gene regions
-    const exGeneRegions = [];
-    for (const r of GENE_REGIONS) {
-        if ($(`input[name="exclude_gene_region_${r}"]`).parent().checkbox('is checked')) {
-            exGeneRegions.push(r);
-        }
+    // Include and exclude gene regions
+    for (const [key, namePrefix] of GENE_REGION_FILTERS) {
+        currentState[key] = GENE_REGIONS
+            .filter(r => $(`input[name="${namePrefix}${r}"]`).parent().checkbox('is checked'))
+            .join(',');
     }
-    currentState.exclude_gene_regions = exGeneRegions.join(',');
 
     // Sort: currentState.sort_by is maintained directly by the pill/checkbox/header
     // handlers (it is an ordered, comma-separated list), so it is NOT re-read here.
@@ -869,10 +814,7 @@ function readStateFromUI() {
     currentState.tag = getDropdownValue($('#tag-filter'));
 
     // Text/number inputs
-    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_repeats_above_population',
-                        'min_sigma_percentile', 'motif_size', 'motif',
-                        'phenotype_keyword', 'sample_id_like',
-                        'search', 'max_variation_cluster_size_diff']) {
+    for (const name of TEXT_FILTER_INPUTS) {
         currentState[name] = $(`input[name="${name}"]`).val().trim();
     }
 
@@ -893,42 +835,33 @@ window.addEventListener('popstate', function() {
 // API Fetch and Search Logic
 // =========================================================================
 
-// Build API URL
+// Build API URL. The filters come from the shared lists (TEXT_FILTER_INPUTS, CHECKBOX_FILTERS and
+// GENE_REGION_FILTERS), so a filter added to one reaches the request as well as the state
+// functions. Every string value is '' when unset (DEFAULT_STATE), so a truthiness test sends
+// exactly the ones that are set.
 function buildApiUrl() {
     const params = new URLSearchParams();
     params.set('outlier_type', currentState.outlier_type);
     params.set('page', currentState.page);
     params.set('page_size', currentState.page_size);
 
-    const optionalStringParams = [
-        'require_above_unaffected', 'require_families_above_unaffected',
-        'require_above_population', 'motif', 'phenotype_keyword',
-        'sample_id_keyword', 'sample_id_like', 'search', 'max_variation_cluster_size_diff',
-        'gene_regions', 'exclude_gene_regions', 'sort_by', 'tag',
+    const stringParams = [
+        'require_above_unaffected', 'require_families_above_unaffected', 'require_above_population',
+        ...TEXT_FILTER_INPUTS, 'sample_id_keyword', ...GENE_REGION_FILTERS.map(([key]) => key), 'sort_by', 'tag',
     ];
-    for (const name of optionalStringParams) {
+    for (const name of stringParams) {
         if (currentState[name]) params.set(name, currentState[name]);
     }
     // Only relevant when a population filter is set; omit the default ('99th') to keep URLs clean.
     if (populationMetricAffectsResults() && currentState.population_metric === 'max') {
         params.set('population_metric', 'max');
     }
-
-    for (const name of ['min_expansion', 'min_repeats_threshold', 'min_repeats_above_population', 'min_sigma_percentile']) {
-        if (currentState[name] !== '' && currentState[name] !== undefined) {
-            params.set(name, currentState[name]);
+    // include_loci_without_population_data only counts under a population filter
+    for (const name of CHECKBOX_FILTERS) {
+        if (currentState[name]
+                && (name !== 'include_loci_without_population_data' || currentState.require_above_population)) {
+            params.set(name, 'true');
         }
-    }
-    if (currentState.motif_size) params.set('motif_size', currentState.motif_size);
-
-    if (currentState.apply_pathogenic_threshold) params.set('apply_pathogenic_threshold', 'true');
-    if (currentState.known_loci_only) params.set('known_loci_only', 'true');
-    if (currentState.known_motifs_only) params.set('known_motifs_only', 'true');
-    if (currentState.mendelian_genes_only) params.set('mendelian_genes_only', 'true');
-    if (currentState.exclude_vc_depth_filtered) params.set('exclude_vc_depth_filtered', 'true');
-    if (currentState.exclude_vc_size_filtered) params.set('exclude_vc_size_filtered', 'true');
-    if (currentState.require_above_population && currentState.include_loci_without_population_data) {
-        params.set('include_loci_without_population_data', 'true');
     }
 
     return `${API_BASE_URL}/loci?${params.toString()}`;
@@ -1008,7 +941,7 @@ function describeFetchError(error) {
     // fetch() rejects with a TypeError when the request can't be made at all (offline,
     // server down, DNS/connection refused).
     if (error instanceof TypeError) {
-        return 'Could not reach the server — check your internet connection and try again.';
+        return 'Could not reach the server. Check that it is still running and try again.';
     }
     return (error && error.message) || 'Search failed.';
 }
@@ -1121,6 +1054,9 @@ async function performSearch() {
     $('#error-message').hide();
     $('#results-container').addClass('loading');
 
+    // Set once the response is in, so the catch can tell an error in the page's own rendering
+    // (e.g. a TypeError from an unexpected field value) from a failure to reach the server
+    let rendering = false;
     try {
         const grouped = currentState.group_by !== 'locus';
         const response = await fetchWithTimeout(grouped ? buildGroupedApiUrl() : buildApiUrl());
@@ -1140,6 +1076,7 @@ async function performSearch() {
             replaceStateInUrl();
             return performSearch();
         }
+        rendering = true;
         if (grouped) renderGroupedResults(data); else renderResults(data);
         renderSummaryCharts(data);
         updatePaginationControls(data);
@@ -1148,7 +1085,9 @@ async function performSearch() {
     } catch (error) {
         if (requestId !== searchRequestSeq) return;  // stale failure - don't clobber the newer search's UI
         console.error('Search error:', error);
-        $('#error-text').text(describeFetchError(error));
+        $('#error-text').text(rendering
+            ? `The results could not be displayed: ${error.message} (details in the browser console)`
+            : describeFetchError(error));
         $('#error-message').show();
         $('#results-tbody').html(`<tr><td colspan="${resultsTableColumnCount()}" style="color: #888; padding: 20px; text-align: center;">Search failed</td></tr>`);
         $('.pagination-container').hide();
@@ -1214,8 +1153,6 @@ async function performExport(format) {
             } catch (_) { /* cross-origin response body not readable — ignore */ }
         };
         iframe.src = url;
-    } catch (e) {
-        alert('Export failed: ' + e.message);
     } finally {
         // The export parameters have already been built from the UI, so hand currentState back to
         // the results table exactly as it was; the table on screen still matches it.
@@ -1289,9 +1226,52 @@ $('#clear-all-filters').on('click', function() {
 // Summary Charts (Motifs and Gene Regions)
 // =========================================================================
 
-// Chart instances (for cleanup on re-render)
-let motifChartInstance = null;
-let geneRegionChartInstance = null;
+// Chart instances by canvas id (for cleanup on re-render)
+const summaryChartInstances = {};
+
+// Draw, or redraw, one summary chart: a horizontal bar per label, in a container sized to the
+// number of bars (35px per bar + padding for the axis). backgroundColor and borderColor are one
+// color or one per bar; yTicks optionally styles the bar labels (e.g. a monospace font for motifs).
+function renderSummaryBarChart(canvasId, containerId, labels, counts, { backgroundColor, borderColor, yTicks }) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    if (summaryChartInstances[canvasId]) {
+        summaryChartInstances[canvasId].destroy();
+        delete summaryChartInstances[canvasId];
+    }
+    document.getElementById(containerId).style.height = (labels.length * 35 + 50) + 'px';
+
+    const scales = {
+        x: {
+            beginAtZero: true,
+            title: { display: true, text: 'Number of loci' }
+        }
+    };
+    if (yTicks) scales.y = { ticks: yTicks };
+    summaryChartInstances[canvasId] = new Chart(canvas, {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Loci count',
+                data: counts,
+                backgroundColor: backgroundColor,
+                borderColor: borderColor,
+                borderWidth: 1,
+                barThickness: 20
+            }]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false }
+            },
+            scales: scales
+        }
+    });
+}
 
 // Gene region colors matching the badge background colors (lighter/pastel)
 const geneRegionColors = {
@@ -1305,15 +1285,6 @@ const geneRegionColors = {
 };
 
 function renderMotifChart(motifCounts) {
-    const ctx = document.getElementById('motif-chart');
-    if (!ctx) return;
-
-    // Destroy existing chart
-    if (motifChartInstance) {
-        motifChartInstance.destroy();
-        motifChartInstance = null;
-    }
-
     // Sort by count descending
     const sorted = Object.entries(motifCounts).sort((a, b) => b[1] - a[1]);
 
@@ -1337,53 +1308,12 @@ function renderMotifChart(motifCounts) {
         data.push(otherCount);
     }
 
-    // Set container height based on number of bars (35px per bar + padding for axis)
-    const container = document.getElementById('motif-chart-container');
-    container.style.height = (labels.length * 35 + 50) + 'px';
-
-    motifChartInstance = new Chart(ctx, {
-        type: 'bar',
-        data: {
-            labels: labels,
-            datasets: [{
-                label: 'Loci count',
-                data: data,
-                backgroundColor: '#90caf9',
-                borderColor: '#64b5f6',
-                borderWidth: 1,
-                barThickness: 20
-            }]
-        },
-        options: {
-            indexAxis: 'y',
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: { display: false }
-            },
-            scales: {
-                x: {
-                    beginAtZero: true,
-                    title: { display: true, text: 'Number of loci' }
-                },
-                y: {
-                    ticks: { font: { family: 'monospace' } }
-                }
-            }
-        }
+    renderSummaryBarChart('motif-chart', 'motif-chart-container', labels, data, {
+        backgroundColor: '#90caf9', borderColor: '#64b5f6', yTicks: { font: { family: 'monospace' } },
     });
 }
 
 function renderGeneRegionChart(regionCounts) {
-    const ctx = document.getElementById('gene-region-chart');
-    if (!ctx) return;
-
-    // Destroy existing chart
-    if (geneRegionChartInstance) {
-        geneRegionChartInstance.destroy();
-        geneRegionChartInstance = null;
-    }
-
     // Define order for gene regions
     const regionOrder = ['CDS', 'exon', 'intron', "5' UTR", "3' UTR", 'promoter', 'intergenic'];
 
@@ -1410,37 +1340,8 @@ function renderGeneRegionChart(regionCounts) {
         }
     }
 
-    // Set container height based on number of bars (35px per bar + padding for axis)
-    const container = document.getElementById('gene-region-chart-container');
-    container.style.height = (labels.length * 35 + 50) + 'px';
-
-    geneRegionChartInstance = new Chart(ctx, {
-        type: 'bar',
-        data: {
-            labels: labels,
-            datasets: [{
-                label: 'Loci count',
-                data: data,
-                backgroundColor: colors,
-                borderColor: colors,
-                borderWidth: 1,
-                barThickness: 20
-            }]
-        },
-        options: {
-            indexAxis: 'y',
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: { display: false }
-            },
-            scales: {
-                x: {
-                    beginAtZero: true,
-                    title: { display: true, text: 'Number of loci' }
-                }
-            }
-        }
+    renderSummaryBarChart('gene-region-chart', 'gene-region-chart-container', labels, data, {
+        backgroundColor: colors, borderColor: colors,
     });
 }
 
@@ -1586,11 +1487,11 @@ $(document).on('click', 'td.col-group-expand', function() {
     const $existing = $row.next('.group-detail-row');
     if ($existing.length) {
         $existing.remove();
-        $toggle.removeClass('expanded').html('<i class="chevron right icon"></i>');
+        $toggle.html('<i class="chevron right icon"></i>');
         refreshCollapseAllButton();
         return;
     }
-    $toggle.addClass('expanded').html('<i class="chevron down icon"></i>');
+    $toggle.html('<i class="chevron down icon"></i>');
     const $detail = $(`<tr class="group-detail-row"><td colspan="${$row.children('td').length}">`
         + `<div class="group-loci" data-group-id="${escapeHtml($row.attr('data-group-id'))}"></div></td></tr>`);
     $row.after($detail);
@@ -1697,6 +1598,22 @@ const VC_FILTER_REASON_TITLES = {
     'EXTENSION': 'Size Filter: variation cluster filtered out because its width exceeded the maximum variation cluster size threshold',
 };
 const VC_FILTER_REASON_COLORS = {'DEPTH': 'gold', 'EXTENSION': 'darkred'};
+
+// Which of TRExplorer's three variation-cluster states a locus is in, for the table's VC column
+// and the detail panel: {sizeDiff, sizeDiffText} (e.g. 12 and '+12bp') when a variation cluster
+// was kept for the repeat, {reasonTitle, reasonColor} when one was computed and then filtered out,
+// and null when TRExplorer recorded neither (or the size difference is not a number).
+function describeVariationCluster(locus) {
+    if (locus.VariationClusterSizeDiff != null && locus.VariationClusterSizeDiff !== '') {
+        const sizeDiff = Number(locus.VariationClusterSizeDiff);
+        if (!Number.isFinite(sizeDiff)) return null;
+        return {sizeDiff, sizeDiffText: (sizeDiff >= 0 ? '+' : '') + sizeDiff.toLocaleString('en-US') + 'bp'};
+    }
+    const reason = locus.VariationClusterFilterReason;
+    if (!reason) return null;
+    return {reasonTitle: VC_FILTER_REASON_TITLES[reason] || reason,
+            reasonColor: VC_FILTER_REASON_COLORS[reason] || 'darkorange'};
+}
 
 // Row Rendering Function
 function renderLocusRow(locus, rowIndex) {
@@ -1808,16 +1725,7 @@ function renderLocusRow(locus, rowIndex) {
     const inheritance = locus.GeneTableInheritance || '';
 
     // Gene phenotype summary (truncated with "more" link)
-    const genePhenoFull = locus.GeneTableLLMPhenotypeSummary || '';
-    const genePhenoTruncLen = 50;
-    let genePhenoHtml = '';
-    if (genePhenoFull) {
-        if (genePhenoFull.length > genePhenoTruncLen) {
-            genePhenoHtml = `<span class="phenotype-short">${escapeHtml(genePhenoFull.substring(0, genePhenoTruncLen))}... <a class="expand-phenotype" style="color: #2185d0; cursor: pointer;">more</a></span><span class="phenotype-full" style="display:none;">${escapeHtml(genePhenoFull)} <a class="collapse-phenotype" style="color: #2185d0; cursor: pointer;">less</a></span>`;
-        } else {
-            genePhenoHtml = escapeHtml(genePhenoFull);
-        }
-    }
+    const genePhenoHtml = renderExpandableText(locus.GeneTableLLMPhenotypeSummary, 50);
 
     // pLI
     const pli = locus.pLI != null ? locus.pLI.toFixed(2) : '';
@@ -1865,23 +1773,17 @@ function renderLocusRow(locus, rowIndex) {
     // filter, dark red for the size filter, orange for any other reason), and blank when
     // TRExplorer recorded neither. VariationCluster / VariationClusterFilterReason are optional
     // input columns (see input_tables.py); a database without them shows only the first state.
+    const variationCluster = describeVariationCluster(locus);
     let vcCell = '';
-    if (locus.VariationClusterSizeDiff != null && locus.VariationClusterSizeDiff !== '') {
-        const vcDiff = Number(locus.VariationClusterSizeDiff);
-        if (Number.isFinite(vcDiff)) {
-            const refSize = (locus.Start0Based != null && locus.End1Based != null) ? locus.End1Based - locus.Start0Based : null;
-            const vcTitle = (locus.VariationCluster ? `Variation Cluster Interval: ${locus.VariationCluster}\n` : '')
-                + 'Variation Cluster Interval Size: '
-                + (refSize != null ? `reference repeat interval size (${refSize.toLocaleString('en-US')} bp) + ` : '')
-                + `${vcDiff.toLocaleString('en-US')} bp`;
-            const vcSign = vcDiff >= 0 ? '+' : '';
-            vcCell = `<span title="${escapeHtml(vcTitle)}"><i class="check circle icon" style="color: #2185d0;"></i>Yes</span>: ${vcSign}${vcDiff.toLocaleString('en-US')}bp`;
-        }
-    } else if (locus.VariationClusterFilterReason) {
-        const vcReason = locus.VariationClusterFilterReason;
-        const vcReasonTitle = VC_FILTER_REASON_TITLES[vcReason] || vcReason;
-        const vcReasonColor = VC_FILTER_REASON_COLORS[vcReason] || 'darkorange';
-        vcCell = `<i class="times circle outline icon" style="color: ${vcReasonColor};" title="${escapeHtml(vcReasonTitle)}"></i>`;
+    if (variationCluster && variationCluster.sizeDiff != null) {
+        const refSize = (locus.Start0Based != null && locus.End1Based != null) ? locus.End1Based - locus.Start0Based : null;
+        const vcTitle = (locus.VariationCluster ? `Variation Cluster Interval: ${locus.VariationCluster}\n` : '')
+            + 'Variation Cluster Interval Size: '
+            + (refSize != null ? `reference repeat interval size (${refSize.toLocaleString('en-US')} bp) + ` : '')
+            + `${variationCluster.sizeDiff.toLocaleString('en-US')} bp`;
+        vcCell = `<span title="${escapeHtml(vcTitle)}"><i class="check circle icon" style="color: #2185d0;"></i>Yes</span>: ${variationCluster.sizeDiffText}`;
+    } else if (variationCluster) {
+        vcCell = `<i class="times circle outline icon" style="color: ${variationCluster.reasonColor};" title="${escapeHtml(variationCluster.reasonTitle)}"></i>`;
     }
 
     // UCSC link (buildUcscUrl in header_template.html, shared with the swim plot)
@@ -1956,6 +1858,16 @@ function renderFullTextPopupTrigger(fullText, shortenedHtml, title) {
     return `<span class="motif-truncated" title="${title}" data-full-motif="${escapeHtml(fullText)}">${shortenedHtml}</span>`;
 }
 
+// Text longer than maxLength shows its first maxLength characters, "..." and a "more" link that
+// swaps in the whole text (with a "less" link back; the .expand-phenotype / .collapse-phenotype
+// handlers below do the swap). Shorter text is shown as it is. Escaped; '' for no text.
+function renderExpandableText(text, maxLength) {
+    if (!text) return '';
+    if (text.length <= maxLength) return escapeHtml(text);
+    return `<span class="phenotype-short">${escapeHtml(text.substring(0, maxLength))}... <a class="expand-phenotype" style="color: #2185d0; cursor: pointer;">more</a></span>`
+        + `<span class="phenotype-full" style="display:none;">${escapeHtml(text)} <a class="collapse-phenotype" style="color: #2185d0; cursor: pointer;">less</a></span>`;
+}
+
 // A motif longer than maxLength shows its first maxLength bases, "..." and its size, e.g.
 // "TCTTGTGGGACTTCAGGCACTTGAAAGATA... (235bp)"; clicking it opens the full-motif popup.
 function formatMotifForDisplay(motif, maxLength = 30) {
@@ -2001,20 +1913,12 @@ $(document).on('click', 'td.col-expand', async function() {
 
     // Toggle off (with slide animation)
     if ($existingDetail.length) {
-        // .children(), not .find(): the rendered detail holds hundreds of nested cells (the
-        // per-sample sub-table and the summary tables), and this wants the row's one outer cell.
-        const $td = $existingDetail.children('td');
-        $td.wrapInner('<div class="slide-wrapper"></div>');
-        $td.children('.slide-wrapper').slideUp(200, function() {
-            $existingDetail.remove();
-            refreshCollapseAllButton();
-        });
-        $toggle.removeClass('expanded').html('<i class="chevron right icon"></i>');
+        collapseLocusDetailRow($existingDetail);
         return;
     }
 
     // Show loading
-    $toggle.addClass('expanded').html('<i class="chevron down icon"></i>');
+    $toggle.html('<i class="chevron down icon"></i>');
     // Spans the row's own cells: a grouped row's locus list has one more column than the main
     // table (This sample / This family)
     const $loadingRow = $(`<tr class="locus-detail-row"><td colspan="${$row.children('td').length}" style="padding: 12px 14px; background: #fafafa; border-top: 1px solid #ccc; border-bottom: 2px solid #2185d0;"><div class="ui tiny active inline loader"></div> Loading...</td></tr>`);
@@ -2109,18 +2013,12 @@ function renderLocusDetail(detail, outlierType) {
     // the size difference when TRExplorer kept a variation cluster for this repeat, the crossed-out
     // circle and the reason when it computed one and then filtered it out, and nothing when it
     // recorded neither.
-    if (locus.VariationClusterSizeDiff != null && locus.VariationClusterSizeDiff !== '') {
-        const vcsDiff = Number(locus.VariationClusterSizeDiff);
-        if (Number.isFinite(vcsDiff)) {
-            const vcsSign = vcsDiff >= 0 ? '+' : '';
-            html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">Variation Cluster: ${vcsSign}${vcsDiff.toLocaleString('en-US')}bp</div>`;
-        }
-    } else if (locus.VariationClusterFilterReason) {
-        const vcsReason = locus.VariationClusterFilterReason;
-        const vcsReasonTitle = VC_FILTER_REASON_TITLES[vcsReason] || vcsReason;
-        const vcsReasonColor = VC_FILTER_REASON_COLORS[vcsReason] || 'darkorange';
+    const variationCluster = describeVariationCluster(locus);
+    if (variationCluster && variationCluster.sizeDiff != null) {
+        html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">Variation Cluster: ${variationCluster.sizeDiffText}</div>`;
+    } else if (variationCluster) {
         html += `<div style="font-size: 0.88em; color: #666; margin-bottom: 4px;">Variation Cluster: `
-            + `<i class="times circle outline icon" style="color: ${vcsReasonColor};"></i>${escapeHtml(vcsReasonTitle)}</div>`;
+            + `<i class="times circle outline icon" style="color: ${variationCluster.reasonColor};"></i>${escapeHtml(variationCluster.reasonTitle)}</div>`;
     }
 
     // Allele histogram
@@ -2199,14 +2097,7 @@ function renderLocusDetail(detail, outlierType) {
         if (isAffectedStatus(s.affected_status)) rowClass += ' sample-status-affected';
 
         // Expandable phenotype text in detail panel
-        let phenTrunc = '';
-        if (s.phenotype_description) {
-            if (s.phenotype_description.length > 150) {
-                phenTrunc = `<span class="phenotype-short">${escapeHtml(s.phenotype_description.substring(0, 150))}... <a class="expand-phenotype" style="color: #2185d0; cursor: pointer;">more</a></span><span class="phenotype-full" style="display:none;">${escapeHtml(s.phenotype_description)} <a class="collapse-phenotype" style="color: #2185d0; cursor: pointer;">less</a></span>`;
-            } else {
-                phenTrunc = escapeHtml(s.phenotype_description);
-            }
-        }
+        const phenTrunc = renderExpandableText(s.phenotype_description, 150);
 
         html += `<tr class="${rowClass}" data-sample-id="${escapeHtml(s.sample_id)}" data-family-id="${escapeHtml(s.family_id || '')}">`;
 
@@ -2313,7 +2204,7 @@ function renderLocusDetail(detail, outlierType) {
         window._copyTextMap[locus.LocusId] = copyText;
     }
     html += `<div style="margin-top: 10px; display: flex; justify-content: space-between; align-items: center;">
-        <button class="ui mini basic button collapse-detail-btn" data-locus-id="${escapeHtml(locus.LocusId)}">
+        <button class="ui mini basic button collapse-detail-btn">
             <i class="chevron up icon"></i> Collapse details
         </button>
         ${affUnsolved.length > 0 ? `<button class="ui mini basic button copy-ids-btn" data-locus-id="${escapeHtml(locus.LocusId)}">
@@ -2345,17 +2236,22 @@ $(document).on('click', '.copy-ids-btn', function() {
     }).catch(() => copyByHand());
 });
 
-// Collapse details button handler (with slide animation)
-$(document).on('click', '.collapse-detail-btn', function() {
-    const $detailRow = $(this).closest('.locus-detail-row');
-    const $locusRow = $detailRow.prev('.locus-row');
+// Close one locus's detail panel with a slide animation and reset its locus row's chevron. Used by
+// the row's expand toggle and by the panel's Collapse details button.
+function collapseLocusDetailRow($detailRow) {
+    // .children(), not .find(): the rendered detail holds hundreds of nested cells (the
+    // per-sample sub-table and the summary tables), and this wants the row's one outer cell.
     const $td = $detailRow.children('td');
     $td.wrapInner('<div class="slide-wrapper"></div>');
     $td.children('.slide-wrapper').slideUp(200, function() {
         $detailRow.remove();
         refreshCollapseAllButton();
     });
-    $locusRow.find('.expand-toggle').removeClass('expanded').html('<i class="chevron right icon"></i>');
+    $detailRow.prev('.locus-row').find('.expand-toggle').html('<i class="chevron right icon"></i>');
+}
+
+$(document).on('click', '.collapse-detail-btn', function() {
+    collapseLocusDetailRow($(this).closest('.locus-detail-row'));
 });
 
 // The Collapse all button has nothing to do when no locus is expanded, so it is only shown while
@@ -2367,7 +2263,7 @@ function refreshCollapseAllButton() {
 // Collapse every expanded locus at once, with the same slide animation as collapsing one.
 // Expanded sample or family rows (grouped views) close too, taking their loci with them.
 $(document).on('click', '.collapse-all-btn', function() {
-    $('.group-row .expand-toggle').removeClass('expanded').html('<i class="chevron right icon"></i>');
+    $('.group-row .expand-toggle').html('<i class="chevron right icon"></i>');
     $('.group-detail-row').remove();
     const $detailRows = $('.locus-detail-row');
     if (!$detailRows.length) {
@@ -2376,7 +2272,7 @@ $(document).on('click', '.collapse-all-btn', function() {
     }
     // Reset every chevron up front rather than per row: the rows themselves go away in the
     // animation callbacks below, and their locus rows stay put.
-    $('.locus-row .expand-toggle').removeClass('expanded').html('<i class="chevron right icon"></i>');
+    $('.locus-row .expand-toggle').html('<i class="chevron right icon"></i>');
     // One outer cell per detail row: .find('td') would wrap and animate every nested cell too,
     // and fire this callback once per animated element instead of once per row.
     const $td = $detailRows.children('td');
@@ -2568,8 +2464,8 @@ function goToPage(page) {
 }
 
 // =========================================================================
-// Annotation CRUD Functions (the note editor openNoteEditor and the write helpers addTag and
-// removeTag are in header_template.html, shared with the swim plot)
+// Annotation CRUD Functions (the note editor openNoteEditor is in note_editor.html and
+// the write helpers addTag and removeTag in header_template.html, both shared with the swim plot)
 // =========================================================================
 
 // Under a grouped row, highlight that row's sample (or its family's samples) in the locus's detail
@@ -2650,7 +2546,7 @@ function refreshAfterNoteChange(locusId) {
     refreshDetailPanel(locusId);
 }
 
-// Edit Notes button and note icon open the shared note editor (openNoteEditor, header_template.html)
+// Edit Notes button and note icon open the shared note editor (openNoteEditor, note_editor.html)
 $(document).on('click', '.add-note-btn, .note-indicator', function() {
     const locusId = $(this).data('locus-id') || $(this).closest('tr.locus-row').data('locus-id');
     openNoteEditor(locusId, refreshAfterNoteChange);
@@ -2679,8 +2575,7 @@ $(document).on('click', '.add-tag-btn', async function() {
     const existingTags = await fetchLocusTags(locusId);
     if (seq !== tagModalSeq) return;  // a newer click already owns the modal
 
-    // Store locusId on modal for delete handlers, together with the tags it belongs to
-    $modal.data('locus-id', locusId);
+    // The locus's current tags, each with a delete button that carries the locus id
     renderExistingTagsInModal(existingTags, locusId);
 
     // Populate the dropdown with existing tags
@@ -2688,8 +2583,11 @@ $(document).on('click', '.add-tag-btn', async function() {
     setupDropdownMenu($addTagDropdown, values);
     resetDropdown();
 
-    // Add Enter key handler for the search input
-    $addTagDropdown.find('input.search').off('keydown.addtag').on('keydown.addtag', function(e) {
+    // Enter adds the tag. The handler is on the dropdown, after Semantic UI's own key handler there
+    // (bound when the dropdown was set up), which first commits the highlighted item, so a typed
+    // prefix of an existing tag adds that tag. A new tag is committed the same way, as the menu's
+    // addition item, and onApprove falls back to the typed text when nothing was committed.
+    $addTagDropdown.off('keydown.addtag').on('keydown.addtag', function(e) {
         if (e.key === 'Enter') {
             e.preventDefault();
             $modal.find('.ok.button').click();
@@ -2792,12 +2690,12 @@ $(document).on('click', '.delete-modal-tag', async function() {
 });
 
 // Lightweight transient toast. Self-contained so it does not depend on the
-// Semantic UI toast module being bundled (it is not on this page).
+// Semantic UI toast module being bundled (it is not on this page). type is 'error' or 'warning'.
 function showToast(message, type) {
-    const colors = { error: '#db2828', warning: '#f2c037', success: '#21ba45', info: '#2185d0' };
+    const colors = { error: '#db2828', warning: '#f2c037' };
     const $toast = $('<div></div>').text(message).css({
         position: 'fixed', top: '1em', right: '1em', zIndex: 9999,
-        background: colors[type] || colors.info, color: '#fff',
+        background: colors[type], color: '#fff',
         padding: '0.8em 1.2em', borderRadius: '4px',
         boxShadow: '0 2px 8px rgba(0,0,0,0.2)', fontSize: '0.95em',
     });

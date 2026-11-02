@@ -3,13 +3,13 @@
 import contextlib
 import io
 import json
-import os
-import tempfile
 import unittest
 
 import intervaltree
 
 import locus_annotations
+import results_server
+from tests.temp_file_helpers import write_temporary_file
 
 
 class ComputeJaccardTests(unittest.TestCase):
@@ -98,7 +98,7 @@ class AddDerivedLocusColumnsTests(unittest.TestCase):
         self.assertEqual(record["Chrom"], "chr1")
         self.assertEqual(record["Start0Based"], 100000874)
         self.assertEqual(record["End1Based"], 100000884)
-        self.assertEqual(record["ReferenceRegion"], "1:100000875-100000884")
+        self.assertEqual(record["ReferenceRegion"], "chr1:100000874-100000884")
         self.assertEqual(record["MotifSize"], 1)
         # (100000884 - 100000874) // 1 == 10
         self.assertEqual(record["NumRepeatsInReference"], 10)
@@ -121,7 +121,20 @@ class AddDerivedLocusColumnsTests(unittest.TestCase):
         records = [{"LocusId": "chr3-10-22-AT", "Motif": "AT"}]
         locus_annotations.add_derived_locus_columns(records)
         self.assertEqual(records[0]["Chrom"], "chr3")
-        self.assertEqual(records[0]["ReferenceRegion"], "3:11-22")
+        self.assertEqual(records[0]["ReferenceRegion"], "chr3:10-22")
+
+    def test_reference_region_reads_back_as_the_locus_coordinates(self):
+        # A derived ReferenceRegion pasted into the server's reference-region search must
+        # select the locus's own interval: a 0-based start, like TRExplorer's
+        # "chr1:10000-10108" for 1-10000-10108-TAACCC. A 1-based start would miss a 1 bp locus.
+        records = [{"LocusId": "1-10000-10108-TAACCC", "Motif": "TAACCC"},
+                   {"LocusId": "chrX-500-501-A", "Motif": "A"}]
+        locus_annotations.add_derived_locus_columns(records)
+        self.assertEqual(records[0]["ReferenceRegion"], "chr1:10000-10108")
+        for record in records:
+            self.assertEqual(
+                results_server.parse_reference_region(record["ReferenceRegion"]),
+                ((record["Chrom"], record["Start0Based"], record["End1Based"]), None))
 
     def test_preserves_existing_reference_region_and_num_repeats(self):
         records = [{
@@ -182,6 +195,31 @@ class AddDerivedLocusColumnsTests(unittest.TestCase):
         self.assertEqual(records[0]["gene_region_rank"], 1)
         self.assertIn("ignored the gene_region_rank supplied by the input matrix for 1 of 1 loci",
                       output.getvalue())
+
+    def test_supplied_coordinate_and_motif_columns_are_recomputed_and_reported(self):
+        # Chrom, Start0Based, End1Based, MotifSize and CanonicalMotif are recognized matrix
+        # columns but are always recomputed from the LocusId and Motif, so values that disagree
+        # with them (here every one) are replaced, and each replacement is reported.
+        records = [
+            {"LocusId": "1-100-130-CAG", "Motif": "CAG", "Chrom": "chr2", "Start0Based": 99,
+             "End1Based": 131, "MotifSize": 4, "CanonicalMotif": "CTG"},
+            {"LocusId": "1-200-210-AT", "Motif": "AT", "Chrom": "chr1"},
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            locus_annotations.add_derived_locus_columns(records)
+        self.assertEqual(
+            {column: records[0][column]
+             for column in ("Chrom", "Start0Based", "End1Based", "MotifSize", "CanonicalMotif")},
+            {"Chrom": "chr1", "Start0Based": 100, "End1Based": 130, "MotifSize": 3,
+             "CanonicalMotif": "AGC"})
+        self.assertEqual(output.getvalue().splitlines(), [
+            "  ignored the Chrom supplied by the input matrix for 2 of 2 loci; it is always derived from LocusId",
+            "  ignored the Start0Based supplied by the input matrix for 1 of 2 loci; it is always derived from LocusId",
+            "  ignored the End1Based supplied by the input matrix for 1 of 2 loci; it is always derived from LocusId",
+            "  ignored the MotifSize supplied by the input matrix for 1 of 2 loci; it is always derived from Motif",
+            "  ignored the CanonicalMotif supplied by the input matrix for 1 of 2 loci; it is always derived from Motif",
+        ])
 
     def test_no_supplied_gene_region_rank_prints_nothing(self):
         records = [{"LocusId": "1-10-22-AT", "Motif": "AT", "gene_region": "CDS"}]
@@ -259,13 +297,9 @@ class MotifValidationTests(unittest.TestCase):
         self.assertEqual(records[0]["CanonicalMotif"], "")
 
 
-def _make_catalog_file(loci):
-    """Write a catalog JSON to a temp file and return its path."""
-    handle = tempfile.NamedTemporaryFile(
-        mode="wt", suffix=".json", delete=False)
-    json.dump(loci, handle)
-    handle.close()
-    return handle.name
+def _write_catalog_file(test_case, loci):
+    """Write a catalog's loci as a temporary JSON file (see write_temporary_file) and return its path."""
+    return write_temporary_file(test_case, json.dumps(loci), suffix=".json")
 
 
 class LoadKnownDiseaseLociTests(unittest.TestCase):
@@ -292,10 +326,7 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
                 "Diseases": [{"Name": "Disease C"}],
             },
         ]
-        self.catalog_path = _make_catalog_file(self.catalog)
-
-    def tearDown(self):
-        os.remove(self.catalog_path)
+        self.catalog_path = _write_catalog_file(self, self.catalog)
 
     def test_only_named_disease_loci_with_regions_are_loaded(self):
         interval_trees, strchive_trees = locus_annotations.load_known_disease_loci(self.catalog_path)
@@ -310,14 +341,11 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
 
     def test_null_pathogenic_motifs_still_match_by_repeat_unit(self):
         # Most loci of the real catalog (e.g. HTT, FMR1) have "PathogenicMotifs": null.
-        catalog_path = _make_catalog_file([{
+        catalog_path = _write_catalog_file(self, [{
             "LocusId": "DISEASE_AT", "MainReferenceRegion": "chr1:100-110", "RepeatUnit": "AT",
             "PathogenicMotifs": None, "Diseases": [{"Name": "Disease X"}],
         }])
-        try:
-            interval_trees, _ = locus_annotations.load_known_disease_loci(catalog_path)
-        finally:
-            os.remove(catalog_path)
+        interval_trees, _ = locus_annotations.load_known_disease_loci(catalog_path)
         self.assertEqual(
             locus_annotations.matches_disease_locus("1-100-110-TA", interval_trees), "DISEASE_AT")
         self.assertEqual(
@@ -329,16 +357,13 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
             "start_hg38": 500, "stop_hg38": 530,
             "reference_motif_reference_orientation": ["CAG"],
         }]
-        strchive_path = _make_catalog_file(strchive)
-        try:
-            _trees, strchive_trees = locus_annotations.load_known_disease_loci(
-                self.catalog_path, strchive_filepath=strchive_path)
-            self.assertIn("2", strchive_trees)
-            intervals = sorted(strchive_trees["2"])
-            self.assertEqual(intervals[0].begin, 500)
-            self.assertEqual(intervals[0].end, 530)
-        finally:
-            os.remove(strchive_path)
+        strchive_path = _write_catalog_file(self, strchive)
+        _trees, strchive_trees = locus_annotations.load_known_disease_loci(
+            self.catalog_path, strchive_filepath=strchive_path)
+        self.assertIn("2", strchive_trees)
+        intervals = sorted(strchive_trees["2"])
+        self.assertEqual(intervals[0].begin, 500)
+        self.assertEqual(intervals[0].end, 530)
 
     def test_strchive_pathogenic_motif_is_matched_and_collected(self):
         # Several STRchive loci expand as a motif that differs from the reference unit. Matching
@@ -349,41 +374,34 @@ class LoadKnownDiseaseLociTests(unittest.TestCase):
             "reference_motif_reference_orientation": ["CAG"],
             "pathogenic_motif_reference_orientation": ["CCG"],
         }]
-        strchive_path = _make_catalog_file(strchive)
-        try:
-            _trees, strchive_trees = locus_annotations.load_known_disease_loci(
-                self.catalog_path, strchive_filepath=strchive_path)
-            self.assertEqual(
-                locus_annotations.matches_disease_locus("chr2-500-530-CCG", {}, strchive_trees),
-                "STR_B")
-            self.assertIn(
-                locus_annotations.compute_canonical_motif("CCG"),
-                locus_annotations.collect_known_disease_canonical_motifs({}, strchive_trees))
-        finally:
-            os.remove(strchive_path)
+        strchive_path = _write_catalog_file(self, strchive)
+        _trees, strchive_trees = locus_annotations.load_known_disease_loci(
+            self.catalog_path, strchive_filepath=strchive_path)
+        self.assertEqual(
+            locus_annotations.matches_disease_locus("chr2-500-530-CCG", {}, strchive_trees),
+            "STR_B")
+        self.assertIn(
+            locus_annotations.compute_canonical_motif("CCG"),
+            locus_annotations.collect_known_disease_canonical_motifs({}, strchive_trees))
 
     def test_real_htt_locus_is_stored_at_its_locus_id_coordinates(self):
         # HTT's CAG repeat, as the GRCh38 variant catalog and STRchive list it. Both give the
         # 57 bp of 19 CAG repeats with a 0-based start, which TRExplorer and TRGT-style
         # catalogs call 4-3074876-3074933-CAG, so a locus with that id matches with Jaccard 1.
-        catalog_path = _make_catalog_file([{
+        catalog_path = _write_catalog_file(self, [{
             "LocusId": "HTT",
             "MainReferenceRegion": "chr4:3074876-3074933",
             "RepeatUnit": "CAG",
             "Diseases": [{"Symbol": "HD", "Name": "Huntington's disease"}],
         }])
-        strchive_path = _make_catalog_file([{
+        strchive_path = _write_catalog_file(self, [{
             "id": "HD_HTT", "disease": "Huntington disease", "chrom": "chr4",
             "start_hg38": 3074876, "stop_hg38": 3074933,
             "reference_motif_reference_orientation": ["CAG"],
             "pathogenic_motif_reference_orientation": ["CAG"],
         }])
-        try:
-            interval_trees, strchive_trees = locus_annotations.load_known_disease_loci(
-                catalog_path, strchive_filepath=strchive_path)
-        finally:
-            os.remove(catalog_path)
-            os.remove(strchive_path)
+        interval_trees, strchive_trees = locus_annotations.load_known_disease_loci(
+            catalog_path, strchive_filepath=strchive_path)
         for trees in (interval_trees, strchive_trees):
             [interval] = trees["4"]
             self.assertEqual((interval.begin, interval.end), (3074876, 3074933))
@@ -406,13 +424,9 @@ class MatchesDiseaseLocusTests(unittest.TestCase):
             "PathogenicMotifs": ["CCG"],
             "Diseases": [{"Name": "Test ataxia"}],
         }]
-        self.catalog_path = _make_catalog_file(self.catalog)
         self.interval_trees, _ = locus_annotations.load_known_disease_loci(
-            self.catalog_path)
+            _write_catalog_file(self, self.catalog))
         # Stored interval is [1000, 1030).
-
-    def tearDown(self):
-        os.remove(self.catalog_path)
 
     def test_exact_overlap_and_motif_match(self):
         # Query [1000,1030) CAG: Jaccard 1.0, motif matches RepeatUnit.
@@ -446,6 +460,17 @@ class MatchesDiseaseLocusTests(unittest.TestCase):
         self.assertIsNone(
             locus_annotations.matches_disease_locus(
                 "1-1000-1500-CAG", self.interval_trees))
+
+    def test_jaccard_of_exactly_the_threshold_matches(self):
+        # [100, 133) against the disease locus [100, 150) has Jaccard 33/50 = 0.66 exactly, which
+        # matches, as it does for the TRExplorer match; 32/50 = 0.64 does not.
+        interval_trees = {"1": intervaltree.IntervalTree()}
+        interval_trees["1"].addi(100, 150, data={"LocusId": "BOUNDARY_TEST", "RepeatUnit": "CAG"})
+        self.assertEqual(locus_annotations.compute_jaccard(100, 133, 100, 150),
+                         locus_annotations.MIN_JACCARD_SIMILARITY_OF_MATCHING_LOCI)
+        self.assertEqual(
+            locus_annotations.matches_disease_locus("1-100-133-CAG", interval_trees), "BOUNDARY_TEST")
+        self.assertIsNone(locus_annotations.matches_disease_locus("1-100-132-CAG", interval_trees))
 
     def test_no_overlap_returns_none(self):
         self.assertIsNone(
@@ -528,12 +553,8 @@ class KnownMotifTests(unittest.TestCase):
             "PathogenicMotifs": ["CCCCGG", "NGC"],
             "Diseases": [{"Name": "D"}],
         }]
-        self.catalog_path = _make_catalog_file(self.catalog)
         self.interval_trees, _ = locus_annotations.load_known_disease_loci(
-            self.catalog_path)
-
-    def tearDown(self):
-        os.remove(self.catalog_path)
+            _write_catalog_file(self, self.catalog))
 
     def test_collect_canonical_motifs_expands_n_into_concrete_motifs(self):
         known = locus_annotations.collect_known_disease_canonical_motifs(
@@ -547,13 +568,9 @@ class KnownMotifTests(unittest.TestCase):
         self.assertNotIn(compute_canonical_motif("NGC"), known)
 
     def test_long_motif_with_n_is_not_expanded(self):
-        catalog_path = _make_catalog_file([{
+        interval_trees, _ = locus_annotations.load_known_disease_loci(_write_catalog_file(self, [{
             "LocusId": "LONG", "MainReferenceRegion": "chr1:1000-1120", "RepeatUnit": "GGCTNNGGGNGC",
-            "Diseases": [{"Name": "D"}]}])
-        try:
-            interval_trees, _ = locus_annotations.load_known_disease_loci(catalog_path)
-        finally:
-            os.remove(catalog_path)
+            "Diseases": [{"Name": "D"}]}]))
         self.assertEqual(locus_annotations.collect_known_disease_canonical_motifs(interval_trees), set())
 
     def test_compute_is_known_motif(self):
@@ -574,25 +591,21 @@ class PolyalanineDiseaseLocusTests(unittest.TestCase):
 
     def setUp(self):
         # As in variant_catalog_without_offtargets.GRCh38.json and STRchive-loci.json.
-        catalog_path = _make_catalog_file([
+        catalog_path = _write_catalog_file(self, [
             {"LocusId": "ARX_1", "MainReferenceRegion": "chrX:25013649-25013697", "RepeatUnit": "NGC",
              "PathogenicMotifs": None,
              "Diseases": [{"Name": "Developmental and epileptic encephalopathy-1"}]},
             {"LocusId": "PHOX2B", "MainReferenceRegion": "chr4:41745972-41746032", "RepeatUnit": "GCN",
              "PathogenicMotifs": None, "Diseases": [{"Name": "Congenital central hypoventilation"}]},
         ])
-        strchive_path = _make_catalog_file([{
+        strchive_path = _write_catalog_file(self, [{
             "id": "EIEE1_ARX", "disease": "Developmental and epileptic encephalopathy-1",
             "chrom": "chrX", "start_hg38": 25013649, "stop_hg38": 25013697,
             "reference_motif_reference_orientation": ["GCN"],
             "pathogenic_motif_reference_orientation": ["NGC"],
         }])
-        try:
-            self.interval_trees, self.strchive_trees = locus_annotations.load_known_disease_loci(
-                catalog_path, strchive_filepath=strchive_path)
-        finally:
-            os.remove(catalog_path)
-            os.remove(strchive_path)
+        self.interval_trees, self.strchive_trees = locus_annotations.load_known_disease_loci(
+            catalog_path, strchive_filepath=strchive_path)
 
     def test_a_concrete_motif_matches_the_n_motif(self):
         # TRGT's pathogenic-repeat catalog calls ARX's repeat GCG; PHOX2B is often genotyped as GCC.

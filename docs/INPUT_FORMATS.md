@@ -35,8 +35,11 @@ and can hold larger values, and the build prints a warning. All coordinates are 
 
 Tab-separated (optionally gzipped). **One row per locus.** The first two columns identify the
 locus; every remaining column is **one sample**, headed by that sample's `sample_id`. Each
-cell holds the sample's per-allele repeat copy numbers, comma-separated — two values for a
-diploid call, one for a hemizygous/haploid call; blank or `.` for a no-call.
+cell holds the sample's per-allele repeat copy numbers as **whole numbers**, comma-separated:
+two values for a diploid call, one for a hemizygous/haploid call; blank, `.` or `./.` for a
+no-call. Any other cell, such as a fractional copy number (`12.5,40`, `45.3`, even `12.0`), three
+values or `12/40`, is silently read as a no-call, so round a tool's fractional copy numbers to
+whole numbers before building the matrix.
 
 ```
 trid                            motif   SAMPLE_A   SAMPLE_B   SAMPLE_C
@@ -48,17 +51,22 @@ chrX-148500631-148500691-GCC    GCC     21         20,21      45
 |--------|-----------|-------|
 | `trid` | **required** | locus id `chrom-start-end-motif` (e.g. the TRGT trid); also used as `LocusId`. Exactly four `-`-separated fields, with integer start/end; any other shape fails the build with an error naming the column, the value and this file |
 | `motif` | **required** | repeat unit (e.g. `AAAAT`). Only IUPAC bases (`ACGTNYRSWMKBVDH`, case-insensitive); a decorated or placeholder motif such as `(CAG)n` fails the build with an error naming the locus, the column and the value |
-| one column per sample | **≥1 required** | header = `sample_id`; cell = comma-separated per-allele repeat copy numbers |
+| one column per sample | **≥1 required** | header = `sample_id`; cell = one or two comma-separated whole-number repeat copy numbers (any other cell is a no-call; see above) |
 | optional annotation columns | optional | recognized per-locus annotation columns annotate the locus instead of being read as samples; most are written to the loci table, a few are always recomputed — see below |
 
 **Annotations from TRExplorer.** You do not need to supply any annotation: each locus gets the
 population statistics (`HPRC256_*`, `AoU1027_*`, `TenK10K_*`), Gencode gene id and region,
 variation cluster and reference-repeat fields of its locus in TRExplorer's repeat catalog
 (class A, below). A locus matches the TRExplorer locus with the same id, ignoring a `chr`
-prefix; otherwise the TRExplorer locus whose interval overlaps it with a Jaccard similarity
-(intersection over union) of at least 0.66 and whose motif matches (the same canonical motif for
-1-6 bp motifs, the same motif length for 7 bp or longer), preferring the largest HPRC256, then
-AoU1027, standard deviation. `TRExplorerLocusId` and `TRExplorerLocusJaccardSimilarity` record
+prefix; otherwise a TRExplorer locus on the same chromosome whose interval overlaps it with a
+Jaccard similarity (intersection over union) of 0.66 or more, 0.66 itself included, and whose
+motif matches (for 1-6 bp motifs, the same length and a shared canonical motif, with an `N` in
+either motif matching any base, so a polyalanine locus written as `NGC` or `GCN` matches `GCC`
+or `GCG`; for 7 bp or longer, the same motif length). When several do, each is ranked by the
+first of these it has: its HPRC256 standard deviation, its AoU1027 standard deviation, its
+reference repeat purity. One ranked by an earlier statistic beats one ranked by a later one or
+by none; between two ranked by the same statistic, the larger value wins; and a tie that is left
+goes to the last locus id in sort order. `TRExplorerLocusId` and `TRExplorerLocusJaccardSimilarity` record
 the match. A locus with no match keeps these columns empty. The build prints how many loci
 matched by id, by overlap, or not at all.
 
@@ -68,8 +76,9 @@ space-insensitive) and are not treated as samples. Any header that is **not** re
 of the two rules below is treated as a sample, so check this list before naming a sample column.
 
 Being recognized is not the same as being kept: some of these columns are always recomputed by
-the build from `trid` and `motif`, and whatever you supply for them is silently replaced. The
-"Value you supply" column below says which is which. A kept value wins over TRExplorer's:
+the build from `trid`, `motif` or `gene_region`, and whatever you supply for them is replaced
+(the build prints how many values it ignored). The "Value you supply" column below says which is
+which. A kept value wins over TRExplorer's:
 TRExplorer fills only the columns your matrix leaves empty.
 
 *Rule 1: recognized by exact name.* The full set, grouped by what it annotates:
@@ -79,28 +88,29 @@ TRExplorer fills only the columns your matrix leaves empty.
 | gene | `gene_id` / `GencodeGeneId`, `gene_region` / `GencodeGeneRegion` | **kept.** The `Gencode*` alias is used only when the plain name is absent |
 | gene | `gene_region_rank` | **discarded.** Always recomputed from `gene_region`, so the rank can never disagree with the region stored beside it (the results table sorts gene regions by this rank while displaying `gene_region`). Supply it only to keep the header out of the sample list; the build prints one line saying how many supplied values it ignored |
 | gene | `IsInMendelianGene` | **kept only without a gene table.** With one (genelookup's is downloaded by default) it is recomputed from `gene_id`: 1 when the table gives the gene an `inheritance` mode, or its `sources` name OMIM, ClinGen, GenCC, PanelAppUK, PanelAppAU or Decipher. A gene listed only for GWAS, ClinVar, dbNSFP or constraint (pLI, LOEUF) gets 0. A gene table with neither an `inheritance` nor a `sources` column counts every gene it lists |
-| locus coordinates / motif | `Chrom`, `Start0Based`, `End1Based`, `MotifSize`, `CanonicalMotif` | **discarded.** Always recomputed from `trid` and `motif`. Supply them only to keep those headers out of the sample list |
+| locus coordinates / motif | `Chrom`, `Start0Based`, `End1Based`, `MotifSize`, `CanonicalMotif` | **discarded.** Always recomputed from `trid` and `motif`. Supply them only to keep those headers out of the sample list; the build prints one line per column saying how many supplied values it ignored |
 | locus coordinates / motif | `ReferenceRegion`, `NumRepeatsInReference` | **kept.** Derived from the coordinates and motif only when absent |
 | known-locus flags | `KnownDiseaseLocus`, `IsKnownMotif` | **kept only without a known-loci catalog** (`--known-loci-json` / STRchive). With a catalog the catalog wins |
 | other annotations | `Source` | **kept.** Falls back to `--source-label` when absent |
 | other annotations | `NonCodingAnnotations`, `RepeatMaskerIntervals` | **kept** (pure pass-through) |
 | variation cluster | `VariationCluster`, `VariationClusterSizeDiff`, `VariationClusterFilterReason` | **kept** (pure pass-through) |
 
-The recomputed columns are assigned unconditionally in
-`locus_annotations.add_derived_locus_columns` (e.g. `record["Chrom"] = f"chr{chrom_field.replace('chr', '')}"`,
-`record["MotifSize"] = len(record["Motif"])`, `record["CanonicalMotif"] = compute_canonical_motif(...)`,
-`record["gene_region_rank"] = gene_region_rank(record.get("gene_region"))`), while the kept ones
-are guarded by `if record.get("...") is None`. Replacing a supplied value is silent except for
-`gene_region_rank`, where the build prints a single summary line naming how many loci carried a
-supplied rank that was ignored.
+The recomputed columns (`Chrom`, `Start0Based`, `End1Based`, `MotifSize`, `CanonicalMotif` and
+`gene_region_rank`, listed in `SOURCE_COLUMN_BY_RECOMPUTED_COLUMN` in
+`trails/locus_annotations.py`) are always overwritten by `add_derived_locus_columns`, while a kept
+one is computed only when your matrix left it empty. For each recomputed column your matrix
+supplied, the build prints one summary line, e.g. "ignored the MotifSize supplied by the input
+matrix for 1,200 of 2,000 loci; it is always derived from Motif".
 
 *Rule 2: recognized by prefix.* A header whose normalized name starts with `hprc256`,
 `aou1027`, `tenk10k` or `trexplorer` (e.g. `HPRC256_99thPercentile`, `AoU1027_Stdev`,
 `TenK10K_MaxAllele`, `TRExplorerMotif`) is a per-cohort population-stat / TRExplorer annotation.
 If the name matches a loci-table output column it is stored under that column's canonical
-spelling; otherwise it is passed through verbatim under your own header. The prefixes are the
-specific cohort/version tokens (not the bare cohort abbreviation), so a sample genuinely named
-e.g. `AoU_0001` is still read as a sample.
+spelling; otherwise it is passed through verbatim under your own header. The `hprc256` and
+`aou1027` prefixes include the cohort size, so a sample named e.g. `AoU_0001` or `HPRC_0001` is
+still read as a sample. `tenk10k` and `trexplorer` are whole names, though, so a sample column
+whose header starts with either (e.g. `TenK10K_S1`) is read as an annotation column and is not a
+sample: rename such a sample column before building.
 
 *Population gate.* The `HPRC256_99thPercentile`, `AoU1027_99thPercentile` and
 `TenK10K_99thPercentile` columns (TRExplorer's, unless your matrix supplies them) also gate the
@@ -115,8 +125,8 @@ percentile gates every outlier type. The build records the chosen cohorts in the
 table, and `trails.py` rebuilds the database when the flag changes.
 
 Both rules live in one place in the code, which is the source of truth if this table ever falls
-behind: `ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED` and `ANNOTATION_COLUMN_PREFIXES` in
-`trails/input_tables.py` (applied by `_is_annotation_column`).
+behind: `ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED` (rule 1) and `ANNOTATION_COLUMN_PREFIXES`
+(rule 2) in `trails/input_tables.py`.
 
 In particular, a locus's `gene_id` (TRExplorer's Gencode gene id, or your own column) is what
 joins it to the gene table, which populates the gene-symbol / inheritance / pLI /
@@ -124,7 +134,9 @@ phenotype-summary columns and enables gene-level phenotype scoring.
 
 This is a per-allele genotype matrix from **any** TR genotyping tool — short-read or long-read
 (TRGT, ExpansionHunter, straglr, LongTR, …). TRails only needs the per-allele repeat copy
-numbers, not a tool-specific VCF. `trails.py` (via
+numbers, not a tool-specific VCF. Some tools report fractional copy numbers (straglr, or copy
+numbers computed from LongTR's lengths in bp); round those to whole numbers first, since a
+fractional cell is read as a no-call. `trails.py` (via
 `build_database.build()`) reads it **directly** into the result database — no intermediate
 files are written; the per-locus records described below are built in memory.
 
@@ -200,7 +212,7 @@ documented here only as the internal data model, for contributors. Each record c
 | `OutlierSampleIds_AllAlleles` | `allele:sample_id` entries, comma-separated, **sorted by allele size DESC**, e.g. `11x:GSS225379,11x:PMGRC-111-107-2` |
 | `OutlierSampleIds_ShortAlleles` | same format (short alleles) |
 | `OutlierSampleIds_HemizygousAlleles` | same format (hemizygous) |
-| `ReferenceRegion` | `chrom:start-end`; your matrix's value when it has one, otherwise computed from `LocusId` |
+| `ReferenceRegion` | `chrom:start-end` with a `chr` prefix, a 0-based start and a 1-based end, the same numbers as the `LocusId` (e.g. `chr1:10000-10108` for `1-10000-10108-TAACCC`), as TRExplorer writes it; your matrix's value when it has one, otherwise computed from `LocusId` |
 | `NumRepeatsInReference` | reference allele size in repeat units; your matrix's value when it has one, otherwise computed |
 | `gene_id`, `gene_region` | your matrix's `gene_id` / `gene_region`, or its `GencodeGeneId` / `GencodeGeneRegion` aliases when those are absent; otherwise TRExplorer's Gencode gene id and region; NULL when neither has one |
 
@@ -262,3 +274,20 @@ is uploaded.
 | STRchive disease-locus table (`STRchive-loci.json`) | `--strchive-loci-json` | github.com/dashnowlab/STRchive, downloaded from a built-in default URL and cached locally by the installer (offline-safe); pass the flag to pin your own copy |
 | TRExplorer population statistics and locus annotations (`TRExplorer_v2.1.hg38.annotations.duckdb`) | none | TRExplorer repeat catalog v2.1, hg38 (gs://tandem-repeat-catalog). The installer downloads the annotated catalog table (about 900 MB), keeps the columns TRails uses in this file (about 500 MB) and deletes the download. See "Annotations from TRExplorer" above |
 | gene-disease table (`genelookup_gene_table.tsv.gz`) | `--gene-table` | genelookup.broadinstitute.org, exported through its query service: gene id and symbol, aliases, pLI, LoF O/E upper bound, HGNC id, inheritance, LLM phenotype summary and sources. OMIM's licensed columns are not included (genelookup does not export them). Not versioned, so it is downloaded once and refreshed only with `TRAILS_FORCE=1 ./install.sh` or `.venv/bin/python trails/trails_setup.py --force`; pass `--gene-table` to use your own table instead |
+
+### Your own gene table (`--gene-table`)
+
+A tab-separated table (optionally gzipped) with one row per gene. Column names are matched
+case- and underscore-insensitively, as in every other TSV input, and a blank or `.` cell is
+missing.
+
+| Column | Required? | Fills |
+|--------|-----------|-------|
+| `gene_id` | **required** | the Ensembl gene id the loci are joined on (their `gene_id`). Each gene id may appear on only one row; a repeated one stops the build |
+| `gene_symbol`, `gene_aliases`, `hgnc_gene_id`, `inheritance`, `LLM_phenotype_summary`, `sources` | optional | the matching `GeneTable*` loci columns (`GeneTableGeneSymbol`, ...) |
+| `pLI_v2`, `pLI_v4`, `lof_oe_ci_upper_v4` | optional | `GeneTablepLI_v2`, `GeneTablepLI_v4`, `GeneTableLoeuf`, and `pLI`, the larger of the two pLI values |
+| `disease_category` | optional | `GeneTableDiseaseCategory`, shown as the swim plot's "Disease Category". genelookup's table has no such column, so with the downloaded table it is always empty |
+
+`inheritance` and `sources` also decide `IsInMendelianGene` (see the `IsInMendelianGene` row of
+section 1). The column list lives in `GENE_TABLE_COLUMN_BY_SOURCE_FIELD` in
+`trails/analysis_columns.py`.

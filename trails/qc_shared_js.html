@@ -2,14 +2,16 @@
 // =========================================================================
 // Shared QC helpers used by index_page_template.html, sample_qc_template.html,
 // qc2_template.html, and swim_plot_template.html. Kept in one place so fixes to the
-// box-plot stats / Mendelian-warning popup can't drift between the pages. (escapeHtml,
-// isAffectedStatus, ESCAPING_ADDITIONS_DROPDOWN_SETTINGS, setupDropdownMenu, getDropdownValue,
-// renderMendelianWarning, computeBoxStats, computePercentile, jitterFromKey,
-// singleBinBoxPlotPlugin, the QC pages' per-bin builders
-// appendQCBinCard and createSingleBinBoxPlotChart, and the Mendelian-warning popup handler.)
+// box-plot stats / Mendelian-warning popup can't drift between the pages.
+// Defines: escapeHtml, isAffectedStatus, ESCAPING_ADDITIONS_DROPDOWN_SETTINGS, setupDropdownMenu,
+// getDropdownValue, renderMendelianWarning, medianOfSorted, computeBoxStats, computePercentile,
+// jitterFromKey, singleBinBoxPlotPlugin, the QC pages' per-bin builders appendQCBinCard and
+// createSingleBinBoxPlotChart, their grouping and loading helpers groupRowsByBin and
+// drawQCPageOnLoad, and the Mendelian-warning popup handler.
 // Page-specific pieces (MOTIF_BINS, MENDELIAN_WARNINGS, each chart's data and options) stay in each page.
-// Requires Chart.js + jQuery (loaded by header_template.html) and the page-level
-// MENDELIAN_WARNINGS and OUTLIER_WARNINGS consts (referenced only at call time).
+// Requires Chart.js + jQuery (loaded by header_template.html) and the page-level MENDELIAN_WARNINGS
+// const. renderMendelianWarning also reads OUTLIER_WARNINGS unless the page passes
+// mendelianOnly: true (QC2 does, and does not define it). Both are referenced only at call time.
 // =========================================================================
 
 // HTML escaping helper
@@ -109,33 +111,25 @@ function renderMendelianWarning(sampleId, { mendelianOnly = false } = {}) {
                data-sample-id="${escapeHtml(sampleId)}"></i>`;
 }
 
-// Compute box plot statistics for an array of values
-function computeBoxStats(values) {
-    if (!values || values.length === 0) {
+// The median of an array sorted ascending, or null when it is empty
+function medianOfSorted(sorted) {
+    const n = sorted.length;
+    if (n === 0) return null;
+    return n % 2 === 0 ? (sorted[n / 2 - 1] + sorted[n / 2]) / 2 : sorted[Math.floor(n / 2)];
+}
+
+// Compute box plot statistics for an array of values sorted ascending
+function computeBoxStats(sorted) {
+    if (!sorted || sorted.length === 0) {
         return { min: null, q1: null, median: null, q3: null, max: null };
     }
-    const sorted = values.slice().sort((a, b) => a - b);
     const n = sorted.length;
+    const median = medianOfSorted(sorted);
 
-    const median = n % 2 === 0
-        ? (sorted[n / 2 - 1] + sorted[n / 2]) / 2
-        : sorted[Math.floor(n / 2)];
-
-    // Q1: median of lower half
-    const lowerHalf = sorted.slice(0, Math.floor(n / 2));
-    const q1 = lowerHalf.length > 0
-        ? (lowerHalf.length % 2 === 0
-            ? (lowerHalf[lowerHalf.length / 2 - 1] + lowerHalf[lowerHalf.length / 2]) / 2
-            : lowerHalf[Math.floor(lowerHalf.length / 2)])
-        : median;
-
-    // Q3: median of upper half
-    const upperHalf = sorted.slice(Math.ceil(n / 2));
-    const q3 = upperHalf.length > 0
-        ? (upperHalf.length % 2 === 0
-            ? (upperHalf[upperHalf.length / 2 - 1] + upperHalf[upperHalf.length / 2]) / 2
-            : upperHalf[Math.floor(upperHalf.length / 2)])
-        : median;
+    // Q1 and Q3: the medians of the lower and upper halves (an odd count's middle value is in
+    // neither), or the median itself when the halves are empty (a single value)
+    const q1 = medianOfSorted(sorted.slice(0, Math.floor(n / 2))) ?? median;
+    const q3 = medianOfSorted(sorted.slice(Math.ceil(n / 2))) ?? median;
 
     // Whiskers: 1.5 * IQR
     const iqr = q3 - q1;
@@ -338,7 +332,6 @@ function appendQCBinCard(container, binIndex, bin, tableTitle, tableHeaderHtml, 
 //   tooltipLines(point): the lines of a dot's tooltip.
 function createSingleBinBoxPlotChart(canvasId, points, options) {
     const ctx = document.getElementById(canvasId).getContext('2d');
-    const values = points.map(point => point.y);
 
     const yTicks = { font: { size: 10 }, maxTicksLimit: 6 };
     if (options.yTickLabel) yTicks.callback = options.yTickLabel;
@@ -359,6 +352,10 @@ function createSingleBinBoxPlotChart(canvasId, points, options) {
         options: {
             responsive: true,
             maintainAspectRatio: false,
+            // Room right of the chart area for the '95%' / '99%' labels singleBinBoxPlotPlugin
+            // draws 2px past its right edge (about 18px wide in its 9px font); without it they
+            // fall outside the canvas and are cut off
+            layout: { padding: { right: 22 } },
             scales: {
                 x: {
                     type: 'linear',
@@ -389,17 +386,49 @@ function createSingleBinBoxPlotChart(canvasId, points, options) {
         }
     });
 
-    // Store box stats for the custom plugin
-    chart.config._boxStats = computeBoxStats(values);
-
-    // Compute and store percentiles for the custom plugin
-    const sortedValues = values.slice().sort((a, b) => a - b);
+    // Store box stats and percentiles for the custom plugin, from one sorted copy of the values
+    const sortedValues = points.map(point => point.y).sort((a, b) => a - b);
+    chart.config._boxStats = computeBoxStats(sortedValues);
     chart.config._percentiles = {
         p95: computePercentile(sortedValues, 95),
         p99: computePercentile(sortedValues, 99)
     };
 
     return chart;
+}
+
+// The rows of a QC section grouped by their bin: {bin: [rows]} for each name in bins, in that
+// order. A row whose bin is not listed is left out.
+function groupRowsByBin(rows, bins) {
+    const rowsByBin = {};
+    bins.forEach(bin => { rowsByBin[bin] = []; });
+    rows.forEach(row => {
+        if (rowsByBin[row.bin] !== undefined) rowsByBin[row.bin].push(row);
+    });
+    return rowsByBin;
+}
+
+// Once a QC page (Sample QC, QC2) has loaded, fetch its data from API_BASE_URL/endpoint, hide the
+// loading indicator, show the sections whose element ids are in sectionIds and call
+// drawSections(data). If the request or the drawing fails, the indicator gives way to
+// "Failed to load <dataName>: <message>" in #qc-error.
+function drawQCPageOnLoad(endpoint, dataName, sectionIds, drawSections) {
+    document.addEventListener('DOMContentLoaded', async function() {
+        try {
+            const response = await fetch(`${API_BASE_URL}/${endpoint}`);
+            if (!response.ok) throw await errorFromResponse(response);
+            const data = await response.json();
+
+            document.getElementById('qc-loading').style.display = 'none';
+            sectionIds.forEach(id => { document.getElementById(id).style.display = 'block'; });
+            drawSections(data);
+        } catch (err) {
+            console.error(`Load ${dataName} error:`, err);
+            document.getElementById('qc-loading').style.display = 'none';
+            document.getElementById('qc-error').style.display = 'block';
+            document.getElementById('qc-error').textContent = `Failed to load ${dataName}: ` + err.message;
+        }
+    });
 }
 
 // Warning icon click handler — show violation rates and/or outlier info popup
@@ -428,11 +457,11 @@ document.addEventListener('click', function(e) {
     const existingPopup = document.querySelector('.mendelian-warning-popup');
     if (existingPopup) existingPopup.remove();
 
-    // Format percentage with color coding
-    const formatRate = (rate, threshold = 0.10) => {
-        const pct = (rate * 100).toFixed(1) + '%';
-        return rate > threshold ? `<span class="high-rate">${pct}</span>` : pct;
-    };
+    // A rate as a percentage. The server flags a sample when its autosome or chrX rate is above
+    // MENDELIAN_VIOLATION_RATE_WARNING_THRESHOLD (0.10, results_server.py), so formatRate highlights
+    // those two rows above it; the chrY and motif-size rows are shown for context, never highlighted.
+    const formatPercent = rate => (rate * 100).toFixed(1) + '%';
+    const formatRate = rate => rate > 0.10 ? `<span class="high-rate">${formatPercent(rate)}</span>` : formatPercent(rate);
 
     // Determine warning types
     const hasMendelian = warning.autosome_rate !== undefined;
@@ -448,7 +477,7 @@ document.addEventListener('click', function(e) {
         html += '<table class="invisible-table">';
         html += `<tr><td style="font-weight:600;color:#555;">Autosome</td><td style="text-align:right;">${formatRate(warning.autosome_rate)}</td><td style="color:#888;">(${warning.autosome_violations.toLocaleString()} / ${warning.autosome_total.toLocaleString()})</td></tr>`;
         html += `<tr><td style="font-weight:600;color:#555;">chrX</td><td style="text-align:right;">${formatRate(warning.chrX_rate)}</td><td style="color:#888;">(${warning.chrX_violations.toLocaleString()} / ${warning.chrX_total.toLocaleString()})</td></tr>`;
-        html += `<tr><td style="font-weight:600;color:#555;">chrY</td><td style="text-align:right;">${formatRate(warning.chrY_rate, 1.0)}</td><td style="color:#888;">(${warning.chrY_violations.toLocaleString()} / ${warning.chrY_total.toLocaleString()})</td></tr>`;
+        html += `<tr><td style="font-weight:600;color:#555;">chrY</td><td style="text-align:right;">${formatPercent(warning.chrY_rate)}</td><td style="color:#888;">(${warning.chrY_violations.toLocaleString()} / ${warning.chrY_total.toLocaleString()})</td></tr>`;
         html += '</table>';
 
         // Motif size breakdown for Mendelian
@@ -456,13 +485,9 @@ document.addEventListener('click', function(e) {
             html += '<div class="motif-section">';
             html += '<div class="motif-section-header">By Motif Size</div>';
             html += '<div class="motif-grid">';
-            const motifLabels = {
-                '1bp': '1bp', '2bp': '2bp', '3bp': '3bp', '4bp': '4bp',
-                '5bp': '5bp', '6bp': '6bp', '7_24bp': '7-24bp', '25plusbp': '25+bp'
-            };
-            for (const [cat, data] of Object.entries(warning.motif_rates)) {
-                const label = motifLabels[cat] || cat;
-                html += `<div class="motif-item"><span>${label}:</span><span>${formatRate(data.rate, 1.0)}</span></div>`;
+            // Keyed by the bin labels the server shows (MENDELIAN_MOTIF_SIZE_BINS in results_server.py)
+            for (const [label, data] of Object.entries(warning.motif_rates)) {
+                html += `<div class="motif-item"><span>${escapeHtml(label)}:</span><span>${formatPercent(data.rate)}</span></div>`;
             }
             html += '</div></div>';
         }

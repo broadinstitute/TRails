@@ -169,9 +169,6 @@ def parse_outlier_entries(value, locus_id=None, column=None):
     if is_missing_outlier_value(value):
         return []
 
-    if not isinstance(value, str):
-        value = str(value)
-
     entries = []
     for raw_entry in [part for part in value.split(",") if part]:
         fields = raw_entry.split(":")

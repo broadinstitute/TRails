@@ -39,6 +39,7 @@ CLI, from the TRails directory (the build needs the packages in .venv/):
 """
 
 import argparse
+import os
 
 import allele_histograms
 import analysis_columns
@@ -81,7 +82,7 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
             one column per sample).
         sample_metadata_tsv: One row per sample (only sample_id required).
         db_path: Output DuckDB database path. Written atomically (``<path>.tmp``
-            then ``os.replace``).
+            then ``os.replace``); a missing directory for it is created first.
         phenotypes_table: Optional HPO-terms-per-sample TSV.
         gene_table: Optional gene-disease table (gene_id keyed).
         genes_to_phenotype: Optional HPO genes_to_phenotype.txt (reference) for
@@ -112,6 +113,10 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
     Returns:
         The path of the written database (``db_path``).
     """
+    # The database is first written at the very end (Stage 11), so a missing directory for it is
+    # created now rather than discovered after every stage before has run.
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+
     # Stage 1: read the repeat-copy-numbers matrix into per-locus rows.
     print(f"Reading repeat-copy-numbers matrix: {repeat_copy_numbers_tsv}")
     locus_rows, sample_id_list = input_tables.read_repeat_copy_numbers(repeat_copy_numbers_tsv)
@@ -272,7 +277,7 @@ def build(repeat_copy_numbers_tsv, sample_metadata_tsv, db_path,
 
         result_database.finalize_database(connection, tmp_path, db_path)
     except Exception:
-        connection.close()
+        result_database.discard_new_database(connection, tmp_path)
         raise
 
     print(f"Done: {db_path}")

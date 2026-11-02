@@ -9,40 +9,7 @@ from swim_plot import (
     _compute_motif_category,
     generate_swim_plot_table,
 )
-
-
-def _make_record(**overrides):
-    """Build a minimal locus record with all swim-plot inputs, overridable."""
-    record = {
-        "LocusId": "1-100-110-AT",
-        "Motif": "AT",
-        "CanonicalMotif": "AT",
-        "MotifSize": 2,
-        "gene_region": "intron",
-        "GeneTableGeneSymbol": "GENE1",
-        "IsInMendelianGene": 0,
-        "IsKnownMotif": 0,
-        "gene_id": "ENSG1",
-        "pLI": 0.5,
-        "NumRepeatsInReference": 5,
-        "HPRC256_MaxAllele": None,
-        "AoU1027_MaxAllele": None,
-        "TenK10K_MaxAllele": None,
-        "HPRC256_99thPercentile": None,
-        "AoU1027_99thPercentile": None,
-        "TenK10K_99thPercentile": None,
-        "HPRC256_StdevPercentile": None,
-        "AoU1027_StdevPercentile": None,
-        "Source": "TRails",
-        "OutlierSampleIds_AllAlleles": None,
-        "OutlierSampleIds_ShortAlleles": None,
-        "OutlierSampleIds_HemizygousAlleles": None,
-        "FirstUnaffectedAlleleSize_AllAlleles": None,
-        "FirstUnaffectedAlleleSize_ShortAlleles": None,
-        "FirstUnaffectedAlleleSize_HemizygousAlleles": None,
-    }
-    record.update(overrides)
-    return record
+from tests.database_test_helpers import make_locus_record_with_every_swim_plot_input
 
 
 class MotifCategoryTests(unittest.TestCase):
@@ -74,7 +41,7 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
     def test_one_row_per_outlier_entry(self):
         sample_lookup = self._sample_lookup()
         records = [
-            _make_record(OutlierSampleIds_AllAlleles="40x:S1,30x:S2,20x:S3"),
+            make_locus_record_with_every_swim_plot_input(OutlierSampleIds_AllAlleles="40x:S1,30x:S2,20x:S3"),
         ]
         rows = generate_swim_plot_table(records, sample_lookup)
         self.assertEqual(len(rows), 3)
@@ -83,7 +50,7 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
     def test_rank_ordering_largest_is_rank_one(self):
         sample_lookup = self._sample_lookup()
         # Provide entries out of order; parse sorts descending, so 40 -> rank 1.
-        records = [_make_record(OutlierSampleIds_AllAlleles="20x:S3,40x:S1,30x:S2")]
+        records = [make_locus_record_with_every_swim_plot_input(OutlierSampleIds_AllAlleles="20x:S3,40x:S1,30x:S2")]
         rows = generate_swim_plot_table(records, sample_lookup)
         self.assertEqual(rows[0]["allele_size"], 40)
         self.assertEqual(rows[0]["outlier_rank"], 1)
@@ -95,13 +62,13 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
     def test_row_keys_are_the_table_columns(self):
         # result_database.write_swim_plot declares the table from SWIM_PLOT_COLUMNS.
         sample_lookup = self._sample_lookup()
-        records = [_make_record(OutlierSampleIds_AllAlleles="40x:S1")]
+        records = [make_locus_record_with_every_swim_plot_input(OutlierSampleIds_AllAlleles="40x:S1")]
         rows = generate_swim_plot_table(records, sample_lookup)
         self.assertEqual(list(rows[0]), SWIM_PLOT_COLUMNS)
 
     def test_affected_and_analysis_title_cased_on_rows(self):
         sample_lookup = self._sample_lookup()
-        records = [_make_record(OutlierSampleIds_AllAlleles="40x:S1,30x:S2")]
+        records = [make_locus_record_with_every_swim_plot_input(OutlierSampleIds_AllAlleles="40x:S1,30x:S2")]
         rows = generate_swim_plot_table(records, sample_lookup)
         self.assertEqual(rows[0]["affected_status"], "Affected")
         self.assertEqual(rows[0]["analysis_status"], "Unsolved")
@@ -114,13 +81,13 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
         # swim-plot row shows the entered "Possibly Affected".
         sample_lookup = self._sample_lookup()
         sample_lookup["S1"]["affected_status"] = "possibly affected"
-        records = [_make_record(OutlierSampleIds_AllAlleles="40x:S1")]
+        records = [make_locus_record_with_every_swim_plot_input(OutlierSampleIds_AllAlleles="40x:S1")]
         rows = generate_swim_plot_table(records, sample_lookup)
         self.assertEqual(rows[0]["affected_status"], "Possibly Affected")
 
     def test_is_above_first_unaffected_flag(self):
         sample_lookup = self._sample_lookup()
-        records = [_make_record(
+        records = [make_locus_record_with_every_swim_plot_input(
             OutlierSampleIds_AllAlleles="40x:S1,30x:S2,25x:S3",
             FirstUnaffectedAlleleSize_AllAlleles=30,
         )]
@@ -133,7 +100,7 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
 
     def test_is_above_first_unaffected_when_no_unaffected(self):
         sample_lookup = self._sample_lookup()
-        records = [_make_record(
+        records = [make_locus_record_with_every_swim_plot_input(
             OutlierSampleIds_AllAlleles="40x:S1",
             FirstUnaffectedAlleleSize_AllAlleles=None,
         )]
@@ -144,7 +111,7 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
     def test_a_zero_repeat_allele_is_flagged_as_the_affected_count_counts_it(self):
         # With no unaffected sample, #Aff counts a 0-repeat (fully deleted) affected allele, so
         # the swim plot's is_above_first_unaffected flag must say the same.
-        records = [_make_record(OutlierSampleIds_ShortAlleles="7x:S3,5x:S2,0x:S1")]
+        records = [make_locus_record_with_every_swim_plot_input(OutlierSampleIds_ShortAlleles="7x:S3,5x:S2,0x:S1")]
         sample_lookup = {sample_id: {"affected_status": "affected"} for sample_id in ("S1", "S2", "S3")}
         affected_lookup = {sample_id: "affected" for sample_id in sample_lookup}
         counted_rows = analysis_columns.add_all_outlier_columns(records, sample_lookup, affected_lookup, {})
@@ -157,9 +124,12 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
     def test_motif_category_bins(self):
         sample_lookup = self._sample_lookup()
         records = [
-            _make_record(LocusId="L_small", MotifSize=3, OutlierSampleIds_AllAlleles="40x:S1"),
-            _make_record(LocusId="L_big", MotifSize=30, OutlierSampleIds_AllAlleles="40x:S1"),
-            _make_record(LocusId="L_unknown", MotifSize=None, OutlierSampleIds_AllAlleles="40x:S1"),
+            make_locus_record_with_every_swim_plot_input(
+                LocusId="L_small", MotifSize=3, OutlierSampleIds_AllAlleles="40x:S1"),
+            make_locus_record_with_every_swim_plot_input(
+                LocusId="L_big", MotifSize=30, OutlierSampleIds_AllAlleles="40x:S1"),
+            make_locus_record_with_every_swim_plot_input(
+                LocusId="L_unknown", MotifSize=None, OutlierSampleIds_AllAlleles="40x:S1"),
         ]
         rows = generate_swim_plot_table(records, sample_lookup)
         by_locus = {r["LocusId"]: r["motif_category"] for r in rows}
@@ -169,7 +139,7 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
 
     def test_all_three_outlier_types_emitted(self):
         sample_lookup = self._sample_lookup()
-        records = [_make_record(
+        records = [make_locus_record_with_every_swim_plot_input(
             OutlierSampleIds_AllAlleles="40x:S1",
             OutlierSampleIds_ShortAlleles="20x:S2",
             OutlierSampleIds_HemizygousAlleles="15x:S3",
@@ -181,12 +151,12 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
 
     def test_missing_outlier_value_skipped(self):
         sample_lookup = self._sample_lookup()
-        records = [_make_record(OutlierSampleIds_AllAlleles=".")]
+        records = [make_locus_record_with_every_swim_plot_input(OutlierSampleIds_AllAlleles=".")]
         self.assertEqual(generate_swim_plot_table(records, sample_lookup), [])
 
     def test_sample_missing_metadata_treated_as_none(self):
         sample_lookup = self._sample_lookup()
-        records = [_make_record(OutlierSampleIds_AllAlleles="40x:UNKNOWN_SAMPLE")]
+        records = [make_locus_record_with_every_swim_plot_input(OutlierSampleIds_AllAlleles="40x:UNKNOWN_SAMPLE")]
         rows = generate_swim_plot_table(records, sample_lookup)
         self.assertEqual(len(rows), 1)
         self.assertIsNone(rows[0]["family_id"])
@@ -197,7 +167,7 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
 
     def test_locus_passthrough_columns_present(self):
         sample_lookup = self._sample_lookup()
-        records = [_make_record(OutlierSampleIds_AllAlleles="40x:S1")]
+        records = [make_locus_record_with_every_swim_plot_input(OutlierSampleIds_AllAlleles="40x:S1")]
         row = generate_swim_plot_table(records, sample_lookup)[0]
         for column in SWIM_PLOT_LOCUS_COLUMNS:
             self.assertIn(column, row)
@@ -208,7 +178,7 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
     def test_phenotype_nan_becomes_none(self):
         sample_lookup = self._sample_lookup()
         sample_lookup["S9"] = {"family_id": "F9", "sex": "female", "phenotype_description": float("nan")}
-        records = [_make_record(OutlierSampleIds_AllAlleles="40x:S9")]
+        records = [make_locus_record_with_every_swim_plot_input(OutlierSampleIds_AllAlleles="40x:S9")]
         rows = generate_swim_plot_table(records, sample_lookup)
         self.assertIsNone(rows[0]["phenotype_description"])
 
@@ -219,7 +189,7 @@ class GenerateSwimPlotTableTests(unittest.TestCase):
         sample_lookup = self._sample_lookup()
         sample_lookup["S9"] = {"family_id": "", "sex": " ", "phenotype_description": ""}
         sample_lookup["S8"] = {"family_id": "NA", "sex": "NA", "phenotype_description": "null"}
-        records = [_make_record(OutlierSampleIds_AllAlleles="40x:S9,30x:S8")]
+        records = [make_locus_record_with_every_swim_plot_input(OutlierSampleIds_AllAlleles="40x:S9,30x:S8")]
         for row in generate_swim_plot_table(records, sample_lookup):
             self.assertIsNone(row["family_id"], row["sample_id"])
             self.assertIsNone(row["sex"], row["sample_id"])

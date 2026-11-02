@@ -22,7 +22,7 @@ import duckdb_compat
 import result_database
 import results_server
 import swim_plot
-from tests.server_test_fixtures import ServerTestCase, make_swim_plot_row
+from tests.server_test_fixtures import ServerTestCase, make_swim_plot_row, read_gzipped_tsv_rows
 
 
 # LocusId, Chrom, Start0Based, End1Based, CanonicalMotif, gene symbol, Ensembl id,
@@ -135,7 +135,6 @@ class SearchQueryTests(ServerTestCase):
         super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "test_results.duckdb")
         _build_test_db(cls.db_path)
-        results_server.app.config["DB_PATH"] = cls.db_path
         conn = duckdb_compat.connect(cls.db_path, read_only=True)
         try:
             results_server.app.config["DB_COLUMNS_SET"] = duckdb_compat.table_columns(conn, "loci")
@@ -181,6 +180,14 @@ class SearchQueryTests(ServerTestCase):
         self.assertEqual(self._search("fmr1"), {"1-100-110-AT"})
         self.assertEqual(self._search("ATXN"), {"2-200-209-AAG"})
 
+    def test_gene_symbol_wildcard_characters_match_literally(self):
+        # Read as ILIKE wildcards, "%" would match every gene symbol, "FMR_" FMR1 and "AT%1" ATXN1,
+        # in the search box and in the gene_symbol parameter alike
+        for text in ("%", "FMR_", "AT%1"):
+            self.assertEqual(self._search(text), set(), text)
+            self.assertEqual(self._query(gene_symbol=[text]), set(), text)
+        self.assertEqual(self._query(gene_symbol=["FMR1"]), {"1-100-110-AT"})
+
     def test_no_match(self):
         self.assertEqual(self._search("NOTAGENE"), set())
 
@@ -225,16 +232,12 @@ class SearchQueryTests(ServerTestCase):
         # so there is nothing for them to exclude and every locus survives. Failing closed here
         # instead would empty the whole result the moment either box was ticked.
         all_loci = {locus[0] for locus in TEST_LOCI}
-        original = results_server.app.config["DB_COLUMNS_SET"]
-        try:
-            results_server.app.config["DB_COLUMNS_SET"] = original - {"VariationClusterFilterReason"}
-            self.assertEqual(self._query(exclude_vc_depth_filtered=True), all_loci)
-            self.assertEqual(self._query(exclude_vc_size_filtered=True), all_loci)
-            self.assertEqual(
-                self._query(exclude_vc_depth_filtered=True, exclude_vc_size_filtered=True),
-                all_loci)
-        finally:
-            results_server.app.config["DB_COLUMNS_SET"] = original
+        self.leave_columns_out_of_the_database_for_one_test("VariationClusterFilterReason")
+        self.assertEqual(self._query(exclude_vc_depth_filtered=True), all_loci)
+        self.assertEqual(self._query(exclude_vc_size_filtered=True), all_loci)
+        self.assertEqual(
+            self._query(exclude_vc_depth_filtered=True, exclude_vc_size_filtered=True),
+            all_loci)
 
     def test_variation_cluster_filter_combines_with_search(self):
         # Separate filters still AND with each other; only terms inside the search box OR.
@@ -248,26 +251,17 @@ class SearchQueryTests(ServerTestCase):
         # A database built without the gene table or without TRExplorer annotations must not
         # 500; the affected term drops out of the OR, and a filter left with nothing matches
         # nothing rather than everything.
-        original = results_server.app.config["DB_COLUMNS_SET"]
-        try:
-            results_server.app.config["DB_COLUMNS_SET"] = original - {"GeneTableGeneSymbol"}
-            self.assertEqual(self._search("FMR1"), set())
-            self.assertEqual(self._search("FMR1, 2-200-209-AAG"), {"2-200-209-AAG"})
-        finally:
-            results_server.app.config["DB_COLUMNS_SET"] = original
+        self.leave_columns_out_of_the_database_for_one_test("GeneTableGeneSymbol")
+        self.assertEqual(self._search("FMR1"), set())
+        self.assertEqual(self._search("FMR1, 2-200-209-AAG"), {"2-200-209-AAG"})
 
     def test_variation_cluster_filter_passes_everything_without_the_column(self):
         # This filter is the exception to the rule above: its clause deliberately keeps loci whose
         # VariationClusterSizeDiff is NULL or "", so a database with no such column at all is the
         # same situation for every locus and every locus passes. Matching nothing instead would
         # contradict how the filter treats missing data when the column is present.
-        original = results_server.app.config["DB_COLUMNS_SET"]
-        try:
-            results_server.app.config["DB_COLUMNS_SET"] = original - {"VariationClusterSizeDiff"}
-            self.assertEqual(self._query(max_variation_cluster_size_diff=20),
-                             self._query())
-        finally:
-            results_server.app.config["DB_COLUMNS_SET"] = original
+        self.leave_columns_out_of_the_database_for_one_test("VariationClusterSizeDiff")
+        self.assertEqual(self._query(max_variation_cluster_size_diff=20), self._query())
 
 
 class PopulationFilterTestCase(ServerTestCase):
@@ -384,6 +378,33 @@ class RequireAbovePopulationTests(PopulationFilterTestCase):
         self.assertIsNotNone(error_response)
 
 
+class MinSigmaPercentileTests(PopulationFilterTestCase):
+    """min_sigma_percentile=0.9 keeps the loci whose HPRC256 or AoU1027 percentile is at most 0.1."""
+
+    COLUMNS = ("FirstAffectedAlleleSize_AllAlleles", "HPRC256_StdevPercentile", "AoU1027_StdevPercentile")
+    LOCI = (
+        ("A", 50, 0.05, None),
+        ("B", 50, None, 0.08),
+        ("C", 50, 0.5, 0.5),
+        ("D", 50, None, None),
+        ("E", 50, 0.5, 0.02),
+    )
+
+    def test_either_cohort_is_enough(self):
+        self.assertEqual(self._query(min_sigma_percentile=0.9), {"A", "B", "E"})
+
+    def test_only_the_present_cohort_column_is_compared(self):
+        results_server.app.config["DB_COLUMNS_SET"] -= {"AoU1027_StdevPercentile"}
+        self.assertEqual(self._query(min_sigma_percentile=0.9), {"A"})
+        results_server.app.config["DB_COLUMNS_SET"] = (
+            results_server.app.config["DB_COLUMNS_SET"] - {"HPRC256_StdevPercentile"} | {"AoU1027_StdevPercentile"})
+        self.assertEqual(self._query(min_sigma_percentile=0.9), {"B", "E"})
+
+    def test_matches_nothing_without_either_column(self):
+        results_server.app.config["DB_COLUMNS_SET"] -= {"HPRC256_StdevPercentile", "AoU1027_StdevPercentile"}
+        self.assertEqual(self._query(min_sigma_percentile=0.0), set())
+
+
 class SplitSearchTermsTests(unittest.TestCase):
     """Commas separate terms, except inside a region's coordinates."""
 
@@ -397,6 +418,15 @@ class SplitSearchTermsTests(unittest.TestCase):
         self.assertEqual(
             results_server.split_search_terms("FMR1, chr16:11,579,459-11,579,529, ENSG00000102081"),
             ["FMR1", "chr16:11,579,459-11,579,529", "ENSG00000102081"])
+        self.assertEqual(results_server.split_search_terms("chr1:1,000,000-2,000,000"), ["chr1:1,000,000-2,000,000"])
+
+    def test_a_comma_not_followed_by_exactly_three_digits_separates_terms(self):
+        # Otherwise "chr1:100-200,16" would be read as the single region chr1:100-20016
+        self.assertEqual(results_server.split_search_terms("chr1:100-200,16"), ["chr1:100-200", "16"])
+        self.assertEqual(results_server.split_search_terms("chr1:100-200,1634"), ["chr1:100-200", "1634"])
+        # The same for a single position: chr1:100 and all of chr16
+        self.assertEqual(results_server.split_search_terms("chr1:100,16"), ["chr1:100", "16"])
+        self.assertEqual(results_server.split_search_terms("chr1:1,000,16"), ["chr1:1,000", "16"])
 
     def test_ordinary_lists_still_split(self):
         self.assertEqual(results_server.split_search_terms("FMR1,HTT"), ["FMR1", "HTT"])
@@ -429,8 +459,9 @@ class VariationClusterSortTests(ServerTestCase):
             NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles INTEGER,
             OutlierSampleIds_AllAlleles TEXT
         )""")
-        # Stored as TEXT, the way TRExplorer writes them. Compared as strings "9" beats "20"
-        # beats "148", which is the exact reverse of the intended widest-cluster-first order.
+        # Declared TEXT here, the VARCHAR case result_database.infer_column_types produces when a
+        # value is not an integer. Compared as strings "9" beats "20" beats "148", the exact
+        # reverse of the intended widest-cluster-first order.
         conn.executemany("INSERT INTO loci VALUES (?, ?, ?, ?)", [
             ("1-100-110-AT", "9", 1, "6x:sampleA"),
             ("2-200-209-AAG", "20", 1, "6x:sampleB"),
@@ -442,7 +473,6 @@ class VariationClusterSortTests(ServerTestCase):
 
     def setUp(self):
         # Set before every test, since a test may narrow it
-        results_server.app.config["DB_PATH"] = self.db_path
         results_server.app.config["DB_COLUMNS_SET"] = {
             "LocusId", "VariationClusterSizeDiff",
             "NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles",
@@ -537,7 +567,6 @@ class VariationClusterTypeTests(ServerTestCase):
         finally:
             conn.close()
 
-        results_server.app.config["DB_PATH"] = db_path
         results_server.app.config["DB_COLUMNS_SET"] = set(self.COLUMNS)
         return declared, set(self.get_locus_ids_from_api_query(db_path, **extra_params))
 
@@ -645,7 +674,7 @@ class BlankFilterValueTests(EndpointConfigTestCase):
 
     def test_blank_list_filters_are_dropped(self):
         for param in ("locus_id", "gene_symbol", "phenotype_keyword", "sample_id_keyword",
-                      "sample_id_like", "motif", "motif_size"):
+                      "sample_id_like", "motif", "motif_size", "gene_regions", "exclude_gene_regions"):
             for raw in (",", " , ", ",,"):
                 data = self._loci(f"{param}={raw}")
                 self.assertEqual({r["LocusId"] for r in data["results"]}, self.ALL_LOCUS_IDS,
@@ -677,6 +706,21 @@ class BlankFilterValueTests(EndpointConfigTestCase):
         self.assertEqual(
             {r["LocusId"] for r in self._loci("sample_id_like=sampleC")["results"]},
             {"chr2-200-209-AAG"})
+
+    def test_gene_regions_drop_blank_entries_and_still_reject_unknown_names(self):
+        for query, regions, locus_ids in (
+                ("gene_regions=cds,", ["cds"], {"chr1-100-110-AT"}),
+                ("gene_regions=,cds", ["cds"], {"chr1-100-110-AT"}),
+                ("gene_regions=cds,,intron", ["cds", "intron"], self.ALL_LOCUS_IDS)):
+            data = self._loci(query)
+            self.assertEqual({r["LocusId"] for r in data["results"]}, locus_ids, query)
+            self.assertEqual(data["filters_applied"]["gene_regions"], regions, query)
+        self.assertEqual({r["LocusId"] for r in self._loci("exclude_gene_regions=cds,")["results"]},
+                         {"chr2-200-209-AAG"})
+        for name in ("gene_regions", "exclude_gene_regions"):
+            response = self.client.get(f"/api/v1/loci?outlier_type=all&{name}=cds,foo,")
+            self.assertEqual(response.status_code, 400, name)
+            self.assertIn(f"{name} contains invalid values: ['foo']", response.get_json()["detail"][0])
 
 
 class VariationClusterFilterWithoutTheColumnTests(EndpointConfigTestCase):
@@ -720,17 +764,48 @@ class DiseaseCatalogStartupTests(ServerTestCase):
         super().setUpClass()
         cls.db_path = os.path.join(cls.tmpdir, "catalog_results.duckdb")
         _build_endpoint_test_db(cls.db_path)
+        # The build recorded no disease locus for chr1-100-110-AT, which the STRchive file below
+        # matches, and one for chr2-200-209-AAG, which it does not
+        cls.db_with_known_disease_column_path = os.path.join(cls.tmpdir, "known_disease_column_results.duckdb")
+        _build_endpoint_test_db(cls.db_with_known_disease_column_path)
+        conn = duckdb_compat.connect(cls.db_with_known_disease_column_path)
+        try:
+            conn.execute("ALTER TABLE loci ADD COLUMN KnownDiseaseLocus TEXT DEFAULT ''")
+            conn.execute("UPDATE loci SET KnownDiseaseLocus = 'ATXN1' WHERE LocusId = 'chr2-200-209-AAG'")
+        finally:
+            conn.close()
+        fmr1_test_locus = {
+            "id": "FMR1_test",
+            "disease": "Test syndrome",
+            "pathogenic_min": 5,
+            "chrom": "chr1",
+            "start_hg38": 100,
+            "stop_hg38": 110,
+            "reference_motif_reference_orientation": ["AT"],
+            "pathogenic_motif_reference_orientation": ["AT"],
+        }
         cls.strchive_path = os.path.join(cls.tmpdir, "STRchive-loci.json")
         with open(cls.strchive_path, "wt") as output_file:
-            json.dump([{
-                "id": "FMR1_test",
-                "disease": "Test syndrome",
-                "chrom": "chr1",
-                "start_hg38": 100,
-                "stop_hg38": 110,
-                "reference_motif_reference_orientation": ["AT"],
-                "pathogenic_motif_reference_orientation": ["AT"],
+            json.dump([fmr1_test_locus], output_file)
+        # Also matches chr2-200-209-AAG, whose stored KnownDiseaseLocus names another disease locus
+        cls.strchive_with_a_second_match_path = os.path.join(cls.tmpdir, "STRchive-loci-with-a-second-match.json")
+        with open(cls.strchive_with_a_second_match_path, "wt") as output_file:
+            json.dump([fmr1_test_locus, {
+                "id": "ATXN1_other",
+                "disease": "Other test syndrome",
+                "chrom": "chr2",
+                "start_hg38": 200,
+                "stop_hg38": 209,
+                "reference_motif_reference_orientation": ["AAG"],
+                "pathogenic_motif_reference_orientation": ["AAG"],
             }], output_file)
+
+    def _known_disease_locus_by_locus_id_in_the_list_and_the_tsv_export(self):
+        """Return the KnownDiseaseLocus of every locus, as /api/v1/loci and as the TSV export give it."""
+        results = self.client.get("/api/v1/loci?outlier_type=all").get_json()["results"]
+        tsv_rows = read_gzipped_tsv_rows(self.client.get("/api/v1/export?outlier_type=all&format=tsv"))
+        return ({r["LocusId"]: r["KnownDiseaseLocus"] for r in results},
+                {r["LocusId"]: r["KnownDiseaseLocus"] for r in tsv_rows})
 
     def _configure(self, **kwargs):
         self.configure_server(self.db_path, **kwargs)
@@ -749,6 +824,41 @@ class DiseaseCatalogStartupTests(ServerTestCase):
             lookups)
         self.assertEqual(disease_info["source"], "STRchive")
         self.assertEqual(disease_info["locus_id"], "FMR1_test")
+
+    def test_a_startup_catalog_match_is_a_known_disease_locus_without_a_stored_one(self):
+        self.configure_server(self.db_with_known_disease_column_path, strchive_loci_json=self.strchive_path)
+        response = self.client.get("/api/v1/loci/chr1-100-110-AT")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["locus"]["KnownDiseaseLocus"], "FMR1_test")
+        self.assertEqual(response.get_json()["annotations"]["known_disease_locus"]["locus_id"], "FMR1_test")
+        # The filter keeps the locus the detail page reports a disease for, and the build's own
+        # KnownDiseaseLocus too, and the list and the export show both ids
+        self.assertEqual(self.get_locus_ids("known_loci_only=true"), {"chr1-100-110-AT", "chr2-200-209-AAG"})
+        self.assertEqual(results_server.app.config["KNOWN_DISEASE_LOCUS_THRESHOLDS"], {"chr1-100-110-AT": 5})
+        expected = {"chr1-100-110-AT": "FMR1_test", "chr2-200-209-AAG": "ATXN1"}
+        self.assertEqual(self._known_disease_locus_by_locus_id_in_the_list_and_the_tsv_export(), (expected, expected))
+
+    def test_a_stored_known_disease_locus_is_kept_when_a_startup_catalog_matches_another(self):
+        self.configure_server(self.db_with_known_disease_column_path,
+                              strchive_loci_json=self.strchive_with_a_second_match_path)
+        expected = {"chr1-100-110-AT": "FMR1_test", "chr2-200-209-AAG": "ATXN1"}
+        self.assertEqual(self._known_disease_locus_by_locus_id_in_the_list_and_the_tsv_export(), (expected, expected))
+        self.assertEqual(self.client.get("/api/v1/loci/chr2-200-209-AAG").get_json()["locus"]["KnownDiseaseLocus"],
+                         "ATXN1")
+
+    def test_without_a_catalog_the_known_disease_filter_keeps_the_stored_matches(self):
+        self.configure_server(self.db_with_known_disease_column_path)
+        self.assertEqual(self.get_locus_ids("known_loci_only=true"), {"chr2-200-209-AAG"})
+        self.assertEqual(results_server.app.config["KNOWN_DISEASE_LOCUS_THRESHOLDS"], {})
+        expected = {"chr1-100-110-AT": "", "chr2-200-209-AAG": "ATXN1"}
+        self.assertEqual(self._known_disease_locus_by_locus_id_in_the_list_and_the_tsv_export(), (expected, expected))
+
+    def test_a_catalog_match_is_a_known_disease_locus_in_a_database_without_the_column(self):
+        self._configure(strchive_loci_json=self.strchive_path)
+        self.assertEqual(self.get_locus_ids("known_loci_only=true"), {"chr1-100-110-AT"})
+        self.assertEqual(self._known_disease_locus_by_locus_id_in_the_list_and_the_tsv_export(),
+                         ({"chr1-100-110-AT": "FMR1_test", "chr2-200-209-AAG": None},
+                          {"chr1-100-110-AT": "FMR1_test", "chr2-200-209-AAG": ""}))
 
     def test_no_catalog_at_all_leaves_the_lookups_empty(self):
         lookups = self._configure()
@@ -856,6 +966,19 @@ class SearchEndToEndTests(ServerTestCase):
         self.assertEqual(
             self._loci("GENEA, chr16:11,579,459-11,579,529"),
             {"chr1-1-10-cag", "chr16-11579458-11579529-CCG"})
+
+    def test_a_bare_chromosome_after_a_region_without_a_space_is_its_own_term(self):
+        # Read as one region, chr1:1-1016, this would leave out the chr16 locus
+        self.assertEqual(self._loci("chr1:1-10,16"), {"chr1-1-10-cag", "chr16-11579458-11579529-CCG"})
+
+    def test_each_kind_of_term_matches_its_own_locus_in_any_order(self):
+        # Pasted locus ids share one IN list, so each other term must still bind its own value
+        terms = ["chr1_alt-1-10-CAG", "GENEA", "ENSG00000000003", "chr16:11,579,459-11,579,529"]
+        for ordered_terms in (terms, terms[::-1]):
+            self.assertEqual(self._loci(", ".join(ordered_terms)), {locus[0] for locus in SEARCH_LOCI},
+                             ordered_terms)
+        self.assertEqual(self._loci("GENEB, chr16-11579458-11579529-CCG"),
+                         {"chr1_alt-1-10-CAG", "chr16-11579458-11579529-CCG"})
 
     def test_an_unparseable_search_term_is_a_400(self):
         response = self.client.get("/api/v1/loci",

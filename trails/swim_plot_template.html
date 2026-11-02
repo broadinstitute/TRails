@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html>
+{%- from "filter_control_macros.html" import gene_region_checkboxes, population_filter_field %}
 {% include "header_template.html" %}
 
 <style>
@@ -95,31 +96,7 @@
                     </div>
 
                     <!-- Require Affected Allele > Population Alleles -->
-                    <div class="field">
-                        <label style="display: inline;">Require Affected Allele &gt; Population Allele</label><span style="display:inline-block; margin-bottom:10px; margin-left: 4px; font-weight: normal;">( <label style="font-weight: normal; cursor: pointer;"><input type="radio" name="swim_population_metric" value="99th" checked style="vertical-align: middle;"> 99th % </label> <label style="font-weight: normal; cursor: pointer; margin-left: 5px;"><input type="radio" name="swim_population_metric" value="max" style="vertical-align: middle;"> max</label> <i class="question circle outline icon help-popup" style="color: #999; cursor: pointer;" data-variation="wide" data-position="top center" data-html="<b>99th %:</b> require the affected allele to exceed each population dataset's 99th-percentile allele size at a given locus. <br /><br /><b>max:</b> require it to exceed each dataset's largest observed allele at a given locus. This is a more stringent filter, but also more susceptible to noise if the max allele in one of the population datasets was overestimated."></i>)</span>
-                        <div class="radio-group">
-                            <div class="ui radio checkbox">
-                                <input type="radio" name="swim_require_above_population" value="" checked>
-                                <label>No</label>
-                            </div>
-                            <div class="ui radio checkbox">
-                                <input type="radio" name="swim_require_above_population" value="long-read">
-                                <label>Long-read (HPRC256, AoU1027)</label>
-                            </div>
-                            <div class="ui radio checkbox">
-                                <input type="radio" name="swim_require_above_population" value="short-read">
-                                <label>Short-read (TenK10K)</label>
-                            </div>
-                            <div class="ui radio checkbox">
-                                <input type="radio" name="swim_require_above_population" value="all">
-                                <label>All (long-read and TenK10K)</label>
-                            </div>
-                        </div>
-                        <div class="ui checkbox" style="margin-top: 0.5em; margin-left: 1em;">
-                            <input type="checkbox" id="swim_include_loci_without_population_data">
-                            <label>Also show loci without population data</label>
-                        </div>
-                    </div>
+                    {{ population_filter_field('swim_', 'id') | indent(20) }}
 
                     </div>
                     <!-- Right column: checkboxes -->
@@ -151,12 +128,7 @@
                     <div class="field">
                         <label>Include Gene Regions</label>
                         <div class="checkbox-group">
-                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_cds"><label>CDS</label></div>
-                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_promoter"><label>Promoter</label></div>
-                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_utr"><label>UTR</label></div>
-                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_intron"><label>Intron</label></div>
-                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_exon"><label>Exon</label></div>
-                            <div class="ui checkbox"><input type="checkbox" name="swim_gene_region_intergenic"><label>Intergenic</label></div>
+                            {{ gene_region_checkboxes('swim_gene_region_') | indent(28) }}
                         </div>
                     </div>
 
@@ -164,12 +136,7 @@
                     <div class="field">
                         <label>Exclude Gene Regions</label>
                         <div class="checkbox-group">
-                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_cds"><label>CDS</label></div>
-                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_promoter"><label>Promoter</label></div>
-                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_utr"><label>UTR</label></div>
-                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_intron"><label>Intron</label></div>
-                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_exon"><label>Exon</label></div>
-                            <div class="ui checkbox"><input type="checkbox" name="swim_exclude_gene_region_intergenic"><label>Intergenic</label></div>
+                            {{ gene_region_checkboxes('swim_exclude_gene_region_') | indent(28) }}
                         </div>
                     </div>
 
@@ -306,9 +273,15 @@
 
 </div><!-- close .ui.grid -->
 
-<!-- Shared helpers (escapeHtml, renderMendelianWarning, box-plot stats, and the persistent
-     Mendelian-warning popup handler) — included so this page can't drift from the QC pages. -->
+<!-- Shared helpers this page takes from qc_shared_js.html: escapeHtml, isAffectedStatus, the
+     escaping dropdown settings (ESCAPING_ADDITIONS_DROPDOWN_SETTINGS), getDropdownValue and
+     setupDropdownMenu (the latter through header_template.html's dropdown helpers), jitterFromKey,
+     and renderMendelianWarning with its persistent popup handler. Included so this page can't
+     drift from the QC pages. -->
 {% include "qc_shared_js.html" %}
+
+{# The note editor (openNoteEditor), shared with the results page #}
+{% include "note_editor.html" %}
 
 <script>
 // =========================================================================
@@ -399,10 +372,10 @@ function getSwimParams() {
     return params;
 }
 
-// Fetch data and render chart
-async function loadSwimPlot() {
+// Fetch data and render chart. params defaults to the live controls; pass swimLoadedParams to
+// reload what the chart already shows.
+async function loadSwimPlot(params = getSwimParams()) {
     const requestId = ++swimLoadSeq;
-    const params = getSwimParams();
     const qs = new URLSearchParams(params).toString();
     const url = `${API_BASE_URL}/swim_plot_data?${qs}`;
 
@@ -442,10 +415,12 @@ const STATUS_COLORS = {
     'Unknown':    { bg: 'rgba(140, 140, 140, 0.7)',    border: 'rgba(110, 110, 110, 0.9)' },
 };
 
-function statusColor(status) {
-    if (isAffectedStatus(status)) return STATUS_COLORS['Affected'];
-    if (status === 'Unaffected') return STATUS_COLORS['Unaffected'];
-    return STATUS_COLORS['Unknown'];
+// Which of the STATUS_COLORS categories an affected status falls in. The dot colors and the legend
+// counts both use it, so the counts always describe the colors shown.
+function statusCategory(status) {
+    if (isAffectedStatus(status)) return 'Affected';
+    if (status === 'Unaffected') return 'Unaffected';
+    return 'Unknown';
 }
 
 // Render the scatter chart
@@ -542,7 +517,7 @@ function renderSwimChart(data) {
             _index: idx
         });
         plottedItems.push(item);
-        const colors = statusColor(item.affected_status);
+        const colors = STATUS_COLORS[statusCategory(item.affected_status)];
         bgColors.push(colors.bg);
         borderColors.push(colors.border);
         // Determine point style: triangle for a "true"/"candidate" tag, rect for intergenic, circle
@@ -697,12 +672,8 @@ function renderSwimChart(data) {
 
 // Update legend with counts
 function updateSwimLegend(data) {
-    let affected = 0, unaffected = 0, unknown = 0;
-    data.forEach(item => {
-        if (isAffectedStatus(item.affected_status)) affected++;
-        else if (item.affected_status === 'Unaffected') unaffected++;
-        else unknown++;
-    });
+    const counts = {Affected: 0, Unaffected: 0, Unknown: 0};
+    data.forEach(item => { counts[statusCategory(item.affected_status)]++; });
     const total = data.length;
     // Say so when a motif size reached the server's cap, so the counts are not read as complete.
     const allelesPerMotifSize = {};
@@ -711,7 +682,7 @@ function updateSwimLegend(data) {
     });
     const capped = Object.values(allelesPerMotifSize).some(n => n >= SWIM_PLOT_MAX_ALLELES_PER_MOTIF_SIZE);
     $('#swim-legend-counts').text(
-        total + ' dots: ' + affected + ' affected, ' + unaffected + ' unaffected, ' + unknown + ' unknown'
+        total + ' dots: ' + counts.Affected + ' affected, ' + counts.Unaffected + ' unaffected, ' + counts.Unknown + ' unknown'
         + (capped ? ' (only the ' + SWIM_PLOT_MAX_ALLELES_PER_MOTIF_SIZE + ' largest alleles per motif size are shown)' : '')
     );
     // Color the legend swatches from STATUS_COLORS so they always match the plotted points.
@@ -748,7 +719,7 @@ function showDotDetail(item) {
     const statsUrl = `${API_BASE_URL}/sample_outlier_stats?sample_id=${encodeURIComponent(item.sample_id)}&locus_id=${encodeURIComponent(item.LocusId)}&outlier_type=${encodeURIComponent(params.outlier_type)}`;
 
     const detailPromise = fetch(detailUrl).then(async r => { if (!r.ok) throw await errorFromResponse(r); return r.json(); });
-    const statsPromise = fetch(statsUrl).then(r => r.ok ? r.json() : null).catch(() => null);
+    const statsPromise = fetchJsonOrNull(statsUrl, 'Load sample outlier stats');
 
     Promise.all([detailPromise, statsPromise])
         .then(([detail, stats]) => {
@@ -1077,27 +1048,14 @@ $(document).ready(function() {
     // Gene region mutual exclusivity: include unchecks exclude (and vice versa)
     linkGeneRegionIncludeAndExcludeCheckboxes('swim_');
 
-    // Initialize sample ID dropdown (a typed-in value is escaped wherever Semantic UI shows it:
-    // ESCAPING_ADDITIONS_DROPDOWN_SETTINGS, qc_shared_js.html)
-    $('#swim-sample-id-filter').dropdown({
-        ...ESCAPING_ADDITIONS_DROPDOWN_SETTINGS,
-        allowAdditions: true,
-        clearable: true,
-        fullTextSearch: true,
-        forceSelection: false,
-    });
+    // Initialize sample ID dropdown
+    setUpSampleIdFilterDropdown($('#swim-sample-id-filter'));
     fetchJsonOrNull(`${API_BASE_URL}/schema`, 'Load schema').then(schema => {
         if (schema) fillSampleIdDropdown($('#swim-sample-id-filter'), schema);
     });
 
     // Initialize tag dropdown
-    $('#swim-tag-filter').dropdown({
-        allowAdditions: false,
-        clearable: true,
-        fullTextSearch: true,
-        maxResults: 10,
-    });
-    refreshTagFilterDropdown($('#swim-tag-filter'));
+    setUpTagFilterDropdown($('#swim-tag-filter'));
 
     $('#dot-detail-modal').modal();
 
@@ -1119,8 +1077,9 @@ $(document).ready(function() {
 });
 
 // =========================================================================
-// Swim Plot Annotation CRUD (the note editor openNoteEditor and the write helpers deleteNote,
-// addTag and removeTag are in header_template.html, shared with the results page)
+// Swim Plot Annotation CRUD (the note editor openNoteEditor is in note_editor.html and
+// the write helpers deleteNote, addTag and removeTag in header_template.html, both shared with the
+// results page)
 // =========================================================================
 
 function refreshSwimModal() {
@@ -1145,7 +1104,7 @@ function applySwimTagUpdate(result) {
 }
 
 // Note and tag buttons in the modal's User Annotations section. Notes are edited in the shared
-// multi-line note editor (openNoteEditor, header_template.html), which opens over this modal.
+// multi-line note editor (openNoteEditor, note_editor.html), which opens over this modal.
 $(document).on('click', '.swim-inline-add-note, .swim-inline-edit-note', function() {
     openNoteEditor($(this).data('locus-id'), refreshSwimModal);
 });
@@ -1181,9 +1140,10 @@ $(document).on('click', '.swim-remove-tag-btn', function() {
         refreshSwimModal();
         // The plotted points were filtered server-side by the active tag, so once this locus no
         // longer carries it, its dots do not belong on the chart. Updating the shapes in place
-        // cannot remove them; reload so the server reapplies the filter.
+        // cannot remove them; reload with the loaded params so the server reapplies the filter
+        // without also applying controls the user changed but never loaded.
         if (swimLoadedParams && swimLoadedParams.tag === tag) {
-            loadSwimPlot();
+            loadSwimPlot(swimLoadedParams);
         }
     }).catch(function(e) { alert('Failed: ' + e.message); });
 });

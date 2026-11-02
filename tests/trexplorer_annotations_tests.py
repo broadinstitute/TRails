@@ -1,11 +1,15 @@
 """Unit tests for trexplorer_annotations: slimming TRExplorer's catalog table and matching loci to it."""
 
+import contextlib
 import gzip
+import io
 import os
 import shutil
 import tempfile
 import unittest
 
+import analysis_columns
+import build_database
 import duckdb_compat
 import locus_annotations
 import trexplorer_annotations
@@ -88,6 +92,19 @@ class BuildDatabaseTests(TRExplorerAnnotationsTestCase):
                                "GencodeGeneId": "ENSG00000197386", "AoU1027_Stdev": None, "VariationCluster": None})
         self.assertNotIn("LocusStructure", columns)
         self.assertFalse(os.path.exists(database_path + ".tmp"))
+
+    def test_a_failed_build_leaves_no_temporary_database(self):
+        # A ReferenceRegion that is not chrom:start-end fails the build's BIGINT cast part way, as
+        # a full disk would; the partly written database must not stay in reference_data/.
+        table_path = os.path.join(self.tmpdir, "catalog.tsv.gz")
+        with gzip.open(table_path, "wt") as f:
+            f.write("\t".join(CATALOG_COLUMNS) + "\n")
+            row = catalog_row("1-100-130-CAG", ReferenceRegion="chr1:start-end")
+            f.write("\t".join(str(row.get(column, "")) for column in CATALOG_COLUMNS) + "\n")
+        database_path = os.path.join(self.tmpdir, "annotations.duckdb")
+        with self.assertRaises(duckdb_compat.Error):
+            trexplorer_annotations.build_trexplorer_annotations_database(table_path, database_path)
+        self.assertEqual(os.listdir(self.tmpdir), ["catalog.tsv.gz"])
 
     def test_a_write_ahead_log_left_next_to_the_old_copy_is_removed(self):
         # DuckDB replays whatever "<database>.wal" sits next to a database, so one left by a
@@ -214,6 +231,30 @@ class AddTRExplorerAnnotationsTests(TRExplorerAnnotationsTestCase):
         records = [user_locus("1-100-131-CAG")]
         self.assertEqual(trexplorer_annotations.add_trexplorer_annotations(records, database_path), (0, 1))
         self.assertEqual(records[0]["TRExplorerLocusJaccardSimilarity"], round(30 / 31, 4))
+
+    def test_no_loci_match_nothing(self):
+        database_path = self.build_database([catalog_row("1-100-130-CAG"), catalog_row("2-100-130-NGC")])
+        self.assertEqual(trexplorer_annotations.add_trexplorer_annotations([], database_path), (0, 0))
+
+    def test_a_build_with_no_loci_and_a_trexplorer_database_writes_the_full_loci_schema(self):
+        # -n 0, or a header-only matrix. trails.py always passes the downloaded TRExplorer database.
+        database_path = self.build_database([catalog_row("1-100-130-CAG")])
+        matrix_path = os.path.join(self.tmpdir, "matrix.tsv")
+        metadata_path = os.path.join(self.tmpdir, "samples.tsv")
+        result_path = os.path.join(self.tmpdir, "result.duckdb")
+        with open(matrix_path, "w") as f:
+            f.write("trid\tmotif\tS1\nchr1-100-130-CAG\tCAG\t10,11\n")
+        with open(metadata_path, "w") as f:
+            f.write("sample_id\nS1\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build_database.build(matrix_path, metadata_path, result_path, n_loci=0,
+                                 trexplorer_annotations_database=database_path)
+        connection = duckdb_compat.connect(result_path)
+        try:
+            self.assertEqual(duckdb_compat.table_columns(connection, "loci"), set(analysis_columns.OUTPUT_COLUMNS))
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM loci").fetchone()[0], 0)
+        finally:
+            connection.close()
 
 
 if __name__ == "__main__":

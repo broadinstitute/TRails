@@ -1,7 +1,9 @@
 """Unit tests for trails_launcher.py, the launcher the top-level trails.py hands over to."""
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -26,9 +28,11 @@ class BuildSourceFilesTests(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         self.real_script_dir = trails_launcher.SCRIPT_DIR
         trails_launcher.SCRIPT_DIR = self.tmpdir
-        # A miniature TRails directory: the two entry points, a module reached only through a
-        # nested import two levels down, plus the two kinds of file the build never imports.
-        self.write("trails_launcher.py", "import build_database\n")
+        # A miniature TRails directory: the launcher, the build entry point, a module reached only
+        # through a nested import two levels down, a download-only module that only the launcher
+        # imports, plus the two kinds of file the build never imports.
+        self.write("trails_launcher.py", "import reference_downloads\n\ndef run_build():\n    import build_database\n")
+        self.write("reference_downloads.py", "def fetch():\n    return 'url'\n")
         self.write("build_database.py", "def build():\n    import pipeline_step\n")
         self.write("pipeline_step.py", "from shared_helper import helper\n")
         self.write("shared_helper.py", "def helper():\n    return 1\n")
@@ -55,6 +59,19 @@ class BuildSourceFilesTests(unittest.TestCase):
         self.write("pipeline_step_tests.py", "import pipeline_step\n\n# another test\n")
         self.assertEqual(trails_launcher.trails_code_version(), before)
 
+    def test_editing_download_code_only_the_launcher_imports_does_not_change_the_fingerprint(self):
+        # The reference files it downloads are hashed one by one in the manifest's inputs.
+        before = trails_launcher.trails_code_version()
+        self.write("reference_downloads.py", "def fetch():\n    return 'another url'\n")
+        self.assertEqual(trails_launcher.trails_code_version(), before)
+
+    def test_editing_the_launcher_itself_changes_the_fingerprint(self):
+        # It decides which inputs and flags reach the build.
+        before = trails_launcher.trails_code_version()
+        self.write("trails_launcher.py", "import reference_downloads\n\ndef run_build():\n"
+                                         "    import build_database\n    return 1\n")
+        self.assertNotEqual(trails_launcher.trails_code_version(), before)
+
     def test_editing_a_build_module_changes_the_fingerprint(self):
         before = trails_launcher.trails_code_version()
         self.write("shared_helper.py", "def helper():\n    return 2\n")
@@ -74,9 +91,11 @@ class BuildSourceFilesTests(unittest.TestCase):
         trails_launcher.SCRIPT_DIR = self.real_script_dir
         names = trails_launcher.build_source_files()
         for expected in ["build_database.py", "input_tables.py", "mendelian_qc.py",
-                         "motif_utilities.py", "result_database.py", "duckdb_compat.py"]:
+                         "motif_utilities.py", "result_database.py", "duckdb_compat.py",
+                         "trexplorer_annotations.py", "trails_launcher.py"]:
             self.assertIn(expected, names)
         self.assertNotIn("results_server.py", names)
+        self.assertNotIn("trails_setup.py", names)
         self.assertEqual([n for n in names if n.endswith("_tests.py")], [])
 
 
@@ -191,14 +210,11 @@ class InitialRequireAbovePopulationTests(unittest.TestCase):
         """Returns the results_server.py command line serve() would run."""
         args = argparse.Namespace(sample_metadata_tsv="samples.tsv", port=None, host=None,
                                   initial_require_above_population=initial_require_above_population)
-        real_run = trails_launcher.subprocess.run
-        commands = []
-        trails_launcher.subprocess.run = lambda cmd, check: commands.append(cmd)
-        try:
+        with mock.patch.object(trails_launcher.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0)) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
             trails_launcher.serve("/data/cohort.duckdb", args)
-        finally:
-            trails_launcher.subprocess.run = real_run
-        return commands[0]
+        return run.call_args.args[0]
 
     def test_a_chosen_value_is_forwarded(self):
         command = self.server_command_for("all")
@@ -207,6 +223,113 @@ class InitialRequireAbovePopulationTests(unittest.TestCase):
 
     def test_no_value_forwards_no_flag(self):
         self.assertNotIn("--initial-require-above-population", self.server_command_for(None))
+
+
+class DatabaseDirectoryTests(unittest.TestCase):
+    """An explicit --db in a directory that does not exist yet must not fail only at the build's end."""
+
+    def test_the_db_directory_is_created_before_the_reference_download(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        db_path = os.path.join(directory, "results", "cohort.duckdb")
+        directory_existed_when = {}
+
+        def fetch_reference_data(reference_data_dir):
+            directory_existed_when["the reference download started"] = os.path.isdir(os.path.dirname(db_path))
+            return {}
+
+        def run_build(args, db_path, *other_arguments):
+            with open(db_path, "w") as f:
+                f.write("a built database")
+
+        for input_name in ("cohort.tsv", "samples.tsv"):
+            with open(os.path.join(directory, input_name), "w") as f:
+                f.write("a header line\n")
+        argv = ["trails.py", "--repeat-copy-numbers-tsv", os.path.join(directory, "cohort.tsv"),
+                "--sample-metadata-tsv", os.path.join(directory, "samples.tsv"), "--db", db_path,
+                "--work-dir", directory, "--no-serve"]
+        with mock.patch.object(trails_launcher.sys, "argv", argv), \
+                mock.patch.object(trails_launcher, "ensure_running_in_trails_virtual_environment"), \
+                mock.patch.object(trails_launcher, "ensure_dependencies"), \
+                mock.patch.object(trails_launcher.trails_setup, "fetch_reference_data", side_effect=fetch_reference_data), \
+                mock.patch.object(trails_launcher, "run_build", side_effect=run_build), \
+                contextlib.redirect_stdout(io.StringIO()):
+            trails_launcher.main()
+        self.assertEqual(directory_existed_when, {"the reference download started": True})
+        self.assertTrue(os.path.exists(db_path + ".build_manifest.json"))
+
+
+class InputFileTests(unittest.TestCase):
+    """A mistyped input path stops trails.py before the virtual environment, pip and the download."""
+
+    def run_main(self, *extra_arguments):
+        """Runs main() with a real sample table, a missing matrix and extra_arguments.
+
+        Returns:
+            The SystemExit code, and whether any slow step ran.
+        """
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        samples_path = os.path.join(directory, "samples.tsv")
+        with open(samples_path, "w") as f:
+            f.write("sample_id\nS1\n")
+        argv = ["trails.py", "--repeat-copy-numbers-tsv", os.path.join(directory, "cohort.tsv"),
+                "--sample-metadata-tsv", samples_path, "--work-dir", os.path.join(directory, "work"),
+                *extra_arguments]
+        with mock.patch.object(trails_launcher.sys, "argv", argv), \
+                mock.patch.object(trails_launcher, "ensure_running_in_trails_virtual_environment") as venv, \
+                mock.patch.object(trails_launcher, "ensure_dependencies") as dependencies, \
+                mock.patch.object(trails_launcher.trails_setup, "fetch_reference_data") as fetch:
+            with self.assertRaises(SystemExit) as exit:
+                trails_launcher.main()
+        self.assertFalse(os.path.exists(os.path.join(directory, "work")))
+        return exit.exception.code, venv.called or dependencies.called or fetch.called
+
+    def test_a_missing_matrix_stops_before_any_slow_step_naming_the_option_and_the_path(self):
+        message, a_slow_step_ran = self.run_main()
+        self.assertFalse(a_slow_step_ran)
+        self.assertRegex(message, r"^ERROR: --repeat-copy-numbers-tsv: .*cohort\.tsv is not an existing file$")
+
+    def test_every_missing_file_is_named_including_the_optional_overrides(self):
+        message, a_slow_step_ran = self.run_main("--gene-table", "/no/such/genes.tsv.gz")
+        self.assertFalse(a_slow_step_ran)
+        self.assertEqual([line.split(":")[1].strip() for line in message.splitlines()],
+                         ["--repeat-copy-numbers-tsv", "--gene-table"])
+
+
+class ServerExitTests(unittest.TestCase):
+    """How trails.py ends when the results server stops: no Python traceback either way."""
+
+    def serve(self, **run_behavior):
+        """Runs serve() against a stubbed server; returns (SystemExit code or None, stdout, stderr)."""
+        args = argparse.Namespace(sample_metadata_tsv="samples.tsv", port=None, host=None,
+                                  initial_require_above_population=None)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        exit_code = None
+        with mock.patch.object(trails_launcher.subprocess, "run", **run_behavior), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                trails_launcher.serve("/data/cohort.duckdb", args)
+            except SystemExit as exit:
+                exit_code = exit.code
+        return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def test_ctrl_c_ends_quietly(self):
+        # Ctrl-C stops the server and reaches the launcher too, as a KeyboardInterrupt.
+        self.assertEqual(self.serve(side_effect=KeyboardInterrupt)[0::2], (None, ""))
+
+    def test_a_server_that_stops_normally_ends_quietly(self):
+        self.assertEqual(self.serve(return_value=subprocess.CompletedProcess([], 0))[0::2], (None, ""))
+
+    def test_a_server_error_exits_with_its_status_and_one_line(self):
+        # e.g. the port is already in use, or the database is missing; the server has said why.
+        exit_code, _stdout, stderr = self.serve(return_value=subprocess.CompletedProcess([], 3))
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(stderr.count("\n"), 1)
+        self.assertIn("exit status 3", stderr)
+
+    def test_a_server_killed_by_a_signal_exits_with_128_plus_the_signal_number(self):
+        self.assertEqual(self.serve(return_value=subprocess.CompletedProcess([], -15))[0], 143)
 
 
 if __name__ == "__main__":

@@ -44,7 +44,13 @@ TRAILS_DIRECTORY = os.path.dirname(SCRIPT_DIR)
 # these files and every TRails module they import, directly or indirectly, so a new pipeline
 # module is picked up automatically as soon as an existing one imports it. Add an entry here
 # only for a new way of starting a build that does not go through one of these files.
-BUILD_ENTRY_POINTS = ["trails_launcher.py", "build_database.py"]
+BUILD_ENTRY_POINTS = ["build_database.py"]
+
+# Files the fingerprint covers without following their imports. This launcher decides which
+# inputs and flags reach the build (build_flags, run_build), so it is covered itself. What it
+# imports beyond the build is trails_setup, which only downloads the reference files, and
+# build_manifest hashes each of those on its own, so editing download code rebuilds nothing.
+BUILD_FILES_HASHED_WITHOUT_THEIR_IMPORTS = ["trails_launcher.py"]
 
 # import names of the runtime deps in requirements.txt that the code actually imports.
 REQUIRED_MODULES = ["flask", "pandas", "numpy", "intervaltree", "duckdb"]
@@ -66,9 +72,9 @@ VIRTUAL_ENVIRONMENT_PYTHON = os.path.join(VIRTUAL_ENVIRONMENT_DIRECTORY, "bin", 
 OPTIONAL_INSTALL_MARKER = os.path.join(VIRTUAL_ENVIRONMENT_DIRECTORY, ".trails_optional_deps_attempted")
 
 # The values results_server.py --initial-require-above-population accepts (the keys of its
-# POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION). Copied rather than imported: importing the
-# server would pull it into the build's code fingerprint. trails_launcher_tests.py checks the two
-# agree.
+# POPULATION_DATASETS_BY_REQUIRE_ABOVE_POPULATION). Copied rather than imported: results_server
+# imports flask and numpy, which may not be installed yet when these arguments are parsed, before
+# ensure_dependencies runs. trails_launcher_tests.py checks the two agree.
 INITIAL_REQUIRE_ABOVE_POPULATION_CHOICES = ["long-read", "short-read", "all"]
 
 
@@ -158,10 +164,10 @@ def hash_file(path):
 def module_names_imported_by(path):
     """Return the set of top-level module names the Python file at path imports.
 
-    Both "import x" and "from x import y" count, at any nesting level, because the build
-    imports some modules inside a function rather than at the top of the file (this file
-    imports build_database that way). Relative imports are ignored: TRails is a flat
-    directory of modules with no package.
+    Both "import x" and "from x import y" count, at any nesting level, so a TRails module a
+    build module imports inside a function rather than at the top of the file is still
+    covered. Relative imports are ignored: TRails is a flat directory of modules with no
+    package.
 
     Args:
         path: Path of the .py file to parse.
@@ -185,14 +191,16 @@ def build_source_files():
 
     Starts from BUILD_ENTRY_POINTS and follows imports that resolve to a .py file next to
     this script, transitively, so a module a pipeline module starts importing is picked up
-    on its own and nobody has to maintain a list. Files the build never imports
-    (results_server.py, which is launched as a subprocess, and the *_tests.py files) stay
-    out, so editing them does not invalidate the manifest.
+    on its own and nobody has to maintain a list, then adds BUILD_FILES_HASHED_WITHOUT_THEIR_IMPORTS.
+    Files the build never imports (trails_setup.py, results_server.py, which is launched as
+    a subprocess, and the *_tests.py files) stay out, so editing them does not invalidate the
+    manifest.
 
     Returns:
         A sorted list of file names (not paths), all of which exist in SCRIPT_DIR.
     """
-    found = set()
+    found = {name for name in BUILD_FILES_HASHED_WITHOUT_THEIR_IMPORTS
+             if os.path.exists(os.path.join(SCRIPT_DIR, name))}
     seen = set()
     queue = list(BUILD_ENTRY_POINTS)
     while queue:
@@ -298,14 +306,10 @@ def run_build(args, db_path, gene_table, genes_to_phenotype, known_loci_json, st
 
 def serve(db_path, args, known_loci_json=None, strchive_loci_json=None):
     """Start results_server.py against the single built DB (forwarding optional reference inputs)."""
+    # No --annotations-db: the server keeps the notes and tags next to the database it is given,
+    # one note/tag store per result database (results_server.default_annotations_db_path).
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "results_server.py"), "--db", db_path]
-    # The server defaults --annotations-db to a bare relative name, which is resolved against the
-    # server's cwd, so notes would follow the launch directory. Derive it from the full database
-    # filename instead: anchoring on the directory alone would make every result database in that
-    # directory share one note/tag store, and notes are keyed by LocusId only.
-    annotations_db = os.path.abspath(db_path) + ".annotations.duckdb"
     for flag, value in [("--sample-table", args.sample_metadata_tsv),
-                        ("--annotations-db", annotations_db),
                         ("--known-loci-json", known_loci_json),
                         ("--strchive-loci-json", strchive_loci_json),
                         ("--initial-require-above-population",
@@ -315,7 +319,18 @@ def serve(db_path, args, known_loci_json=None, strchive_loci_json=None):
         if value:
             cmd += [flag, str(value)]
     print("+ " + " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    try:
+        returncode = subprocess.run(cmd).returncode
+    except KeyboardInterrupt:
+        # Ctrl-C, the usual way to stop the server, reaches the server and this launcher alike.
+        # The server shuts down on it, so there is nothing to report.
+        return
+    if returncode != 0:
+        # The server has already printed why; a traceback here would only bury that. A server
+        # killed by a signal exits with 128 + the signal number, as a shell would report it.
+        print(f"ERROR: the results server stopped with exit status {returncode} (see its messages "
+              f"above)", file=sys.stderr)
+        sys.exit(returncode if returncode > 0 else 128 - returncode)
 
 
 def main():
@@ -363,8 +378,26 @@ def main():
             args.population_gate_cohorts)
     except ValueError as error:
         parser.error(str(error))
+    # Checked before anything slow: otherwise a mistyped path surfaces only as a traceback after
+    # the virtual environment, the pip install and the reference download (about 1 GB) have run.
+    missing_input_files = [
+        f"ERROR: {option}: {path} is not an existing file"
+        for option, path in [("--repeat-copy-numbers-tsv", args.repeat_copy_numbers_tsv),
+                             ("--sample-metadata-tsv", args.sample_metadata_tsv),
+                             ("--phenotypes-table", args.phenotypes_table),
+                             ("--gene-table", args.gene_table),
+                             ("--genes-to-phenotype", args.genes_to_phenotype),
+                             ("--known-loci-json", args.known_loci_json),
+                             ("--strchive-loci-json", args.strchive_loci_json)]
+        if path and not os.path.isfile(path)]
+    if missing_input_files:
+        sys.exit("\n".join(missing_input_files))
 
     os.makedirs(args.work_dir, exist_ok=True)
+    db_path = args.db or default_db_path(args.repeat_copy_numbers_tsv, args.work_dir)
+    # Created now: the build first writes into this directory at its very end, and the reference
+    # download comes before that, so a missing directory would otherwise waste both.
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
 
     # 1. dependencies, 2. public reference data.
     ensure_running_in_trails_virtual_environment()
@@ -378,7 +411,6 @@ def main():
     trexplorer_annotations_database = reference.get(trails_setup.TREXPLORER_ANNOTATIONS_DATABASE_NAME)
 
     # 3. (re)build the DB if stale.
-    db_path = args.db or default_db_path(args.repeat_copy_numbers_tsv, args.work_dir)
     manifest_path = db_path + ".build_manifest.json"
     manifest = build_manifest(
         inputs={"repeat_copy_numbers": args.repeat_copy_numbers_tsv,

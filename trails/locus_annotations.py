@@ -60,8 +60,6 @@ def gene_region_rank(gene_region):
         The integer rank from ``GENE_REGION_RANK``, or None if ``gene_region``
         is missing or not one of the known regions.
     """
-    if gene_region is None:
-        return None
     return GENE_REGION_RANK.get(gene_region)
 
 
@@ -86,8 +84,9 @@ def compute_jaccard(start1, end1, start2, end2):
     if overlap_start >= overlap_end:
         return 0.0
     overlap_size = overlap_end - overlap_start
+    # Positive: the intervals overlap, so the union is at least as long as either of them.
     union_size = (end1 - start1) + (end2 - start2) - overlap_size
-    return overlap_size / union_size if union_size > 0 else 0.0
+    return overlap_size / union_size
 
 
 def motifs_match(motif1, motif2):
@@ -259,16 +258,18 @@ def _catalogs_with_their_motifs(interval_trees, strchive_trees):
             (strchive_trees or {}, strchive_locus_motifs, "STRchive"))
 
 
-# A query locus matches a known disease locus only when their intervals' Jaccard index is above this
-KNOWN_DISEASE_LOCUS_MIN_JACCARD = 0.66
+# A query locus matches a known disease locus only when their intervals' Jaccard index is at least
+# this, 0.66 itself included. The TRExplorer match (trexplorer_annotations) and the analysis code's
+# disease matcher use the same rule, so a locus at exactly 0.66 is matched by all of them.
+MIN_JACCARD_SIMILARITY_OF_MATCHING_LOCI = 0.66
 
 
 def find_matching_disease_locus(chrom, start, end, motif, interval_trees, strchive_trees=None):
     """Return the known disease locus a query locus matches, and the catalog it is from.
 
     Matching uses TRExplorer-style logic: a query locus matches a disease locus
-    when they overlap, their interval Jaccard is greater than
-    KNOWN_DISEASE_LOCUS_MIN_JACCARD, and at least one of the disease locus's motifs
+    when they overlap, their interval Jaccard is at least
+    MIN_JACCARD_SIMILARITY_OF_MATCHING_LOCI, and at least one of the disease locus's motifs
     (``variant_catalog_locus_motifs``, or for STRchive ``strchive_locus_motifs``)
     matches the query motif under ``motifs_match``. The
     variant catalog is consulted first; the optional STRchive trees are a
@@ -296,7 +297,7 @@ def find_matching_disease_locus(chrom, start, end, motif, interval_trees, strchi
 
     for trees, locus_motifs, source in _catalogs_with_their_motifs(interval_trees, strchive_trees):
         for interval in trees.get(chrom, intervaltree.IntervalTree()).overlap(start, end):
-            if compute_jaccard(start, end, interval.begin, interval.end) <= KNOWN_DISEASE_LOCUS_MIN_JACCARD:
+            if compute_jaccard(start, end, interval.begin, interval.end) < MIN_JACCARD_SIMILARITY_OF_MATCHING_LOCI:
                 continue
             if any(motifs_match(motif, disease_motif) for disease_motif in locus_motifs(interval.data)):
                 return interval.data, source
@@ -319,10 +320,12 @@ def matches_disease_locus(locus_id, interval_trees, strchive_trees=None):
     Returns:
         The matching disease locus identifier (the catalog ``LocusId`` or, for
         STRchive, its ``id``, e.g. ``"HD_HTT"``), or None if nothing matches.
+
+    Raises:
+        ValueError: If ``locus_id`` is malformed (see ``parse_locus_id``).
     """
-    chrom, start, end, motif = locus_id.split("-")
     locus_data, source = find_matching_disease_locus(
-        chrom, int(start), int(end), motif, interval_trees, strchive_trees)
+        *parse_locus_id(locus_id), interval_trees, strchive_trees)
     if locus_data is None:
         return None
     if source == "variant_catalog":
@@ -449,15 +452,35 @@ def validate_motif(motif, locus_id, repeat_copy_numbers_tsv=None):
         f"motif {motif!r}")
 
 
+# The recognized matrix annotation columns (input_tables.ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED)
+# that add_derived_locus_columns always recomputes, each mapped to the column it is computed from.
+# None carries information of its own, so a value the matrix supplied is replaced rather than kept,
+# which keeps every locus's coordinates, motif size, canonical motif and region rank consistent
+# with its LocusId, Motif and gene_region. The server searches, groups and sorts by them.
+SOURCE_COLUMN_BY_RECOMPUTED_COLUMN = {
+    "Chrom": "LocusId",
+    "Start0Based": "LocusId",
+    "End1Based": "LocusId",
+    "MotifSize": "Motif",
+    "CanonicalMotif": "Motif",
+    "gene_region_rank": "gene_region",
+}
+
+
 def add_derived_locus_columns(locus_records, source_label="", repeat_copy_numbers_tsv=None):
     """Add coordinate, motif, source, gene-region, and canonical-motif columns.
 
     For each per-locus dict, parses the ``LocusId`` (``chrom-start-end-motif``)
-    and adds:
+    and adds the columns below. ``Chrom``, ``Start0Based``, ``End1Based``,
+    ``MotifSize``, ``CanonicalMotif`` and ``gene_region_rank``
+    (``SOURCE_COLUMN_BY_RECOMPUTED_COLUMN``) are always recomputed, replacing any
+    value the input matrix supplied; the others keep a supplied value.
       * ``Chrom`` -- chromosome with a ``chr`` prefix.
       * ``Start0Based`` / ``End1Based`` -- the parsed coordinates.
-      * ``ReferenceRegion`` -- ``"chrom:start1based-end1based"`` (without the
-        ``chr`` prefix), unless already present in the record.
+      * ``ReferenceRegion`` -- ``"Chrom:Start0Based-End1Based"`` (e.g.
+        ``chr1:10000-10108``), the form TRExplorer, the variant catalog and the
+        server's reference-region search and ExpansionHunter export use, unless
+        already present in the record.
       * ``MotifSize`` -- length of ``Motif``.
       * ``NumRepeatsInReference`` -- ``(End1Based - Start0Based) // len(Motif)``,
         unless already present in the record.
@@ -473,8 +496,8 @@ def add_derived_locus_columns(locus_records, source_label="", repeat_copy_number
         matrix is ignored, so the stored rank can never disagree with the
         region the locus actually has.
 
-    Prints a one-line summary when the input matrix supplied any
-    ``gene_region_rank`` values, so their replacement is not silent.
+    Prints a one-line summary for each recomputed column the input matrix supplied
+    values for, so their replacement is not silent.
 
     Args:
         locus_records: A list of per-locus dicts, each with at least ``LocusId``
@@ -493,9 +516,12 @@ def add_derived_locus_columns(locus_records, source_label="", repeat_copy_number
             integer coordinates, or a ``Motif`` carries a character outside the
             IUPAC alphabet.
     """
-    supplied_rank_count = 0
+    supplied_value_counts = collections.Counter()
 
     for record in locus_records:
+        supplied_value_counts.update(
+            column for column in SOURCE_COLUMN_BY_RECOMPUTED_COLUMN if record.get(column) is not None)
+
         chrom_field, start0_based, end1_based, _motif_field = parse_locus_id(
             record["LocusId"], repeat_copy_numbers_tsv)
         record["Chrom"] = f"chr{chrom_field.replace('chr', '')}"
@@ -503,9 +529,7 @@ def add_derived_locus_columns(locus_records, source_label="", repeat_copy_number
         record["End1Based"] = end1_based
 
         if record.get("ReferenceRegion") is None:
-            record["ReferenceRegion"] = (
-                f"{record['Chrom'].replace('chr', '')}:"
-                f"{record['Start0Based'] + 1}-{record['End1Based']}")
+            record["ReferenceRegion"] = f"{record['Chrom']}:{start0_based}-{end1_based}"
 
         record["MotifSize"] = len(record["Motif"])
 
@@ -538,14 +562,13 @@ def add_derived_locus_columns(locus_records, source_label="", repeat_copy_number
         # to gene_region. Deriving it unconditionally is what keeps it consistent with the
         # region stored next to it, which matters because the server's "region" ordering sorts
         # by this column while displaying gene_region (results_server SORT_MAPPING).
-        if record.get("gene_region_rank") is not None:
-            supplied_rank_count += 1
         record["gene_region_rank"] = gene_region_rank(record.get("gene_region"))
 
-    if supplied_rank_count:
-        print(f"  ignored the gene_region_rank supplied by the input matrix for "
-              f"{supplied_rank_count:,d} of {len(locus_records):,d} loci; the rank is always "
-              f"derived from gene_region")
+    for column, source_column in SOURCE_COLUMN_BY_RECOMPUTED_COLUMN.items():
+        if supplied_value_counts[column]:
+            print(f"  ignored the {column} supplied by the input matrix for "
+                  f"{supplied_value_counts[column]:,d} of {len(locus_records):,d} loci; it is always "
+                  f"derived from {source_column}")
 
     return locus_records
 

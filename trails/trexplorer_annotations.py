@@ -7,7 +7,8 @@ gives each locus of the repeat-copy-numbers table the annotations of its TRExplo
 
   * a TRExplorer locus is a candidate when it is on the same chromosome, its interval overlaps
     the locus with a Jaccard similarity (intersection over union) of at least
-    MIN_JACCARD_SIMILARITY, and its motif matches by locus_annotations.motifs_match's rule: for
+    locus_annotations.MIN_JACCARD_SIMILARITY_OF_MATCHING_LOCI (the known-disease-locus match's
+    threshold too), and its motif matches by locus_annotations.motifs_match's rule: for
     motifs of at most locus_annotations.MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE bp, the same length
     and a shared canonical motif, with an N in either motif matching any base (catalogs write
     polyalanine loci such as ARX as NGC or GCN); for longer motifs, the same length;
@@ -25,8 +26,6 @@ import duckdb_compat
 import locus_annotations
 import result_database
 from motif_utilities import compute_canonical_motifs_with_n_as_any_base
-
-MIN_JACCARD_SIMILARITY = 0.66
 
 TREXPLORER_LOCI_TABLE = "trexplorer_loci"
 
@@ -119,7 +118,7 @@ def build_trexplorer_annotations_database(annotations_tsv_path, database_path):
         num_loci = connection.execute(f"SELECT COUNT(*) FROM {TREXPLORER_LOCI_TABLE}").fetchone()[0]
         result_database.finalize_database(connection, tmp_path, database_path)
     except Exception:
-        connection.close()
+        result_database.discard_new_database(connection, tmp_path)
         raise
     return num_loci
 
@@ -136,6 +135,10 @@ def _match_loci(locus_records, annotations_database_path):
         A dict mapping the index of each matched record in locus_records to a dict of its
         TRExplorer locus's columns plus ``jaccard_similarity``.
     """
+    # A build with no loci (-n 0, or a header-only matrix) has nothing to match. The query below
+    # cannot run on it either: DuckDB types the empty, untyped columns of user_loci as DOUBLE.
+    if not locus_records:
+        return {}
     max_motif_size = locus_annotations.MAX_MOTIF_SIZE_MATCHED_BY_SEQUENCE
     user_loci = pandas.DataFrame({
         "record_index": range(len(locus_records)),
@@ -199,7 +202,7 @@ def _match_loci(locus_records, annotations_database_path):
             f"     OR (u.MotifSize > {max_motif_size} AND length(t.Motif) = u.MotifSize)"
             f") "
             f"SELECT * EXCLUDE (same_locus_id) FROM candidates t "
-            f"WHERE jaccard_similarity >= {MIN_JACCARD_SIMILARITY} "
+            f"WHERE jaccard_similarity >= {locus_annotations.MIN_JACCARD_SIMILARITY_OF_MATCHING_LOCI} "
             f"QUALIFY ROW_NUMBER() OVER (PARTITION BY record_index ORDER BY same_locus_id DESC, "
             f"  {tier} DESC, {tier_value} DESC, LocusId DESC) = 1")
         column_names = [description[0] for description in cursor.description]

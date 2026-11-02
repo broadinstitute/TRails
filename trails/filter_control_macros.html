@@ -1,0 +1,49 @@
+{#- Filter controls that the results page and the swim plot both show, each defined once here. Each
+    macro takes the inputs' name prefix ('' on the results page, 'swim_' on the swim plot).
+
+    The markup comes out with no indentation after its first line, so a caller indents it to its
+    own depth with the indent filter, e.g.
+        {{ gene_region_checkboxes('gene_region_') | indent(12) }}
+-#}
+
+{#- The six gene-region checkboxes, shown twice on each page: to include and to exclude regions.
+    name_prefix is e.g. 'gene_region_' or 'swim_exclude_gene_region_'. The values are
+    header_template.html's GENE_REGIONS, the list the page scripts read the checkboxes by. -#}
+{%- macro gene_region_checkboxes(name_prefix) -%}
+    {%- for value, label in [('cds', 'CDS'), ('promoter', 'Promoter'), ('utr', 'UTR'), ('intron', 'Intron'),
+                             ('exon', 'Exon'), ('intergenic', 'Intergenic')] -%}
+        {{ '\n' if not loop.first }}<div class="ui checkbox"><input type="checkbox" name="{{ name_prefix }}{{ value }}"><label>{{ label }}</label></div>
+    {%- endfor -%}
+{%- endmacro -%}
+
+{#- The "Require Affected Allele > Population Allele" field: the 99th % / max choice, the population
+    cohort radios and the "Also show loci without population data" checkbox. checkbox_attribute is
+    the attribute that names that checkbox: 'name' on the results page, 'id' on the swim plot,
+    which reads its checkboxes by id. -#}
+{%- macro population_filter_field(name_prefix, checkbox_attribute) -%}
+<div class="field">
+    <label style="display: inline;">Require Affected Allele &gt; Population Allele</label><span style="display:inline-block; margin-bottom:10px; margin-left: 4px; font-weight: normal;">( <label style="font-weight: normal; cursor: pointer;"><input type="radio" name="{{ name_prefix }}population_metric" value="99th" checked style="vertical-align: middle;"> 99th % </label> <label style="font-weight: normal; cursor: pointer; margin-left: 5px;"><input type="radio" name="{{ name_prefix }}population_metric" value="max" style="vertical-align: middle;"> max</label> <i class="question circle outline icon help-popup" style="color: #999; cursor: pointer;" data-variation="wide" data-position="top center" data-html="<b>99th %:</b> require the affected allele to exceed each population dataset's 99th-percentile allele size at a given locus. <br /><br /><b>max:</b> require it to exceed each dataset's largest observed allele at a given locus. This is a more stringent filter, but also more susceptible to noise if the max allele in one of the population datasets was overestimated."></i>)</span>
+    <div class="radio-group">
+        <div class="ui radio checkbox">
+            <input type="radio" name="{{ name_prefix }}require_above_population" value="" checked>
+            <label>No</label>
+        </div>
+        <div class="ui radio checkbox">
+            <input type="radio" name="{{ name_prefix }}require_above_population" value="long-read">
+            <label>Long-read (HPRC256, AoU1027)</label>
+        </div>
+        <div class="ui radio checkbox">
+            <input type="radio" name="{{ name_prefix }}require_above_population" value="short-read">
+            <label>Short-read (TenK10K)</label>
+        </div>
+        <div class="ui radio checkbox">
+            <input type="radio" name="{{ name_prefix }}require_above_population" value="all">
+            <label>All (long-read and TenK10K)</label>
+        </div>
+    </div>
+    <div class="ui checkbox" style="margin-top: 0.5em; margin-left: 1em;">
+        <input type="checkbox" {{ checkbox_attribute }}="{{ name_prefix }}include_loci_without_population_data">
+        <label>Also show loci without population data</label>
+    </div>
+</div>
+{%- endmacro -%}

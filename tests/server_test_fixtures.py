@@ -4,6 +4,7 @@ This module's name does not end in "tests.py", so test discovery imports it only
 modules that use it.
 """
 
+import gzip
 import os
 import shutil
 import tempfile
@@ -12,6 +13,20 @@ import unittest
 import duckdb_compat
 import results_server
 import swim_plot
+
+
+def read_gzipped_tsv_rows(response):
+    """Return the rows of a gzipped TSV download, as dicts keyed by its header line.
+
+    Args:
+        response: A Flask test-client response whose body is a gzipped TSV with a header line.
+
+    Returns:
+        List of dicts mapping each header column to the row's value, as text.
+    """
+    lines = gzip.decompress(response.get_data()).decode("utf-8").splitlines()
+    header = lines[0].split("\t")
+    return [dict(zip(header, line.split("\t"))) for line in lines[1:]]
 
 
 def make_swim_plot_row(**values):
@@ -114,6 +129,16 @@ class ServerTestCase(unittest.TestCase):
         finally:
             conn.close()
         return locus_ids
+
+    def leave_columns_out_of_the_database_for_one_test(self, *columns):
+        """Make the server treat its database as lacking some loci columns, for one test.
+
+        Args:
+            *columns: The loci columns to leave out of app.config["DB_COLUMNS_SET"].
+        """
+        saved_columns = results_server.app.config["DB_COLUMNS_SET"]
+        self.addCleanup(results_server.app.config.__setitem__, "DB_COLUMNS_SET", saved_columns)
+        results_server.app.config["DB_COLUMNS_SET"] = saved_columns - set(columns)
 
     def record_template_render_arguments(self):
         """Make the pages record their template's arguments instead of rendering, for one test.

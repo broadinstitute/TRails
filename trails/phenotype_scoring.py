@@ -8,8 +8,9 @@ computes two families of scores:
 
   * A gene-phenotype similarity: how well a patient's HPO terms match the known
     disease phenotypes of the gene at that locus, restricted to diseases whose
-    inheritance mode is compatible with the outlier type. Diseases with no
-    inheritance annotation are kept for every outlier type.
+    inheritance mode is compatible with the outlier type (mitochondrial and
+    Y-linked modes only at chrM and chrY loci). Diseases with no inheritance
+    annotation are kept for every outlier type.
   * Pairwise phenotype similarity and shared-term counts between consecutive
     qualifying samples (ordered largest allele first), which surface loci where
     multiple expanded patients share phenotypes.
@@ -34,14 +35,38 @@ from analysis_columns import (
 
 
 # Which disease inheritance modes are compatible with each outlier type:
-#   - AllAlleles (expansions on one allele) -> dominant diseases (AD, XD)
+#   - AllAlleles (expansions on one allele) -> diseases one expanded copy causes: dominant (AD, XD),
+#     plus mitochondrial (MT) and Y-linked (YL), since chrM and chrY have no second, normal copy
+#     to mask an expansion (a heteroplasmic chrM call has two alleles, and either can cause it)
 #   - ShortAlleles (the shorter of two alleles) -> recessive diseases (AR)
-#   - HemizygousAlleles (single allele, X in males) -> XR, XL, XD all manifest
+#   - HemizygousAlleles (a single-allele call: chrX in males, chrY, and chrM called haploid)
+#     -> XR, XL, XD, MT and YL all manifest
+# MT and YL count only at loci on chrM and chrY (allowed_inheritance_for_locus): HPO also tags some
+# diseases of nuclear genes as mitochondrial, such as SURF1's autosomal recessive Leigh syndrome.
 OUTLIER_TYPE_INHERITANCE = {
-    "AllAlleles": {"AD", "XD"},
+    "AllAlleles": {"AD", "XD", "MT", "YL"},
     "ShortAlleles": {"AR"},
-    "HemizygousAlleles": {"XR", "XL", "XD"},
+    "HemizygousAlleles": {"XR", "XL", "XD", "MT", "YL"},
 }
+
+# The chromosomes (Chrom spellings) at whose loci the MT and YL inheritance codes are allowed.
+CHROMOSOMES_FOR_INHERITANCE_CODE = {"MT": {"chrM", "chrMT"}, "YL": {"chrY"}}
+
+
+def allowed_inheritance_for_locus(outlier_type, chrom):
+    """Return the disease inheritance codes compatible with an outlier type at one locus.
+
+    Args:
+        outlier_type: One of OUTLIER_TYPES.
+        chrom: The locus's ``Chrom`` (e.g. ``"chrY"``), or None.
+
+    Returns:
+        set: ``OUTLIER_TYPE_INHERITANCE[outlier_type]``, without MT unless the locus is on
+        chrM and without YL unless it is on chrY.
+    """
+    return {code for code in OUTLIER_TYPE_INHERITANCE[outlier_type]
+            if code not in CHROMOSOMES_FOR_INHERITANCE_CODE
+            or chrom in CHROMOSOMES_FOR_INHERITANCE_CODE[code]}
 
 
 # Whether the pyhpo Ontology() singleton has already been initialized. Building
@@ -385,7 +410,7 @@ def compute_phenotype_scores(records, participant_to_hpo, gene_lookup, gene_dise
                 if gene_disease_key in gene_disease_data:
                     score_result = score_patient_vs_gene_filtered(
                         hpo_terms, gene_disease_key, gene_disease_data,
-                        OUTLIER_TYPE_INHERITANCE[outlier_type],
+                        allowed_inheritance_for_locus(outlier_type, row.get("Chrom")),
                     )
                     gene_similarity = score_result["best_similarity"]
                     overlap_count = score_result["overlap_count"]

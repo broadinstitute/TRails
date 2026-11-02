@@ -1,0 +1,124 @@
+{# The shared note editor: the Edit Note modal and the script that opens it (openNoteEditor) and
+   handles its Delete Note button. Included only by the pages that edit notes,
+   index_page_template.html and swim_plot_template.html. saveNote and deleteNote, which it calls,
+   are in header_template.html. #}
+<div id="edit-note-modal" class="ui small modal">
+    <div class="header">Edit Note</div>
+    <div class="content">
+        <!-- Show existing note info if present -->
+        <div id="existing-note-section" style="display: none; margin-bottom: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="color: #888; font-size: 0.9em;">Last updated: <span id="note-updated-at"></span></span>
+                <button id="delete-note-btn" class="ui mini red basic button"><i class="trash icon"></i>Delete Note</button>
+            </div>
+        </div>
+        <div class="ui form">
+            <div class="field">
+                <label>Note</label>
+                <textarea id="note-textarea" rows="4" placeholder="Enter your note..."></textarea>
+            </div>
+        </div>
+    </div>
+    <div class="actions">
+        <div class="ui cancel button">Cancel</div>
+        <div class="ui primary ok button">Save</div>
+    </div>
+</div>
+
+<script>
+// The note editor (#edit-note-modal, above): a multi-line textarea, so a note keeps its line
+// breaks. onNoteChanged(locusId) runs after a save or a delete, so the page can repaint whatever
+// shows the note.
+//
+// The modal is shared, with one textarea and one locus id, so a slow note fetch for an earlier
+// locus must not fill it after the user has opened a different one: only the newest open commits
+// its response.
+let noteEditorSeq = 0;
+let noteEditorOnNoteChanged = null;
+
+async function openNoteEditor(locusId, onNoteChanged) {
+    const $modal = $('#edit-note-modal');
+    const $textarea = $('#note-textarea');
+    const $existingSection = $('#existing-note-section');
+    const seq = ++noteEditorSeq;
+
+    // Fetch the locus's stored note. The editor must not open until that text is known: Save
+    // replaces the stored note with whatever the textarea holds, so an empty textarea shown over
+    // an existing note destroys it on save.
+    try {
+        const response = await fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`);
+        if (!response.ok) throw await errorFromResponse(response);
+        const data = await response.json();
+        if (seq !== noteEditorSeq) return;  // a newer open already owns the modal
+
+        // Store locusId on modal for the save and delete handlers, together with the text it belongs to.
+        $modal.data('locus-id', locusId);
+        noteEditorOnNoteChanged = onNoteChanged;
+        if (data.note && data.note.note_text) {
+            $textarea.val(data.note.note_text);
+            $('#note-updated-at').text(data.note.updated_at || '');
+            $existingSection.show();
+        } else {
+            $textarea.val('');
+            $existingSection.hide();
+        }
+    } catch (e) {
+        if (seq !== noteEditorSeq) return;
+        // Deliberately no empty-editor fallback: the locus may well have a note, and saving over
+        // it would replace it with whatever the user typed. Report the failure and stay closed.
+        console.error('Load note error:', e);
+        alert('Failed to load the existing note: ' + e.message + '\n\nThe note was not opened for editing.');
+        return;
+    }
+
+    $modal
+        .modal({
+            // The swim plot opens the editor over its detail modal, which stays open underneath
+            allowMultiple: true,
+            onApprove: function() {
+                const noteText = $textarea.val().trim();
+                const currentLocusId = $modal.data('locus-id');
+
+                if (!noteText) {
+                    // If empty, just close (don't save empty note)
+                    return true;
+                }
+
+                // Semantic UI reads this return value synchronously, and an async function hands
+                // it a Promise, which is truthy: the modal would close before the save resolved,
+                // and a failed save would discard what the user typed. Hold the modal open and
+                // close it once the save succeeds.
+                saveNote(currentLocusId, noteText).then(function() {
+                    noteEditorOnNoteChanged(currentLocusId);
+                    $modal.modal('hide');
+                }).catch(function(e) {
+                    alert('Failed to save note: ' + e.message);
+                });
+                return false;
+            },
+            // No onHidden reset: the textarea and the existing-note section are set above before
+            // every show, and a reset there would run when the hide animation ends, which can be
+            // after a quick reopen has already filled the editor with the stored note.
+        })
+        .modal('show');
+}
+
+// Delete note button inside the note editor
+$(document).on('click', '#delete-note-btn', async function() {
+    const locusId = $('#edit-note-modal').data('locus-id');
+
+    if (!confirm('Delete this note?')) return;
+
+    try {
+        await deleteNote(locusId);
+
+        // Clear the modal UI
+        $('#note-textarea').val('');
+        $('#existing-note-section').hide();
+
+        noteEditorOnNoteChanged(locusId);
+    } catch (e) {
+        alert('Failed to delete note: ' + e.message);
+    }
+});
+</script>

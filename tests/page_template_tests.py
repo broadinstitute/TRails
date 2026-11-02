@@ -1,13 +1,16 @@
 """Tests that pin the source text of the results server's page templates.
 
-The templates are Jinja + JavaScript, so there is no Python harness that can execute them.
-These tests pin the template source text instead, which is enough to catch a silent change to
-the behavior each test describes.
+The templates are Jinja + JavaScript, and there is no Python harness that can execute the
+JavaScript. These tests pin the template source text instead (rendering a Jinja macro where its
+output is what matters), which is enough to catch a silent change to the behavior each test
+describes.
 """
 
 import os
 import re
 import unittest
+
+import jinja2
 
 CODE_DIRECTORY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trails")
 
@@ -78,6 +81,17 @@ def js_object_body(text, signature):
     return text[start:end + 4]
 
 
+def filter_control_macros():
+    """Returns the macros of filter_control_macros.html, callable from Python.
+
+    Returns:
+        The template module, with gene_region_checkboxes(name_prefix) and
+        population_filter_field(name_prefix, checkbox_attribute) as attributes.
+    """
+    return jinja2.Environment(loader=jinja2.FileSystemLoader(CODE_DIRECTORY)).get_template(
+        "filter_control_macros.html").module
+
+
 class TagFilterRestoreTests(unittest.TestCase):
     """The saved tag must be selected in a dropdown whose menu already exists.
 
@@ -95,10 +109,13 @@ class TagFilterRestoreTests(unittest.TestCase):
                       "        readStateFromUrl();", self.template)
 
     def test_the_dropdown_promises_are_kept_rather_than_fired_and_forgotten(self):
-        for declaration in ("const tagDropdownReady = refreshTagFilterDropdown($('#tag-filter'));",
+        for declaration in ("const tagDropdownReady = setUpTagFilterDropdown($('#tag-filter'));",
                             "const sampleIdDropdownReady = fetchJsonOrNull(`${API_BASE_URL}/schema`, 'Load schema')"):
             self.assertIn(declaration, self.template)
             self.assertLess(self.template.index(declaration), self.template.index("Promise.all([tagDropdownReady,"))
+        # setUpTagFilterDropdown (header_template.html) hands back the fill's promise
+        self.assertIn("    return refreshTagFilterDropdown($dropdown);\n}",
+                      js_function_body(read_template("header_template.html"), "function setUpTagFilterDropdown("))
 
     def test_search_and_export_read_the_tag_off_the_dropdown(self):
         # This is what makes the ordering matter, so pin it: if these ever stopped reading the
@@ -203,7 +220,8 @@ class AnnotationWriteHelperTests(unittest.TestCase):
                 self.assertNotIn(signature, template, name)
             for call in ("openNoteEditor(", "addTag(", "removeTag("):
                 self.assertIn(call, template, name)
-        self.assertIn("saveNote(currentLocusId, noteText)", js_function_body(self.header, "async function openNoteEditor("))
+        self.assertIn("saveNote(currentLocusId, noteText)",
+                      js_function_body(read_template("note_editor.html"), "async function openNoteEditor("))
 
     def test_the_write_helpers_read_the_response_body(self):
         for signature in self.HELPER_SIGNATURES:
@@ -252,11 +270,42 @@ class OutlierWarningTests(unittest.TestCase):
                          re.findall(r"renderMendelianWarning\(([^)]+)\)", template))
         self.assertNotIn("outlier_warnings", template)
 
+    def test_the_popup_shows_the_motif_bin_labels_the_server_sends(self):
+        # The server keys motif_rates by MENDELIAN_MOTIF_SIZE_BINS's labels, so the popup keeps no
+        # label table of its own
+        self.assertIn('warning["motif_rates"][label] = {', read_template("results_server.py"))
+        self.assertIn("for (const [label, data] of Object.entries(warning.motif_rates)) {",
+                      read_template("qc_shared_js.html"))
+
     def test_the_helper_reads_the_outlier_map_only_without_mendelian_only(self):
         # Leaving the map out of the QC2 page is only safe because the helper does not read it then
         helper = js_function_body(read_template("qc_shared_js.html"), "function renderMendelianWarning(")
         self.assertIn("function renderMendelianWarning(sampleId, { mendelianOnly = false } = {}) {", helper)
         self.assertIn("const outlier = mendelianOnly ? undefined : OUTLIER_WARNINGS[sampleId];", helper)
+
+
+class MendelianWarningPopupTests(unittest.TestCase):
+    """The warning popup highlights the rates the server flags a sample for, and only those.
+
+    load_mendelian_warnings flags a sample when its autosome or chrX rate is above
+    MENDELIAN_VIOLATION_RATE_WARNING_THRESHOLD; its chrY and motif-size rates are shown for context.
+    """
+
+    def setUp(self):
+        self.shared_js = read_template("qc_shared_js.html")
+        self.server = read_template("results_server.py")
+
+    def test_the_highlight_threshold_is_the_servers(self):
+        self.assertIn("MENDELIAN_VIOLATION_RATE_WARNING_THRESHOLD = 0.10", self.server)
+        self.assertIn("const formatRate = rate => rate > 0.10 ? ", self.shared_js)
+
+    def test_only_the_rows_the_server_flags_on_are_highlighted(self):
+        for category in ("autosome", "chrX"):
+            self.assertIn('rates["%s"] > MENDELIAN_VIOLATION_RATE_WARNING_THRESHOLD' % category, self.server)
+            self.assertIn("${formatRate(warning.%s_rate)}" % category, self.shared_js)
+        self.assertEqual(2, self.shared_js.count("${formatRate("))
+        self.assertIn("${formatPercent(warning.chrY_rate)}", self.shared_js)
+        self.assertIn("${formatPercent(data.rate)}", self.shared_js)
 
 
 class ClipboardFallbackTests(unittest.TestCase):
@@ -332,6 +381,12 @@ class SharedJsHeaderTests(unittest.TestCase):
         for helper in helpers:
             self.assertIn(helper, self.header)
 
+    def test_header_says_only_mendelian_warnings_is_always_required(self):
+        # QC2 defines no OUTLIER_WARNINGS (OutlierWarningTests), so the header must not ask for it
+        self.assertIn("Requires Chart.js + jQuery (loaded by header_template.html) and the page-level "
+                      "MENDELIAN_WARNINGS\n// const.", self.header)
+        self.assertIn("mendelianOnly: true (QC2 does, and does not define it)", self.header)
+
 
 class UnknownMotifBinTests(unittest.TestCase):
     """The 'Unknown' motif-size bin the server emits must reach the charts and the popup."""
@@ -350,7 +405,7 @@ class UnknownMotifBinTests(unittest.TestCase):
         self.assertIn("if (data.some(item => item.bin === UNKNOWN_MOTIF_BIN)) bins.push(UNKNOWN_MOTIF_BIN);",
                       template)
         # The grouping and the chart loop must both run over the extended list, not MOTIF_BINS.
-        self.assertIn("bins.forEach(bin => { binData[bin] = []; });", template)
+        self.assertIn("const binData = groupRowsByBin(data, bins);", template)
         self.assertIn("bins.forEach((bin, idx) => {", template)
 
     def test_warning_popup_bin_order_covers_every_bin_the_server_emits(self):
@@ -388,9 +443,24 @@ class QCPageSharedCodeTests(unittest.TestCase):
         template = read_template("qc2_template.html")
         self.assertEqual(1, template.count("data.filter(item => item.total > 0)"))
         self.assertEqual(1, template.count("Math.ceil(maxFraction / 0.05) * 0.05 || 0.05"))
-        load = js_function_body(template, "async function loadQC2Data(")
-        self.assertEqual(2, load.count("_BINS, TRIO_SECTION);"))
-        self.assertEqual(2, load.count("_BINS, CENTER_SECTION);"))
+        draw = template[template.index("drawQCPageOnLoad('qc2_data', "):]
+        self.assertEqual(2, draw.count("_BINS, TRIO_SECTION);"))
+        self.assertEqual(2, draw.count("_BINS, CENTER_SECTION);"))
+
+    def test_both_pages_load_and_group_their_data_through_the_shared_helpers(self):
+        # drawQCPageOnLoad holds the fetch, the loading indicator and the error message, and
+        # groupRowsByBin the grouping of a section's rows, once for both pages
+        for name, call in (("sample_qc_template.html", "drawQCPageOnLoad('sample_qc_data', 'sample QC data', "
+                                                       "['section-rank1', 'section-top10'], data => {"),
+                           ("qc2_template.html", "drawQCPageOnLoad('qc2_data', 'QC2 data', ['section-motif', ")):
+            template = read_template(name)
+            self.assertIn(call, template, name)
+            self.assertIn("const binData = groupRowsByBin(", template, name)
+            self.assertNotIn("fetch(", template, name)
+            self.assertNotIn("DOMContentLoaded", template, name)
+        draw = js_function_body(read_template("qc_shared_js.html"), "function drawQCPageOnLoad(")
+        self.assertIn("document.addEventListener('DOMContentLoaded', async function() {", draw)
+        self.assertIn("document.getElementById('qc-error').textContent = `Failed to load ${dataName}: ` + err.message;", draw)
 
     def test_the_center_section_titles_name_the_server_trio_minimum(self):
         # The cutoff is the server's MIN_TRIOS_PER_CENTER, which the qc2() route passes in
@@ -399,28 +469,41 @@ class QCPageSharedCodeTests(unittest.TestCase):
         self.assertIn("min_trios_per_center=MIN_TRIOS_PER_CENTER,", read_template("results_server.py"))
 
     def test_the_shared_builder_hands_the_box_plot_plugin_its_statistics(self):
+        # Both take the values sorted once
         builder = js_function_body(read_template("qc_shared_js.html"), "function createSingleBinBoxPlotChart(")
-        self.assertIn("chart.config._boxStats = computeBoxStats(values);", builder)
+        self.assertEqual(1, builder.count(".sort("))
+        self.assertIn("chart.config._boxStats = computeBoxStats(sortedValues);", builder)
         self.assertIn("p95: computePercentile(sortedValues, 95),", builder)
         self.assertIn("p99: computePercentile(sortedValues, 99)", builder)
+
+    def test_the_median_and_quartiles_come_from_one_median_helper(self):
+        stats = js_function_body(read_template("qc_shared_js.html"), "function computeBoxStats(")
+        self.assertIn("const median = medianOfSorted(sorted);", stats)
+        self.assertIn("const q1 = medianOfSorted(sorted.slice(0, Math.floor(n / 2))) ?? median;", stats)
+        self.assertIn("const q3 = medianOfSorted(sorted.slice(Math.ceil(n / 2))) ?? median;", stats)
+        self.assertNotIn(".sort(", stats)
+
+    def test_the_percentile_labels_have_room_inside_the_canvas(self):
+        # The plugin draws the '95%' / '99%' labels (about 18px wide) 2px right of the chart area,
+        # so the builder has to leave at least that much room there.
+        template = read_template("qc_shared_js.html")
+        self.assertIn("ctx.fillText(config.label, chartArea.right + 2, yPixel + 3);", template)
+        builder = js_function_body(template, "function createSingleBinBoxPlotChart(")
+        self.assertIn("layout: { padding: { right: 22 } },", builder)
 
 
 class PopulationDataFilterGatingTests(unittest.TestCase):
     """include_loci_without_population_data only counts when require_above_population is set."""
 
     def test_the_results_query_gates_the_flag(self):
-        template = read_template("index_page_template.html")
-        sends = list(re.finditer(r"params\.set\('include_loci_without_population_data'", template))
-        # One send, in buildApiUrl, whose query both /loci and the locus export use, under a
-        # require_above_population test in the statement that encloses it.
-        self.assertEqual(1, len(sends))
-        self.assertIn("params.set('include_loci_without_population_data'",
-                      js_function_body(template, "function buildApiUrl("))
-        for send in sends:
-            # The enclosing statement starts after the previous statement or block ends.
-            statement = template[max(template.rfind(";", 0, send.start()),
-                                     template.rfind("}", 0, send.start())):send.start()]
-            self.assertIn("require_above_population", statement)
+        # buildApiUrl, whose query both /loci and the locus export use, sends the checkbox flags
+        # from CHECKBOX_FILTERS, and this one only under a require_above_population test.
+        self.assertIn("    for (const name of CHECKBOX_FILTERS) {\n"
+                      "        if (currentState[name]\n"
+                      "                && (name !== 'include_loci_without_population_data' || currentState.require_above_population)) {\n"
+                      "            params.set(name, 'true');\n"
+                      "        }\n"
+                      "    }", js_function_body(read_template("index_page_template.html"), "function buildApiUrl("))
 
     def test_the_filter_chip_is_suppressed_with_no_population_threshold(self):
         template = read_template("index_page_template.html")
@@ -453,6 +536,14 @@ class LocusExportUrlTests(unittest.TestCase):
         export = js_function_body(self.template, "async function performExport(")
         self.assertIn("? buildLocusExportUrl(format) : buildGroupedExportUrl(format);", export)
         self.assertNotIn("params.set(", export)
+
+    def test_an_export_error_is_reported_from_the_download_frame(self):
+        # The download runs in a hidden iframe, so a failed export's error body loads there, and
+        # its load handler (which a successful attachment download does not fire) shows it
+        export = js_function_body(self.template, "async function performExport(")
+        self.assertIn("iframe.onload = () => {", export)
+        self.assertIn("if (text.trim()) alert('Export failed: ' + text.trim().slice(0, 500));", export)
+        self.assertIn("        iframe.src = url;\n    } finally {", export)
 
     def test_the_server_parses_the_export_query_like_the_results_query(self):
         server = read_template("results_server.py")
@@ -506,21 +597,57 @@ class SwimDetailModalTests(unittest.TestCase):
                                                         "    _currentModalItem = item;\n"))
         self.assertNotIn("showDotDetail = ", self.template)
 
+    def test_a_failed_sample_outlier_stats_request_is_logged(self):
+        # fetchJsonOrNull (header_template.html) logs the failure; the modal then leaves out the
+        # "Sample is outlier at loci" section
+        self.assertIn("const statsPromise = fetchJsonOrNull(statsUrl, 'Load sample outlier stats');",
+                      self.show_dot_detail)
 
-class SharedNoteEditorTests(unittest.TestCase):
-    """Both pages edit notes in the one multi-line note editor in header_template.html.
 
-    A textarea keeps a note's line breaks, which a window.prompt text field cannot hold.
+class SearchErrorMessageTests(unittest.TestCase):
+    """A failed search names what failed: reaching the server, the server, or drawing the results.
+
+    describeFetchError turns any TypeError into "Could not reach the server", which is what fetch()
+    rejects with when the request cannot be made. A TypeError thrown while rendering the response
+    is a bug in the page, so performSearch shows its own message for it instead.
     """
 
     def setUp(self):
-        self.header = read_template("header_template.html")
+        self.search = js_function_body(read_template("index_page_template.html"), "async function performSearch(")
 
-    def test_the_editor_is_a_textarea_in_the_shared_header(self):
-        self.assertIn('<div id="edit-note-modal" class="ui small modal">', self.header)
-        self.assertIn('<textarea id="note-textarea" rows="4"', self.header)
-        for name in ("index_page_template.html", "swim_plot_template.html"):
+    def test_the_render_step_is_marked_once_the_response_is_in(self):
+        self.assertIn("        rendering = true;\n"
+                      "        if (grouped) renderGroupedResults(data); else renderResults(data);", self.search)
+        self.assertLess(self.search.index("const data = await response.json();"),
+                        self.search.index("rendering = true;"))
+
+    def test_a_render_error_shows_its_own_message(self):
+        self.assertIn("$('#error-text').text(rendering\n"
+                      "            ? `The results could not be displayed: ${error.message} (details in the browser console)`\n"
+                      "            : describeFetchError(error));", self.search)
+        self.assertIn("console.error('Search error:', error);", self.search)
+
+
+class SharedNoteEditorTests(unittest.TestCase):
+    """Both pages edit notes in the one multi-line note editor in note_editor.html.
+
+    A textarea keeps a note's line breaks, which a window.prompt text field cannot hold. Only the
+    two pages that edit notes include the editor; the QC pages do not.
+    """
+
+    def setUp(self):
+        self.editor_template = read_template("note_editor.html")
+
+    def test_the_editor_is_a_textarea_in_its_own_partial(self):
+        self.assertIn('<div id="edit-note-modal" class="ui small modal">', self.editor_template)
+        self.assertIn('<textarea id="note-textarea" rows="4"', self.editor_template)
+        for name in ("index_page_template.html", "swim_plot_template.html", "header_template.html"):
             self.assertNotIn('id="edit-note-modal"', read_template(name), name)
+
+    def test_only_the_pages_that_edit_notes_include_it(self):
+        including = [name for name in sorted(os.listdir(CODE_DIRECTORY)) if name.endswith(".html")
+                     and '{% include "note_editor.html" %}' in read_template(name)]
+        self.assertEqual(["index_page_template.html", "swim_plot_template.html"], including)
 
     def test_both_pages_open_it(self):
         self.assertIn("openNoteEditor(locusId, refreshAfterNoteChange);", read_template("index_page_template.html"))
@@ -529,20 +656,20 @@ class SharedNoteEditorTests(unittest.TestCase):
         self.assertNotIn("prompt('Enter note:'", swim)
 
     def test_it_opens_over_the_swim_plot_detail_modal(self):
-        self.assertIn("allowMultiple: true,", js_function_body(self.header, "async function openNoteEditor("))
+        self.assertIn("allowMultiple: true,", js_function_body(self.editor_template, "async function openNoteEditor("))
 
     def test_every_open_sets_the_editor_and_no_close_resets_it(self):
         # A reset when the hide animation ends could land after a quick reopen had already filled
         # the editor with the stored note, leaving it empty over that note.
-        editor = js_function_body(self.header, "async function openNoteEditor(")
+        editor = js_function_body(self.editor_template, "async function openNoteEditor(")
         self.assertIn("$textarea.val(data.note.note_text);", editor)
         self.assertNotIn("onHidden: function", editor)
 
     def test_save_and_delete_tell_the_page_to_repaint(self):
-        editor = js_function_body(self.header, "async function openNoteEditor(")
+        editor = js_function_body(self.editor_template, "async function openNoteEditor(")
         self.assertIn("noteEditorOnNoteChanged = onNoteChanged;", editor)
         self.assertIn("noteEditorOnNoteChanged(currentLocusId);", editor)
-        delete_handler = self.header[self.header.index("$(document).on('click', '#delete-note-btn'"):]
+        delete_handler = self.editor_template[self.editor_template.index("$(document).on('click', '#delete-note-btn'"):]
         self.assertIn("noteEditorOnNoteChanged(locusId);", delete_handler[:delete_handler.index("\n});\n")])
 
 
@@ -555,7 +682,7 @@ class NoteEditorLoadFailureTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.handler = js_function_body(read_template("header_template.html"), "async function openNoteEditor(")
+        self.handler = js_function_body(read_template("note_editor.html"), "async function openNoteEditor(")
 
     def test_a_failed_response_is_not_read_as_an_absent_note(self):
         self.assertIn("if (!response.ok) throw await errorFromResponse(response);", self.handler)
@@ -583,28 +710,82 @@ class VariationClusterDetailPanelTests(unittest.TestCase):
         template = read_template("index_page_template.html")
         self.row = js_function_body(template, "function renderLocusRow(locus, rowIndex) {")
         self.detail = js_function_body(template, "function renderLocusDetail(detail, outlierType) {")
+        self.helper = js_function_body(template, "function describeVariationCluster(locus) {")
 
-    def test_the_row_cell_has_both_states(self):
-        self.assertIn("} else if (locus.VariationClusterFilterReason) {", self.row)
-        self.assertIn("times circle outline icon", self.row)
+    def test_one_helper_decides_the_state_for_both(self):
+        for body in (self.row, self.detail):
+            self.assertIn("const variationCluster = describeVariationCluster(locus);", body)
+            self.assertNotIn("locus.VariationClusterSizeDiff", body)
+            self.assertNotIn("locus.VariationClusterFilterReason", body)
 
-    def test_the_detail_panel_has_the_same_second_state(self):
-        self.assertIn("} else if (locus.VariationClusterFilterReason) {", self.detail)
-        self.assertIn("times circle outline icon", self.detail)
+    def test_the_helper_tells_the_three_states_apart(self):
+        # A filtered-out cluster has a filter reason and a NULL size difference, so the reason is
+        # looked at only when there is no size difference.
+        self.assertIn("if (locus.VariationClusterSizeDiff != null && locus.VariationClusterSizeDiff !== '') {",
+                      self.helper)
+        self.assertIn("if (!Number.isFinite(sizeDiff)) return null;", self.helper)
+        self.assertIn("sizeDiffText: (sizeDiff >= 0 ? '+' : '') + sizeDiff.toLocaleString('en-US') + 'bp'",
+                      self.helper)
+        self.assertIn("reasonTitle: VC_FILTER_REASON_TITLES[reason] || reason", self.helper)
+        self.assertIn("reasonColor: VC_FILTER_REASON_COLORS[reason] || 'darkorange'", self.helper)
 
-    def test_the_detail_panel_reuses_the_row_cell_wording_and_colors(self):
-        for name in ("VC_FILTER_REASON_TITLES", "VC_FILTER_REASON_COLORS"):
-            self.assertIn(name, self.row)
-            self.assertIn(name, self.detail)
+    def test_both_show_the_kept_and_the_filtered_out_state(self):
+        for body in (self.row, self.detail):
+            self.assertIn("if (variationCluster && variationCluster.sizeDiff != null) {", body)
+            self.assertIn("} else if (variationCluster) {", body)
+            self.assertIn('<i class="times circle outline icon" style="color: ${variationCluster.reasonColor};"', body)
+        self.assertIn("Variation Cluster: ${variationCluster.sizeDiffText}", self.detail)
 
-    def test_both_guard_the_size_difference_the_same_way(self):
-        guard = "locus.VariationClusterSizeDiff != null && locus.VariationClusterSizeDiff !== ''"
-        self.assertIn(guard, self.row)
-        self.assertIn(guard, self.detail)
-        self.assertIn("Number.isFinite(", self.detail)
 
-    def test_the_unfiltered_state_is_a_size_in_bp(self):
-        self.assertIn("Variation Cluster: ${vcsSign}${vcsDiff.toLocaleString('en-US')}bp", self.detail)
+class AddTagEnterTests(unittest.TestCase):
+    """Enter in the Edit Tags modal adds the highlighted menu item, not the typed prefix.
+
+    Semantic UI commits the highlighted menu item in its own keydown handler on the dropdown
+    element, so the page binds its Enter handler on the dropdown, after Semantic UI's, and reads the
+    committed value (typing 'can' with 'candidate' highlighted adds 'candidate'). A key handler on
+    the dropdown's search input would run before Semantic UI's, while nothing is committed yet.
+    """
+
+    def setUp(self):
+        self.template = read_template("index_page_template.html")
+
+    def test_the_enter_handler_runs_after_semantic_uis(self):
+        self.assertIn("$addTagDropdown.off('keydown.addtag').on('keydown.addtag', function(e) {", self.template)
+        self.assertIsNone(re.search(r"input\.search'\)[^;]*\.on\('key", self.template))
+
+    def test_the_typed_text_is_only_a_fallback(self):
+        self.assertIn("const tag = (dropdownValue || searchValue || '').trim();", self.template)
+
+
+class SharedRenderingHelperTests(unittest.TestCase):
+    """Markup and rules that several places show are written once, in one helper each."""
+
+    def setUp(self):
+        self.template = read_template("index_page_template.html")
+
+    def test_both_expandable_texts_use_one_helper(self):
+        # The .expand-phenotype / .collapse-phenotype handlers look for the classes it writes
+        helper = js_function_body(self.template, "function renderExpandableText(text, maxLength) {")
+        for name in ("phenotype-short", "expand-phenotype", "phenotype-full", "collapse-phenotype"):
+            self.assertIn('class="%s"' % name, helper)
+            self.assertEqual(1, self.template.count('class="%s"' % name), name)
+        self.assertIn("renderExpandableText(locus.GeneTableLLMPhenotypeSummary, 50)",
+                      js_function_body(self.template, "function renderLocusRow(locus, rowIndex) {"))
+        self.assertIn("renderExpandableText(s.phenotype_description, 150)",
+                      js_function_body(self.template, "function renderLocusDetail(detail, outlierType) {"))
+
+    def test_both_summary_charts_use_one_builder(self):
+        self.assertEqual(1, self.template.count("new Chart("))
+        self.assertIn("new Chart(", js_function_body(self.template, "function renderSummaryBarChart("))
+        for call in ("renderSummaryBarChart('motif-chart', 'motif-chart-container', labels, data, {",
+                     "renderSummaryBarChart('gene-region-chart', 'gene-region-chart-container', labels, data, {"):
+            self.assertIn(call, self.template)
+
+    def test_the_swim_dots_and_legend_counts_use_one_status_rule(self):
+        swim = read_template("swim_plot_template.html")
+        self.assertIn("const colors = STATUS_COLORS[statusCategory(item.affected_status)];", swim)
+        self.assertIn("data.forEach(item => { counts[statusCategory(item.affected_status)]++; });", swim)
+        self.assertEqual(1, swim.count("isAffectedStatus("))
 
 
 class DetailRowOuterCellTests(unittest.TestCase):
@@ -629,14 +810,21 @@ class DetailRowOuterCellTests(unittest.TestCase):
                              "line %d selects descendant wrappers" % number)
 
     def test_every_detail_cell_lookup_targets_a_direct_child(self):
-        # Toggle off, the loading row's error message, the detail render (loadLocusDetailInto,
-        # shared by the expand handler and the post-annotation refresh), collapse one and collapse
-        # all, plus the two colspans (a locus detail row's and a grouped row's) that count the
-        # cells of the row they open under.
-        self.assertEqual(7, self.template.count(".children('td')"))
+        # Collapsing one row (collapseLocusDetailRow, shared by the expand toggle and the Collapse
+        # details button), the loading row's error message, the detail render (loadLocusDetailInto,
+        # shared by the expand handler and the post-annotation refresh) and collapse all, plus the
+        # two colspans (a locus detail row's and a grouped row's) that count the cells of the row
+        # they open under.
+        self.assertEqual(6, self.template.count(".children('td')"))
         self.assertEqual(2, self.template.count("colspan=\"${$row.children('td').length}\""))
-        # One slide wrapper per row: toggle off, collapse one, collapse all.
-        self.assertEqual(3, self.template.count(".children('.slide-wrapper')"))
+        # One slide wrapper per row: collapse one, collapse all.
+        self.assertEqual(2, self.template.count(".children('.slide-wrapper')"))
+
+    def test_both_ways_of_closing_one_panel_use_the_shared_collapse(self):
+        self.assertIn("    if ($existingDetail.length) {\n        collapseLocusDetailRow($existingDetail);",
+                      self.template)
+        self.assertIn("$(document).on('click', '.collapse-detail-btn', function() {\n"
+                      "    collapseLocusDetailRow($(this).closest('.locus-detail-row'));\n});", self.template)
 
     def test_the_wrapped_cell_is_the_one_that_is_animated(self):
         self.assertIn("$td.wrapInner('<div class=\"slide-wrapper\"></div>');\n"
@@ -663,9 +851,6 @@ class ResultsTableColumnCountTests(unittest.TestCase):
         self.assertGreater(header.count("<th "), 0)
         # selectedAllelesCell, the grouped view's extra cell, is interpolated rather than literal
         self.assertEqual(header.count("<th "), row.count("<td "))
-
-    def test_no_colspan_is_a_hard_coded_number(self):
-        self.assertEqual([], re.findall(r'colspan="\d+"', self.template))
 
     def test_every_colspan_is_one_of_the_computed_counts(self):
         self.assertEqual({"${colCount}", "${resultsTableColumnCount()}", "${$row.children('td').length}"},
@@ -698,7 +883,7 @@ class FamilyCountColumnTests(unittest.TestCase):
         self.assertIn("#results-table .col-fam-unsolved { width: 55px; }", read_template("header_template.html"))
 
     def test_the_server_accepts_the_sort(self):
-        self.assertIn('"family_count": (f"NumAffectedUnsolvedFamiliesAboveUnaffected_{ot}", "DESC")',
+        self.assertIn('"family_count": ("NumAffectedUnsolvedFamiliesAboveUnaffected_{ot}", "DESC")',
                       read_template("results_server.py"))
 
 
@@ -719,8 +904,9 @@ class MinDeltaPopFilterTests(unittest.TestCase):
     def test_every_state_function_handles_it(self):
         self.assertIn("    min_repeats_above_population: '',",
                       js_object_body(self.template, "const DEFAULT_STATE = {"))
-        for signature in ("function applyStateToUI(", "function readStateFromUI(", "function buildApiUrl("):
-            self.assertIn("'min_repeats_above_population'", js_function_body(self.template, signature), signature)
+        # applyStateToUI, readStateFromUI and buildApiUrl take it from the shared list
+        # (FilterControlListTests)
+        self.assertIn("min_repeats_above_population", js_string_list(self.template, "TEXT_FILTER_INPUTS"))
         self.assertIn("min_repeats_above_population: 'Min Δpop'",
                       js_function_body(self.template, "function updateActiveFiltersBar("))
 
@@ -743,20 +929,64 @@ class MinDeltaPopFilterTests(unittest.TestCase):
         # The full cohort list is pinned to the server's in PopulationCohortTests
         self.assertIn('"short-read": ("TenK10K",),', read_template("results_server.py"))
 
-    def test_the_server_accepts_min_pli_for_api_callers(self):
-        self.assertIn('request.args.get("min_pli")', read_template("results_server.py"))
-
     def test_a_url_with_a_parameter_the_page_does_not_use_is_normalized_in_place(self):
         # readStateFromUrl keeps only DEFAULT_STATE keys, and then always rewrites the arrival
-        # hash in place, so a URL carrying a parameter the page does not use (e.g. min_pli)
-        # neither keeps it nor traps Back.
+        # hash in place, so a URL carrying a parameter the page does not use (e.g. min_pli, which
+        # only API callers send) neither keeps it nor traps Back.
         read_state = js_function_body(self.template, "function readStateFromUrl(")
         self.assertIn("if (key in DEFAULT_STATE) {", read_state)
         self.assertIn("    replaceStateInUrl();\n\n    applyStateToUI();", read_state)
+        self.assertNotIn("min_pli", js_object_body(self.template, "const DEFAULT_STATE = {"))
+        self.assertIn('request.args.get("min_pli")', read_template("results_server.py"))
 
     def test_the_metric_stays_in_the_url_because_the_column_uses_it(self):
         state_hash = js_function_body(self.template, "function buildStateHash(")
         self.assertNotIn("key === 'population_metric'", state_hash)
+
+
+class FilterControlListTests(unittest.TestCase):
+    """applyStateToUI, readStateFromUI and buildApiUrl take the filter controls from one shared list
+    per kind.
+
+    A control left out of a list is silently lost on reload, on Search or from the request, so each
+    list has to name exactly the page's inputs of that kind.
+    """
+
+    def setUp(self):
+        self.template = read_template("index_page_template.html")
+
+    def test_the_lists_name_exactly_the_pages_text_and_checkbox_filters(self):
+        # The population filter field's inputs come from filter_control_macros.html
+        page = self.template + str(filter_control_macros().population_filter_field("", "name"))
+        inputs = re.findall(r'<input type="(text|number|checkbox)" name="(\w+)"', page)
+        self.assertEqual(sorted(name for kind, name in inputs if kind in ("text", "number")),
+                         sorted(js_string_list(self.template, "TEXT_FILTER_INPUTS")))
+        # The sort checkboxes belong to the sort pills, and the gene-region ones to GENE_REGION_FILTERS
+        self.assertEqual(sorted(name for kind, name in inputs if kind == "checkbox" and name != "sort_by"
+                                and not re.match(r"(exclude_)?gene_region_", name)),
+                         sorted(js_string_list(self.template, "CHECKBOX_FILTERS")))
+
+    def test_each_name_is_a_state_key(self):
+        default_state = js_object_body(self.template, "const DEFAULT_STATE = {")
+        for name in js_string_list(self.template, "TEXT_FILTER_INPUTS"):
+            self.assertIn("    %s: ''," % name, default_state)
+        for name in js_string_list(self.template, "CHECKBOX_FILTERS"):
+            self.assertIn("    %s: false," % name, default_state)
+
+    def test_both_state_functions_loop_over_the_lists(self):
+        for signature in ("function applyStateToUI(", "function readStateFromUI("):
+            body = js_function_body(self.template, signature)
+            for loop in ("for (const name of TEXT_FILTER_INPUTS) {", "for (const name of CHECKBOX_FILTERS) {",
+                         "for (const [key, namePrefix] of GENE_REGION_FILTERS) {"):
+                self.assertIn(loop, body, signature)
+
+    def test_the_request_sends_every_filter_in_the_lists(self):
+        build = js_function_body(self.template, "function buildApiUrl(")
+        self.assertIn("...TEXT_FILTER_INPUTS, 'sample_id_keyword', ...GENE_REGION_FILTERS.map(([key]) => key), 'sort_by', 'tag',",
+                      build)
+        self.assertIn("for (const name of stringParams) {\n        if (currentState[name]) params.set(name, currentState[name]);",
+                      build)
+        self.assertIn("for (const name of CHECKBOX_FILTERS) {", build)
 
 
 class GroupResultsByTests(unittest.TestCase):
@@ -877,9 +1107,14 @@ class PopulationGateOptionTests(unittest.TestCase):
         self.template = read_template("index_page_template.html")
 
     def test_both_pages_offer_the_all_cohorts_filter_the_server_accepts(self):
-        self.assertIn('<input type="radio" name="require_above_population" value="all">', self.template)
-        self.assertIn('<input type="radio" name="swim_require_above_population" value="all">',
-                      read_template("swim_plot_template.html"))
+        # Both pages render the field from filter_control_macros.html with their own name prefix; the
+        # swim plot names its checkbox by id, as it reads its checkboxes
+        field = filter_control_macros().population_filter_field
+        for name, prefix, attribute in (("index_page_template.html", "", "name"), ("swim_plot_template.html", "swim_", "id")):
+            self.assertIn("{{ population_filter_field('%s', '%s') | indent(" % (prefix, attribute), read_template(name), name)
+            rendered = str(field(prefix, attribute))
+            self.assertIn('<input type="radio" name="%srequire_above_population" value="all">' % prefix, rendered)
+            self.assertIn('<input type="checkbox" %s="%sinclude_loci_without_population_data">' % (attribute, prefix), rendered)
         self.assertIn('"all": POPULATION_DATASETS,', read_template("results_server.py"))
 
     def test_the_server_hands_the_page_its_start_value(self):
@@ -1049,8 +1284,6 @@ class PopulationCohortTests(unittest.TestCase):
         swim = read_template("swim_plot_template.html")
         self.assertIn("POPULATION_COHORTS.filter(k => popThresh[k + '_MaxAllele'] != null).forEach(k => {",
                       js_function_body(swim, "function renderDotDetailContent("))
-        for name, template in (("index_page_template.html", index), ("swim_plot_template.html", swim)):
-            self.assertNotIn("['TenK10K', 'TenK10K']", template, name)
 
 
 class AnnotationBadgeTests(unittest.TestCase):
@@ -1137,12 +1370,16 @@ class TypedInDropdownValueEscapingTests(unittest.TestCase):
         for name in sorted(os.listdir(CODE_DIRECTORY)):
             if not name.endswith(".html"):
                 continue
-            for match in re.finditer(r"(\$\('#[\w-]+'\))\.dropdown\(\{(.*?)\n    \}\);", read_template(name), re.DOTALL):
+            for match in re.finditer(r"(\$\('#[\w-]+'\)|\$dropdown)\.dropdown\(\{(.*?)\n    \}\);", read_template(name), re.DOTALL):
                 if "allowAdditions: true" in match.group(2):
                     dropdowns_with_additions.append(match.group(1))
                     self.assertIn("...ESCAPING_ADDITIONS_DROPDOWN_SETTINGS,", match.group(2), match.group(1))
-        self.assertEqual(["$('#sample-id-filter')", "$('#add-tag-dropdown')", "$('#swim-sample-id-filter')"],
-                         dropdowns_with_additions)
+        # header_template.html's setUpSampleIdFilterDropdown ($dropdown), and the add-tag dropdown
+        self.assertEqual(["$dropdown", "$('#add-tag-dropdown')"], dropdowns_with_additions)
+        self.assertIn("function setUpSampleIdFilterDropdown($dropdown) {\n    $dropdown.dropdown({",
+                      read_template("header_template.html"))
+        self.assertIn("setUpSampleIdFilterDropdown($('#sample-id-filter'));", read_template("index_page_template.html"))
+        self.assertIn("setUpSampleIdFilterDropdown($('#swim-sample-id-filter'));", read_template("swim_plot_template.html"))
 
     def test_the_url_restored_dropdown_is_one_of_them(self):
         apply_state = js_function_body(read_template("index_page_template.html"), "function applyStateToUI(")
@@ -1186,8 +1423,7 @@ class ErrorResponseTests(unittest.TestCase):
         for name, function_signature in (("index_page_template.html", "async function performSearch("),
                                          ("index_page_template.html", "async function loadLocusDetailInto("),
                                          ("swim_plot_template.html", "async function loadSwimPlot("),
-                                         ("qc2_template.html", "async function loadQC2Data("),
-                                         ("sample_qc_template.html", "async function loadSampleQCData(")):
+                                         ("qc_shared_js.html", "function drawQCPageOnLoad(")):
             self.assertIn("if (!response.ok) throw await errorFromResponse(response);",
                           js_function_body(templates[name], function_signature), function_signature)
 
@@ -1271,7 +1507,10 @@ class ApiBaseUrlTests(unittest.TestCase):
             all_templates += template
             if name.endswith("_template.html") and name != "header_template.html":
                 self.assertIn('{% include "header_template.html" %}', template, name)
-                self.assertIn("API_BASE_URL", template, name)
+                # The QC pages request their data through qc_shared_js.html's drawQCPageOnLoad
+                self.assertTrue("API_BASE_URL" in template or "drawQCPageOnLoad(" in template, name)
+        self.assertIn("const response = await fetch(`${API_BASE_URL}/${endpoint}`);",
+                      js_function_body(read_template("qc_shared_js.html"), "function drawQCPageOnLoad("))
         self.assertEqual(1, all_templates.count("window.location.origin + '/api/v1'"))
 
     def test_the_results_page_reads_annotations_from_the_shared_url(self):
@@ -1282,21 +1521,35 @@ class ApiBaseUrlTests(unittest.TestCase):
 
 
 class GeneRegionListTests(unittest.TestCase):
-    """Both pages take the gene regions from one list, header_template.html's GENE_REGIONS."""
+    """Both pages take the gene regions from one list, header_template.html's GENE_REGIONS, and draw
+    all four checkbox blocks (include and exclude, on each page) from one macro."""
 
-    def test_the_list_matches_the_server_and_both_pages_checkboxes(self):
+    def test_the_list_matches_the_server_and_the_shared_checkboxes(self):
         regions = js_string_list(read_template("header_template.html"), "GENE_REGIONS")
         server = read_template("results_server.py")
         server_map = server[server.index("GENE_REGION_MAP = {"):]
         self.assertEqual(regions, re.findall(r'^    "(\w+)": \[', server_map[:server_map.index("\n}\n")], re.MULTILINE))
+        checkboxes = filter_control_macros().gene_region_checkboxes
+        self.assertEqual(regions, re.findall(r'name="exclude_gene_region_(\w+)"', str(checkboxes("exclude_gene_region_"))))
+
+    def test_all_four_checkbox_blocks_render_the_macro(self):
         for name, prefix in (("index_page_template.html", ""), ("swim_plot_template.html", "swim_")):
             template = read_template(name)
+            self.assertIn('{%- from "filter_control_macros.html" import gene_region_checkboxes, population_filter_field %}',
+                          template, name)
             for kind in ("gene_region_", "exclude_gene_region_"):
-                self.assertEqual(regions, re.findall(r'name="%s%s(\w+)"' % (prefix, kind), template), (name, kind))
+                self.assertEqual(1, template.count("{{ gene_region_checkboxes('%s%s') | indent(" % (prefix, kind)),
+                                 (name, kind))
 
     def test_both_pages_loop_over_it(self):
-        # applyStateToUI and readStateFromUI, each for include and exclude; getSwimParams likewise
-        self.assertEqual(4, read_template("index_page_template.html").count("for (const r of GENE_REGIONS) {"))
+        # applyStateToUI and readStateFromUI, each once per include and exclude prefix of
+        # GENE_REGION_FILTERS; getSwimParams once each for include and exclude
+        template = read_template("index_page_template.html")
+        self.assertIn("const GENE_REGION_FILTERS = [['gene_regions', 'gene_region_'], "
+                      "['exclude_gene_regions', 'exclude_gene_region_']];", template)
+        self.assertIn("for (const r of GENE_REGIONS) {", js_function_body(template, "function applyStateToUI("))
+        self.assertIn("currentState[key] = GENE_REGIONS\n            .filter(",
+                      js_function_body(template, "function readStateFromUI("))
         self.assertEqual(2, read_template("swim_plot_template.html").count("GENE_REGIONS.forEach(r => {"))
 
 

@@ -263,9 +263,9 @@ def _process_trio(child_id, mother_id, father_id, prepared_loci, threshold):
     Iterates the child's genotype at every locus, dispatching by chromosome
     category (chrY: child+father; chrM and a hemizygous son's chrX: child+mother;
     otherwise all three), requiring at least two distinct allele sizes across the
-    members that count, and
-    tallying totals and violations by chromosome, by motif-size category, and by
-    canonical 1-6bp motif.
+    members that count unless both sides of a single-parent comparison are haploid
+    (chrY, chrM), and tallying totals and violations by chromosome, by motif-size
+    category, and by canonical 1-6bp motif.
 
     Args:
         child_id: Sample id of the child.

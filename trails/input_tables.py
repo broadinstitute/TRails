@@ -99,11 +99,18 @@ def match_columns(df, logical_names):
 
 
 # Matrix columns whose header names a known per-locus annotation rather than a
-# sample. When present they are promoted to the locus record (pass-through)
+# sample. When present they are promoted to the locus record
 # instead of being treated as a sample genotype column — so they cannot pollute
 # the allele histograms/outlier lists and they reach the downstream annotation
-# stages. Matched case/underscore-insensitively; the value maps each normalized
-# header to the canonical column name the record/output schema expects.
+# stages. Being recognized is not the same as being kept: Chrom, Start0Based,
+# End1Based, MotifSize, CanonicalMotif and gene_region_rank are always recomputed
+# from the LocusId, Motif and gene_region
+# (locus_annotations.SOURCE_COLUMN_BY_RECOMPUTED_COLUMN), so for those the header
+# only stays out of the sample list. KnownDiseaseLocus, IsKnownMotif and
+# IsInMendelianGene are kept only when the build has no known-loci catalog or gene
+# table to compute them from. The rest are kept as supplied. Matched
+# case/underscore-insensitively; the value maps each normalized header to the
+# canonical column name the record/output schema expects.
 ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED = {normalize_column_name(name): name for name in [
     "gene_id", "GencodeGeneId", "gene_region", "GencodeGeneRegion", "gene_region_rank",
     "ReferenceRegion", "NumRepeatsInReference", "CanonicalMotif", "MotifSize",
@@ -112,11 +119,16 @@ ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED = {normalize_column_name(name): name f
     "VariationClusterSizeDiff", "VariationCluster", "VariationClusterFilterReason",
 ]}
 # Per-cohort population-stat / TRExplorer annotation columns share these header
-# prefixes (e.g. HPRC256_99thPercentile, AoU1027_Mode, TRExplorerMotif). They are
-# passed through verbatim under their own header name. The prefixes are the
-# specific cohort/version tokens actually emitted upstream (not the bare cohort
-# abbreviation) so they can't swallow a genuine sample column whose id merely
-# starts with a cohort name (e.g. a sample named "AoU_0001").
+# prefixes (e.g. HPRC256_99thPercentile, AoU1027_Mode, TenK10K_MaxAllele,
+# TRExplorerMotif). A header matching a loci-table output column is stored under
+# that column's canonical spelling (see _NORMALIZED_OUTPUT_COLUMNS below); any other
+# prefix-matched header is passed through under its own name.
+# Any header whose normalized form starts with one of these tokens is read as an
+# annotation, never as a sample. "hprc256" and "aou1027" carry the cohort size, so
+# a sample whose id merely starts with the cohort name (e.g. "AoU_0001") is still
+# a sample. "tenk10k" and "trexplorer" are the bare cohort and tool names, so a
+# sample column whose id starts with them (e.g. "TenK10K_S1") is also read as an
+# annotation.
 ANNOTATION_COLUMN_PREFIXES = ("hprc256", "aou1027", "tenk10k", "trexplorer")
 
 # Normalized -> canonical spelling for every loci-table output column, so a
@@ -152,8 +164,17 @@ def _coerce_annotation_value(value):
         return value
 
 
-def _is_annotation_column(column_name):
-    """Return the canonical name if column_name is a known annotation column, else None."""
+def _get_canonical_annotation_column_name_or_none(column_name):
+    """Return the record key a matrix column's values are stored under, or None for a sample column.
+
+    Args:
+        column_name: A matrix column header.
+
+    Returns:
+        The canonical annotation column name for a recognized annotation header (the
+        header itself for a prefix-matched one outside the loci-table schema), or None
+        when the column is a sample.
+    """
     normalized = normalize_column_name(column_name)
     if normalized in ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED:
         return ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED[normalized]
@@ -172,11 +193,14 @@ def read_repeat_copy_numbers(path):
     header names a known per-locus annotation (see
     ``ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED`` /
     ``ANNOTATION_COLUMN_PREFIXES`` — e.g. ``gene_id``, ``GencodeGeneRegion``,
-    ``HPRC256_99thPercentile``) is treated as an annotation pass-through column,
+    ``HPRC256_99thPercentile``) is treated as an annotation column,
     NOT a sample; everything else is a sample whose value for a locus is that
     sample's genotype cell string. Separating annotation columns out keeps them
     from being mistaken for samples (which would otherwise pollute the allele
-    histograms/outlier lists and never reach the annotation stages).
+    histograms/outlier lists and never reach the annotation stages). The returned
+    values are the matrix's own (numeric ones coerced); the build later recomputes
+    some of these columns (see the comment on
+    ``ANNOTATION_COLUMN_CANONICAL_BY_NORMALIZED``).
 
     Gzipped (``.gz``) files are supported.
 
@@ -215,7 +239,7 @@ def read_repeat_copy_numbers(path):
     for column in df.columns:
         if column in (trid_column, motif_column):
             continue
-        canonical = _is_annotation_column(column)
+        canonical = _get_canonical_annotation_column_name_or_none(column)
         if canonical is None:
             sample_id_list.append(column)
         else:
@@ -415,6 +439,10 @@ def read_gene_table(path):
     Returns:
         A dict mapping each gene_id to a dict of its retained annotation fields.
         Returns an empty dict if ``path`` is None.
+
+    Raises:
+        ValueError: If the table has no ``gene_id`` column, or lists a gene_id on more
+            than one row.
     """
     if path is None:
         return {}
@@ -445,6 +473,17 @@ def read_gene_table(path):
         df["hgnc_gene_id"] = df["hgnc_gene_id"].apply(
             lambda value: value if analysis_columns.blank_to_none(value) is None
             else str(int(value)) if isinstance(value, float) else str(value))
+
+    # One row per gene, as genelookup's table has. A table with one row per gene-disease pair can
+    # disagree between a gene's rows (AD on one, AR on the next), so its rows are neither merged
+    # nor dropped; without this check to_dict fails with a pandas error naming no file or gene.
+    repeated_gene_ids = df.loc[df["gene_id"].duplicated(), "gene_id"].unique()
+    if len(repeated_gene_ids):
+        raise ValueError(
+            f"Gene table {path} lists {len(repeated_gene_ids)} gene_id value(s) on more than one "
+            f"row: {', '.join(str(gene_id) for gene_id in repeated_gene_ids[:10])}"
+            f"{', ...' if len(repeated_gene_ids) > 10 else ''}. It needs one row per gene, so "
+            f"combine each gene's rows into one")
 
     return df[columns_to_keep].set_index("gene_id").to_dict(orient="index")
 

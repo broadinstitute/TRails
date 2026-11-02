@@ -1,14 +1,24 @@
 """Unit tests for the TRails Flask server (results_server.py).
 
-These tests build a tiny temporary DuckDB database with a minimal ``loci`` table
-(plus a ``swim_plot`` table) and exercise the server through Flask's test client,
-so no real TCP port is bound. They check that:
+Most test classes build their own small DuckDB database in a temporary directory with one of the
+``_build_*`` functions below (``_build_minimal_db``, behind MinimalDatabaseTestCase, is the most
+used) and drive the server through Flask's test client (server_test_fixtures.ServerTestCase), so
+no TCP port is bound. The others call server functions directly. Covered:
 
-  * GET /api/v1/loci returns rows from the database, and
-  * the pages and endpoints (schema, swim, export, qc) behave gracefully.
+  * the /api/v1/loci list, its filters and sorts, the schema and the pages;
+  * the swim-plot, sample-QC, QC2 and locus-detail endpoints;
+  * the BED, TSV, JSON and ExpansionHunter exports, their outlier sample lists and
+    read-visualization thresholds;
+  * known-disease matching through the variant catalog and STRchive, at startup and on the
+    locus-detail page;
+  * phenotype-keyword matching with and without a swim_plot table;
+  * the sample-table reader, notes and tags, the annotations database's location, the request
+    checks and Mendelian-violation warnings.
 """
 
+import contextlib
 import gzip
+import io
 import json
 import os
 import sys
@@ -26,7 +36,8 @@ import locus_annotations
 import result_database
 import results_server
 import swim_plot
-from tests.server_test_fixtures import ServerTestCase, make_swim_plot_row
+from tests.database_test_helpers import make_locus_record_with_every_swim_plot_input
+from tests.server_test_fixtures import ServerTestCase, make_swim_plot_row, read_gzipped_tsv_rows
 
 
 def _build_minimal_db(path):
@@ -192,6 +203,27 @@ class ResultsServerTests(MinimalDatabaseTestCase):
                              200, value)
         self.assertEqual(self.client.get("/api/v1/loci?outlier_type=all&population_metric=median").status_code, 400)
 
+    def test_the_schema_names_each_kind_of_value_one_way(self):
+        schema = self.client.get("/api/v1/schema").get_json()
+        types = {name: spec["type"] for section in ("filters", "grouped_view_parameters", "swim_plot_parameters")
+                 for name, spec in schema[section].items()}
+        self.assertLessEqual(set(types.values()), {"enum", "multi_enum", "boolean", "float", "string", "int"})
+        for name in ("min_expansion", "min_repeats_threshold", "min_repeats_above_population",
+                     "max_variation_cluster_size_diff"):
+            self.assertEqual(types[name], "int", name)
+
+    def test_every_numeric_bound_the_schema_advertises_is_enforced(self):
+        filters = self.client.get("/api/v1/schema").get_json()["filters"]
+        bounded = {name: spec for name, spec in filters.items() if "min" in spec or "max" in spec}
+        self.assertLessEqual({"min_repeats_threshold", "min_pli"}, set(bounded))
+        for name, spec in bounded.items():
+            for bound, step_outside in (("min", -1), ("max", 1)):
+                if bound not in spec:
+                    continue
+                for value, expected_status in ((spec[bound], 200), (spec[bound] + step_outside, 400)):
+                    response = self.client.get(f"/api/v1/loci?outlier_type=all&{name}={value}")
+                    self.assertEqual(response.status_code, expected_status, (name, value))
+
     def test_the_page_escapes_the_gate_cohort_names(self):
         with mock.patch.dict(results_server.app.config, {"POPULATION_GATE_COHORTS": ('<img src=x onerror="f()">',)}):
             page = self.client.get("/").get_data(as_text=True)
@@ -200,6 +232,13 @@ class ResultsServerTests(MinimalDatabaseTestCase):
         # its data-html attribute's decoded value as HTML, so the name is escaped once more there.
         self.assertIn("built with (&lt;img src=x onerror=&#34;f()&#34;&gt;; #Aff counted by family)", page)
         self.assertIn("built with (&amp;lt;img src=x onerror=&amp;#34;f()&amp;#34;&amp;gt;). A row expands", page)
+
+    def test_every_sort_key_the_schema_advertises_is_accepted(self):
+        sort_options = self.client.get("/api/v1/schema").get_json()["sort_options"]
+        self.assertEqual(sort_options, list(results_server.SORT_MAPPING))
+        for sort_key in sort_options:
+            self.assertEqual(self.client.get(f"/api/v1/loci?outlier_type=all&sort_by={sort_key}").status_code,
+                             200, sort_key)
 
     def test_variation_cluster_sort_is_accepted(self):
         # The sort key the "Variation Cluster" checkbox sends. This fixture has no
@@ -574,15 +613,6 @@ class ResultsServerTests(MinimalDatabaseTestCase):
         self.assertNotIn("LocusId ILIKE", select_query)
         self.assertEqual(sql_params[-3:], [locus_id.lower() for locus_id in ids])
 
-    def test_pasted_locus_ids_keep_their_place_among_the_other_search_terms(self):
-        # The ids are hoisted to the front of the OR, so their bind parameters have to move with
-        # them: a gene symbol term binding out of order would filter on the wrong value.
-        select_query, _, _, _, sql_params = results_server.build_api_query({
-            "outlier_type": "all", "search_terms": [("gene_symbol", "GENE1"), ("locus_id", "chr1-100-110-AT")],
-        })
-        self.assertIn("(lower(LocusId) IN (?) OR GeneTableGeneSymbol ILIKE ?)", select_query)
-        self.assertEqual(sql_params[-2:], ["chr1-100-110-at", "%GENE1%"])
-
     def test_pasted_locus_ids_still_match_case_insensitively_end_to_end(self):
         response = self.client.get("/api/v1/loci",
                                    query_string={"outlier_type": "all",
@@ -592,12 +622,19 @@ class ResultsServerTests(MinimalDatabaseTestCase):
                          {"chr1-100-110-AT", "chr2-200-209-AAG"})
 
     def test_pasted_locus_ids_are_one_set_lookup_in_the_swim_plot_endpoint_too(self):
+        recorded_queries = _record_queries(self)
         response = self.client.get("/api/v1/swim_plot_data",
                                    query_string={"outlier_type": "all",
                                                  "search": "CHR1-100-110-at,chr2-200-209-AAG"})
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         self.assertEqual({entry["LocusId"] for entry in response.get_json()["data"]},
                          {"chr1-100-110-AT", "chr2-200-209-AAG"})
+        # The swim plot looks the matching loci up once, into its temp table, with the same single
+        # IN list the results table uses
+        loci_lookups = [sql for sql in recorded_queries if "FROM loci" in sql]
+        self.assertEqual(len(loci_lookups), 1, loci_lookups)
+        self.assertEqual(loci_lookups[0].count("lower(LocusId) IN (?,?)"), 1, loci_lookups[0])
+        self.assertNotIn("LocusId ILIKE", loci_lookups[0])
 
 
 
@@ -779,9 +816,26 @@ class StrchivePathogenicMotifTests(ServerTestCase):
 
     def test_strchive_inheritance_is_a_flat_list(self):
         # STRchive stores inheritance as a list, so reporting it must not nest it in another one.
-        self.assertEqual(self._known_disease_locus("chr9-100-110-AAGGG")["inheritance"], ["AD"])
+        # Each disease's inheritance is one string, as the variant-catalog branch reports it.
+        known = self._known_disease_locus("chr9-100-110-AAGGG")
+        self.assertEqual((known["inheritance"], known["diseases"][0]["inheritance"]), (["AD"], "AD"))
         # A bare string from an older cached file still comes back as a list of modes.
-        self.assertEqual(self._known_disease_locus("chr3-300-310-CAG")["inheritance"], ["AR"])
+        known = self._known_disease_locus("chr3-300-310-CAG")
+        self.assertEqual((known["inheritance"], known["diseases"][0]["inheritance"]), (["AR"], "AR"))
+
+    def test_a_strchive_diseases_inheritance_is_one_string_or_none(self):
+        # The locus-detail popup shows "-" for a missing inheritance, which an empty list would hide
+        for inheritance, expected_disease_inheritance in ((["AD", "AR"], "AD, AR"), ([], None)):
+            strchive_path = os.path.join(self.tmpdir, "STRchive-inheritance.json")
+            with open(strchive_path, "w") as output_file:
+                json.dump([dict(STRCHIVE_TEST_LOCI[0], inheritance=inheritance)], output_file)
+            disease_trees, strchive_trees = locus_annotations.load_known_disease_loci(
+                None, strchive_filepath=strchive_path)
+            known = results_server.compute_known_disease_info(
+                {"Chrom": "chr9", "Start0Based": 100, "End1Based": 110, "Motif": "AAGGG"},
+                {"disease_trees": disease_trees, "strchive_trees": strchive_trees})
+            self.assertEqual((known["inheritance"], known["diseases"][0]["inheritance"]),
+                             (inheritance or None, expected_disease_inheritance), inheritance)
 
     def test_strchive_inheritance_modes_shapes(self):
         self.assertEqual(results_server.strchive_inheritance_modes(["AD", "AR"]), ["AD", "AR"])
@@ -840,6 +894,12 @@ class PhenotypeKeywordAcrossAffectedOutliersTests(ServerTestCase):
         self.assertEqual(self.get_locus_ids("phenotype_keyword=ataxia,dystonia"),
                          {"chr1-100-110-AT", "chr2-200-209-AAG"})
 
+    def test_underscore_and_percent_match_literally(self):
+        # %25 is a URL-encoded "%". Read as ILIKE wildcards, "seiz_res" would match "seizures"
+        # and "%" every phenotype.
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=seiz_res"), set())
+        self.assertEqual(self.get_locus_ids("phenotype_keyword=%25"), set())
+
 
 def _build_db_with_swim_plot_phenotypes(path):
     """Loci plus the swim_plot rows the phenotypes really come from.
@@ -883,10 +943,11 @@ def _build_db_with_swim_plot_phenotypes(path):
                                allele_size=6, sample_id="sampleD", affected_status="Affected",
                                phenotype_description="neuropathy", LocusId="chr1-100-110-AT",
                                Motif="AT", CanonicalMotif="AT", MotifSize=2),
-            # An unaffected outlier, which the summary columns never carry.
+            # An unaffected outlier, which the summary columns never carry. Its phenotype holds the
+            # ILIKE wildcard characters "_" and "%".
             make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=5, motif_category="2bp",
                                allele_size=5, sample_id="sampleE", affected_status="Unaffected",
-                               phenotype_description="headache", LocusId="chr1-100-110-AT",
+                               phenotype_description="headache_50%", LocusId="chr1-100-110-AT",
                                Motif="AT", CanonicalMotif="AT", MotifSize=2),
             make_swim_plot_row(outlier_type="AllAlleles", outlier_rank=1, motif_category="3bp",
                                allele_size=4, sample_id="sampleF", affected_status="Affected",
@@ -949,6 +1010,14 @@ class PhenotypeKeywordAgreesWithTheSwimPlotTests(ServerTestCase):
     def test_an_unmatched_keyword_returns_nothing(self):
         self.assertEqual(self.get_locus_ids("phenotype_keyword=no_such_phenotype"), set())
 
+    def test_underscore_and_percent_match_literally_in_both_views(self):
+        # %25 is a URL-encoded "%". Read as ILIKE wildcards, "seiz_res" would match "seizures",
+        # "headache%50" would match "headache_50%", and "%" chr2's "myopathy" too.
+        for keyword, expected_locus_ids in (("headache_50%25", {"chr1-100-110-AT"}), ("seiz_res", set()),
+                                            ("headache%2550", set()), ("%25", {"chr1-100-110-AT"})):
+            self.assertEqual(self.get_locus_ids(f"phenotype_keyword={keyword}"), expected_locus_ids, keyword)
+            self.assertEqual(self._swim_locus_ids(keyword), expected_locus_ids, keyword)
+
 
 class CommaSeparatedParameterTests(unittest.TestCase):
     """The comma-list parsing behind the list filters, motif and motif_size."""
@@ -992,23 +1061,36 @@ class PageJsonTests(unittest.TestCase):
 
     def test_a_value_cannot_end_the_script_block_and_keys_keep_their_order(self):
         # The Mendelian warning popup lists motif_rates in their insertion order, which sorted
-        # keys would change ("25plusbp" before "2bp").
+        # keys would change ("25+bp" before "2bp").
         rendered = results_server.jinja2_env.from_string("{{ value | tojson }}").render(
-            value={"2bp": "</script><b>'&", "25plusbp": 1})
-        self.assertEqual(rendered, '{"2bp": "\\u003c/script\\u003e\\u003cb\\u003e\\u0027\\u0026", "25plusbp": 1}')
-        self.assertEqual(json.loads(rendered), {"2bp": "</script><b>'&", "25plusbp": 1})
+            value={"2bp": "</script><b>'&", "25+bp": 1})
+        self.assertEqual(rendered, '{"2bp": "\\u003c/script\\u003e\\u003cb\\u003e\\u0027\\u0026", "25+bp": 1}')
+        self.assertEqual(json.loads(rendered), {"2bp": "</script><b>'&", "25+bp": 1})
 
 
-class SplitOutlierEntriesTests(unittest.TestCase):
-    """The one OutlierSampleIds parser behind the locus-detail samples and the read-visualization thresholds."""
+class OutlierEntryParsingTests(unittest.TestCase):
+    """The locus-detail samples, the export sample lists and the read-visualization thresholds read
+    OutlierSampleIds with the build's parser, analysis_columns.parse_outlier_entries."""
 
-    OUTLIER_STRING = "6x:sA,5:sB,garbage,x:sC,7x:sD:extra,4x:sE"
+    def test_samples_come_largest_allele_first_as_the_build_ranks_them(self):
+        parsed = results_server.parse_outlier_samples("4x:sB,6x:sA,5x:sC", {})
+        self.assertEqual([(s["allele_size"], s["sample_id"]) for s in parsed],
+                         analysis_columns.parse_outlier_entries("4x:sB,6x:sA,5x:sC"))
+        self.assertEqual([(s["allele_size"], s["sample_id"]) for s in parsed], [(6, "sA"), (5, "sC"), (4, "sB")])
+        for missing in (None, "", "NA", "."):
+            self.assertEqual(results_server.parse_outlier_samples(missing, {}), [], repr(missing))
 
-    def test_entries_that_do_not_parse_are_skipped_and_the_order_is_kept(self):
-        self.assertEqual(results_server.split_outlier_entries(self.OUTLIER_STRING),
-                         [(6, "sA"), (5, "sB"), (4, "sE")])
-        self.assertEqual(results_server.split_outlier_entries(None), [])
-        self.assertEqual(results_server.split_outlier_entries(""), [])
+    def test_the_threshold_is_taken_from_the_largest_allele_whatever_the_string_order(self):
+        thresholds = results_server.compute_plot_thresholds(
+            {"LocusId": "L"}, "5x:sB,6x:sA", "", {"sA": "affected", "sB": "unaffected"}, {}, ("HPRC256",))
+        self.assertEqual(thresholds, {"LongAllele": 6})
+
+    def test_an_entry_the_build_would_reject_is_rejected(self):
+        for malformed in ("6x:sA,garbage", "6x:sA,7x:sD:extra", "x:sC"):
+            with self.assertRaises(ValueError, msg=malformed):
+                results_server.parse_outlier_samples(malformed, {})
+            with self.assertRaises(ValueError, msg=malformed):
+                results_server.compute_plot_thresholds({"LocusId": "L"}, malformed, "", {}, {}, ("HPRC256",))
 
     def test_parse_outlier_samples_describes_each_sample(self):
         parsed = results_server.parse_outlier_samples(
@@ -1061,10 +1143,9 @@ class ComputePlotThresholdsTests(unittest.TestCase):
         self.assertEqual(self._thresholds({}, "6x:sampleA,5x:sampleB", "5x:sampleC", self.AFFECTED),
                          {"LongAllele": 6, "ShortAllele": 5})
 
-    def test_no_outliers_and_entries_that_do_not_parse(self):
-        self.assertIsNone(self._thresholds({}, "", "", self.AFFECTED))
-        # Entries that do not parse are skipped rather than raising.
-        self.assertIsNone(self._thresholds({}, "garbage", "", self.AFFECTED))
+    def test_no_outliers(self):
+        for missing in ("", None, "NA"):
+            self.assertIsNone(self._thresholds({}, missing, missing, self.AFFECTED), repr(missing))
 
     def test_solved_samples_set_the_bar_and_unknown_samples_are_candidates(self):
         affected = {"SOLVED": "affected", "UNKNOWN": "unknown", "AFFECTED": "affected"}
@@ -1079,18 +1160,70 @@ class ComputePlotThresholdsTests(unittest.TestCase):
         # The build's #Aff count (find_affected_unsolved_samples_above_unaffected) and the
         # long-allele threshold have to agree on every locus: the threshold is the largest allele
         # the build counts, and there is none when the build counts no sample.
+        # Without population data, a 0-repeat allele (a full deletion) counts when no unaffected or
+        # solved sample is at least as large.
         affected = {"A1": "affected", "A2": "affected", "U1": "unaffected", "S1": "affected", "K1": "unknown"}
         analysis = {"A1": "unsolved", "A2": "partially solved", "S1": "probably solved"}
-        row_dict = {"HPRC256_99thPercentile": 8}
-        for long_outliers in ("10x:A1,9x:U1", "10x:U1,9x:A1", "10x:S1,9x:A1", "10x:K1,9x:A1", "10x:A1,10x:U1",
-                              "9x:A2,7x:A1", "8x:A1", "12x:NOT_IN_THE_TABLE,11x:S1"):
-            build_samples = analysis_columns.find_affected_unsolved_samples_above_unaffected(
-                {"OutlierSampleIds_AllAlleles": long_outliers, **row_dict}, affected, analysis,
-                {"AllAlleles": analysis_columns.parse_outlier_entries(long_outliers)},
-                self.LONG_READ_GATE)[0]
-            thresholds = self._thresholds(row_dict, long_outliers, "", affected, analysis)
-            self.assertEqual(thresholds and thresholds["LongAllele"],
-                             max(build_samples.values()) if build_samples else None, long_outliers)
+        for row_dict in ({"HPRC256_99thPercentile": 8}, {}):
+            for long_outliers in ("10x:A1,9x:U1", "10x:U1,9x:A1", "10x:S1,9x:A1", "10x:K1,9x:A1", "10x:A1,10x:U1",
+                                  "9x:A2,7x:A1", "8x:A1", "12x:NOT_IN_THE_TABLE,11x:S1",
+                                  "0x:A1", "0x:A1,0x:U1", "3x:A1,0x:U1", "0x:U1"):
+                build_samples = analysis_columns.find_affected_unsolved_samples_above_unaffected(
+                    {"OutlierSampleIds_AllAlleles": long_outliers, **row_dict}, affected, analysis,
+                    {"AllAlleles": analysis_columns.parse_outlier_entries(long_outliers)},
+                    self.LONG_READ_GATE)[0]
+                thresholds = self._thresholds(row_dict, long_outliers, "", affected, analysis)
+                self.assertEqual(thresholds["LongAllele"] if thresholds else None,
+                                 max(build_samples.values()) if build_samples else None, (row_dict, long_outliers))
+        self.assertEqual(self._thresholds({}, "0x:A1", "0x:A2", affected, analysis), {"LongAllele": 0, "ShortAllele": 0})
+
+
+class ZeroRepeatAlleleExportTests(ServerTestCase):
+    """The JSON and ExpansionHunter exports list a 0-repeat affected allele the build counts.
+
+    The locus is swim_plot_tests' zero-repeat fixture, built the way the build builds it: three
+    affected samples and no population data, so #Aff counts all three, the full deletion included.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        records = [make_locus_record_with_every_swim_plot_input(
+            Chrom="chr1", Start0Based=100, End1Based=110, OutlierSampleIds_ShortAlleles="7x:S3,5x:S2,0x:S1")]
+        sample_ids = ("S1", "S2", "S3")
+        analysis_columns.add_all_outlier_columns(
+            records, {sample_id: {"affected_status": "affected"} for sample_id in sample_ids},
+            {sample_id: "affected" for sample_id in sample_ids}, {})
+        cls.db_path = os.path.join(cls.tmpdir, "results.duckdb")
+        conn = duckdb_compat.connect(cls.db_path)
+        try:
+            result_database.write_loci_table(conn, records, analysis_columns.OUTPUT_COLUMNS)
+        finally:
+            conn.close()
+        sample_table = os.path.join(cls.tmpdir, "samples.tsv")
+        with open(sample_table, "w") as output_file:
+            output_file.write("sample_id\taffected_status\n" + "".join(f"{s}\taffected\n" for s in sample_ids))
+        cls.configure_server(cls.db_path, sample_table=sample_table)
+
+    def _exported_locus(self, export_format):
+        response = self.client.get(f"/api/v1/export?outlier_type=short&format={export_format}")
+        self.assertEqual(response.status_code, 200)
+        if export_format == "json":
+            [locus] = json.loads(gzip.decompress(response.get_data()))["loci"]
+        else:
+            [locus] = json.loads(response.get_data())
+        return locus
+
+    def test_both_exports_list_every_sample_the_build_counts(self):
+        for export_format in ("json", "expansion_hunter"):
+            locus = self._exported_locus(export_format)
+            self.assertEqual(locus["NumAffectedUnsolvedSamplesAboveUnaffected"], 3, export_format)
+            self.assertEqual([(s["Sample ID"], s["Allele"]) for s in locus["Samples"]["ShortAlleleOutliers"]],
+                             [("S3", 7), ("S2", 5), ("S1", 0)], export_format)
+
+    def test_the_short_allele_threshold_is_the_largest_counted_allele(self):
+        self.assertEqual(self._exported_locus("expansion_hunter")["PlotReadVisualization"],
+                         [{"If": "ShortAllele", "Is": ">=", "Threshold": 7}])
 
 
 def _build_db_with_unknown_category(path):
@@ -1220,18 +1353,22 @@ class PermissiveSampleTableTests(unittest.TestCase):
         self.assertEqual((described["affected_status"], described["analysis_status"]),
                          ("Possibly Affected", "Unsolved"))
 
-    def test_case_insensitive_id_and_extra_columns_preserved(self):
+    def test_case_insensitive_id_and_ancestry_preserved(self):
         path = self._write("Sample ID\tancestry\nS1\tEUR\n")
         sample_rows, _affected, _analysis = results_server.load_sample_table(path)
         self.assertIn("S1", sample_rows)
-        self.assertEqual(sample_rows["S1"]["ancestry"], "EUR")  # extra column preserved
-
-    def test_extra_columns_come_from_the_first_row_of_a_duplicated_sample(self):
-        path = self._write("sample_id\tFamilyID\tancestry\nS1\tF1\tEUR\nS1\tF9\tAFR\n")
-        sample_rows, _affected, _analysis = results_server.load_sample_table(path)
-        self.assertEqual(sample_rows["S1"]["family_id"], "F1")
         self.assertEqual(sample_rows["S1"]["ancestry"], "EUR")
-        self.assertNotIn("FamilyID", sample_rows["S1"])
+
+    def test_the_ancestry_column_is_matched_like_every_other_column(self):
+        path = self._write("sample_id\tANCESTRY\tbatch\nS1\tEUR\tB7\n")
+        sample_rows, _affected, _analysis = results_server.load_sample_table(path)
+        self.assertEqual(sample_rows["S1"], {"sample_id": "S1", "ancestry": "EUR"})
+        self.assertEqual(results_server.describe_sample("S1", sample_rows)["ancestry"], "EUR")
+
+    def test_ancestry_comes_from_the_first_row_of_a_duplicated_sample(self):
+        path = self._write("sample_id\tFamilyID\tAncestry\nS1\tF1\tEUR\nS1\tF9\tAFR\n")
+        sample_rows, _affected, _analysis = results_server.load_sample_table(path)
+        self.assertEqual(sample_rows["S1"], {"sample_id": "S1", "family_id": "F1", "ancestry": "EUR"})
 
     def test_phenotype_strips_only_leading_na_prefix(self):
         path = self._write(
@@ -1252,6 +1389,48 @@ class PermissiveSampleTableTests(unittest.TestCase):
         path = self._write("sample_id\tanalysis_status\nS1\tRNCC\nS2\ts_kgfp\nS3\tNA\n")
         _rows, _affected, analysis_lookup = results_server.load_sample_table(path)
         self.assertEqual(analysis_lookup, {"S1": "unsolved", "S2": "solved", "S3": "unknown"})
+
+
+class NoteAndTagFlagTests(MinimalDatabaseTestCase):
+    """Every view of a locus shows its user note and tags, and no other locus's."""
+
+    @staticmethod
+    def _locus_id_and_note_and_tags_flags(entry):
+        return entry["LocusId"], entry.get("has_note"), tuple(entry.get("tags", ()))
+
+    def test_every_view_shows_the_note_and_tags_of_the_annotated_locus_only(self):
+        self.assertEqual(self.client.put("/api/v1/annotations/chr2-200-209-AAG/note",
+                                         json={"note_text": "check"}).status_code, 200)
+        self.assertEqual(self.client.post("/api/v1/annotations/chr2-200-209-AAG/tags",
+                                          json={"tag": "flagged"}).status_code, 200)
+
+        annotations = self.client.get("/api/v1/annotations/chr2-200-209-AAG").get_json()
+        self.assertEqual((annotations["note"]["note_text"], annotations["tags"]), ("check", ["flagged"]))
+        self.assertEqual(self.client.get("/api/v1/loci/chr2-200-209-AAG").get_json()["user_annotations"],
+                         annotations)
+        self.assertEqual(self.client.get("/api/v1/annotations/chr1-100-110-AT").get_json(), {})
+        self.assertEqual(self.client.get("/api/v1/loci/chr1-100-110-AT").get_json()["user_annotations"], {})
+
+        expected_flags = {("chr1-100-110-AT", None, ()), ("chr2-200-209-AAG", True, ("flagged",))}
+        results = self.client.get("/api/v1/loci?outlier_type=all").get_json()["results"]
+        self.assertEqual({self._locus_id_and_note_and_tags_flags(r) for r in results}, expected_flags)
+        swim_plot_entries = self.client.get("/api/v1/swim_plot_data?outlier_type=all").get_json()["data"]
+        self.assertEqual({self._locus_id_and_note_and_tags_flags(entry) for entry in swim_plot_entries},
+                         expected_flags)
+
+
+class ApiOrderByTests(unittest.TestCase):
+    """build_api_order_by skips the sort columns a database lacks and always ends on LocusId."""
+
+    def test_the_present_sort_columns_come_before_locus_id(self):
+        source_columns = {"LocusId", "gene_region_rank", "NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles"}
+        self.assertEqual(
+            results_server.build_api_order_by({"outlier_type": "all", "sort_by": ["region"]}, source_columns),
+            " ORDER BY gene_region_rank ASC, NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles DESC, LocusId ASC")
+
+    def test_a_database_with_no_sort_column_orders_by_locus_id_alone(self):
+        self.assertEqual(results_server.build_api_order_by({"outlier_type": "all"}, {"LocusId"}),
+                         " ORDER BY LocusId ASC")
 
 
 class _QueryRecordingConnection:
@@ -1550,9 +1729,8 @@ class FamilyCountTests(ServerTestCase):
     def test_the_tsv_export_has_the_family_count_column(self):
         response = self.client.get("/api/v1/export?outlier_type=all&format=tsv&sort_by=family_count")
         self.assertEqual(response.status_code, 200)
-        lines = gzip.decompress(response.get_data()).decode().splitlines()
-        rows = [dict(zip(lines[0].split("\t"), line.split("\t"))) for line in lines[1:]]
-        self.assertEqual([(r["LocusId"], r["NumAffectedUnsolvedFamiliesAboveUnaffected"]) for r in rows],
+        self.assertEqual([(r["LocusId"], r["NumAffectedUnsolvedFamiliesAboveUnaffected"])
+                          for r in read_gzipped_tsv_rows(response)],
                          [("chr2-200-209-AAG", "2"), ("chr1-100-110-AT", "1")])
 
     def test_a_filter_on_a_column_the_database_lacks_matches_nothing_instead_of_failing(self):
@@ -1572,6 +1750,46 @@ class FamilyCountTests(ServerTestCase):
             response = self.client.get(f"/api/v1/loci?{query}")
             self.assertEqual(response.status_code, 200, (query, response.get_data(as_text=True)))
             self.assertEqual(response.get_json()["total"], expected_total, query)
+
+
+class AnnotationsDatabaseLocationTests(ServerTestCase):
+    """Each result database keeps its notes and tags next to it unless --annotations-db says otherwise."""
+
+    def setUp(self):
+        self.db_path = os.path.join(tempfile.mkdtemp(dir=self.tmpdir), "results.duckdb")
+        _build_minimal_db(self.db_path)
+        self.working_directory = tempfile.mkdtemp(dir=self.tmpdir)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.working_directory)
+
+    def _main_output(self, *arguments):
+        """Run main() on the test database without starting the server, and return what it printed."""
+        self.addCleanup(setattr, sys, "argv", sys.argv)
+        sys.argv = ["results_server.py", "--db", self.db_path, *arguments]
+        output = io.StringIO()
+        with mock.patch.object(results_server.app, "run"), contextlib.redirect_stdout(output):
+            results_server.main()
+        return output.getvalue()
+
+    def test_the_default_is_next_to_the_database(self):
+        expected_path = self.db_path + ".annotations.duckdb"
+        self.assertEqual(results_server.default_annotations_db_path(self.db_path), expected_path)
+        results_server.configure_app(self.db_path)
+        self.assertEqual(results_server.app.config["ANNOTATIONS_DB_PATH"], expected_path)
+        self.assertTrue(os.path.exists(expected_path))
+        self.assertIn(f"Loading annotations: {expected_path}", self._main_output())
+        self.assertFalse(os.path.exists(os.path.join(self.working_directory, "annotations.duckdb")))
+
+    def test_notes_left_in_the_working_directory_are_pointed_out(self):
+        old_path = os.path.join(os.path.realpath(self.working_directory), "annotations.duckdb")
+        results_server.load_annotations(old_path)  # creates an empty notes and tags database there
+        output = self._main_output()
+        self.assertIn(f"Note: {old_path} holds notes and tags", output)
+        self.assertIn(self.db_path + ".annotations.duckdb", output)
+        # Once this database has its own file, or the old one is named, there is nothing to point out
+        self.assertNotIn("Note:", self._main_output())
+        os.remove(self.db_path + ".annotations.duckdb")
+        self.assertNotIn("Note:", self._main_output("--annotations-db", old_path))
 
 
 class RequestCheckTests(MinimalDatabaseTestCase):
@@ -1739,6 +1957,9 @@ class MendelianViolationTests(ServerTestCase):
         self.assertEqual(set(warnings), {"ABC_1"})
         self.assertEqual(warnings["ABC_1"]["autosome_rate"], 0.2)
         self.assertEqual(warnings["ABC_1"]["motif_rates"]["1bp"], {"rate": 0.01, "violations": 1, "total": 100})
+        # Keyed by the labels the warning popup shows, in display order
+        self.assertEqual(list(warnings["ABC_1"]["motif_rates"]),
+                         ["1bp", "2bp", "3bp", "4bp", "5bp", "6bp", "7-24bp", "25+bp"])
 
     def test_the_qc2_page_reads_missing_counts_as_zero(self):
         data = self.client.get("/api/v1/qc2_data").get_json()
@@ -1816,9 +2037,7 @@ class MinExpansionTests(ServerTestCase):
             self.assertEqual(self.get_locus_ids(f"{unaffected_filter}=second&min_expansion=1"), {"A"})
 
     def test_a_missing_unaffected_column_matches_nothing(self):
-        saved = results_server.app.config["DB_COLUMNS_SET"]
-        self.addCleanup(results_server.app.config.__setitem__, "DB_COLUMNS_SET", saved)
-        results_server.app.config["DB_COLUMNS_SET"] = saved - {"FirstUnaffectedAlleleSize_AllAlleles"}
+        self.leave_columns_out_of_the_database_for_one_test("FirstUnaffectedAlleleSize_AllAlleles")
         self.assertEqual(self.get_locus_ids("require_families_above_unaffected=second"), set())
 
 
@@ -1873,6 +2092,10 @@ class SwimPlotFilterTests(MinimalDatabaseTestCase):
         for value in ("1", "true"):
             self.assertEqual(self.get_swim_plot_rows(f"require_affected_above_unaffected={value}"),
                              {("chr1-100-110-AT", "sampleA"), ("chr2-200-209-AAG", "sampleC")})
+
+    def test_the_schema_advertises_the_swim_plot_parameter(self):
+        swim_plot_parameters = self.client.get("/api/v1/schema").get_json()["swim_plot_parameters"]
+        self.assertEqual(swim_plot_parameters["require_affected_above_unaffected"]["type"], "boolean")
 
     def test_require_affected_above_unaffected_follows_the_builds_rule(self):
         # The build counts a solved affected sample with the unaffected ones, and a sample of
@@ -2064,7 +2287,7 @@ class LargeExpansionHunterExportTests(ServerTestCase):
 
 
 class KnownDiseaseMatchTests(ServerTestCase):
-    """The locus-detail page and the pathogenic-threshold filter take the same match and minimum."""
+    """The locus-detail page and the startup known-locus set and thresholds take the same match and minimum."""
 
     @classmethod
     def setUpClass(cls):
@@ -2076,6 +2299,9 @@ class KnownDiseaseMatchTests(ServerTestCase):
                  "Diseases": [{"Name": "D1", "PathogenicMin": 0}, {"Name": "D2", "PathogenicMin": 40}]},
                 {"LocusId": "NO_MIN", "MainReferenceRegion": "chr3:300-310", "RepeatUnit": "CAG",
                  "Diseases": [{"Name": "D3"}]},
+                {"LocusId": "NO_NAMED_DISEASE", "MainReferenceRegion": "chr4:400-410", "RepeatUnit": "CAG",
+                 "Diseases": [{"Symbol": "X", "PathogenicMin": 30}]},
+                {"LocusId": "NO_DISEASES", "MainReferenceRegion": "chr5:500-510", "RepeatUnit": "CAG"},
             ], output_file)
         strchive_path = os.path.join(cls.tmpdir, "STRchive-loci.json")
         with open(strchive_path, "w") as output_file:
@@ -2088,31 +2314,53 @@ class KnownDiseaseMatchTests(ServerTestCase):
         return results_server.compute_known_disease_info(
             {"LocusId": "query", "Chrom": chrom, "Start0Based": start, "End1Based": end, "Motif": motif}, lookups)
 
-    def _pathogenic_min(self, chrom, start, end, motif):
-        return results_server.known_disease_pathogenic_min(chrom, start, end, motif, self.disease_trees,
-                                                           self.strchive_trees)
+    def _startup_match(self, chrom, start, end, motif):
+        """Return the startup match of a one-locus database's locus: its disease locus id and threshold."""
+        conn = duckdb_compat.connect(":memory:")
+        try:
+            conn.execute("CREATE TABLE loci (LocusId TEXT, Chrom TEXT, Start0Based BIGINT, End1Based BIGINT, Motif TEXT)")
+            conn.execute("INSERT INTO loci VALUES ('query', ?, ?, ?, ?)", (chrom, start, end, motif))
+            disease_locus_id_by_locus_id, pathogenic_min_by_locus_id = (
+                results_server.find_loci_matching_the_disease_catalogs(
+                    conn, {"disease_trees": self.disease_trees, "strchive_trees": self.strchive_trees}))
+        finally:
+            conn.close()
+        return disease_locus_id_by_locus_id.get("query"), pathogenic_min_by_locus_id.get("query")
 
     def test_a_pathogenic_minimum_of_zero_is_kept_by_both(self):
         self.assertEqual(self._detail("chr1", 100, 110, "TA")["pathogenic_min"], 0)
-        self.assertEqual(self._pathogenic_min("chr1", 100, 110, "TA"), 0)
+        self.assertEqual(self._startup_match("chr1", 100, 110, "TA"), ("ZERO_MIN", 0))
 
     def test_a_catalog_match_without_a_minimum_hides_the_strchive_fallback_from_both(self):
         # STRchive's TEST_REFERENCE has a minimum of 50 at the same locus, but the catalog matched.
         detail = self._detail("chr3", 300, 310, "CAG")
         self.assertEqual((detail["locus_id"], detail["source"], detail["pathogenic_min"]),
                          ("NO_MIN", "variant_catalog", None))
-        self.assertIsNone(self._pathogenic_min("chr3", 300, 310, "CAG"))
+        self.assertEqual(self._startup_match("chr3", 300, 310, "CAG"), ("NO_MIN", None))
 
     def test_a_strchive_only_locus_matches_through_its_pathogenic_motif(self):
         detail = self._detail("chr9", 100, 110, "AAGGG")
         self.assertEqual((detail["locus_id"], detail["source"], detail["pathogenic_min"]),
                          ("TEST_PATHOGENIC", "STRchive", 60))
-        self.assertEqual(self._pathogenic_min("chr9", 100, 110, "AAGGG"), 60)
+        self.assertEqual(self._startup_match("chr9", 100, 110, "AAGGG"), ("TEST_PATHOGENIC", 60))
+
+    def test_a_chromosome_without_the_chr_prefix_matches_for_both(self):
+        self.assertEqual(self._detail("9", 100, 110, "AAGGG")["locus_id"], "TEST_PATHOGENIC")
+        self.assertEqual(self._startup_match("9", 100, 110, "AAGGG"), ("TEST_PATHOGENIC", 60))
 
     def test_too_little_overlap_matches_nothing(self):
         # [100, 110) against [100, 125) has a Jaccard index of 0.4
         self.assertIsNone(self._detail("chr1", 100, 125, "AT"))
-        self.assertIsNone(self._pathogenic_min("chr1", 100, 125, "AT"))
+        self.assertEqual(self._startup_match("chr1", 100, 125, "AT"), (None, None))
+
+    def test_an_overlapping_locus_with_another_motif_matches_nothing(self):
+        self.assertIsNone(self._detail("chr1", 100, 110, "CAG"))
+        self.assertEqual(self._startup_match("chr1", 100, 110, "CAG"), (None, None))
+
+    def test_a_locus_that_only_touches_a_catalog_interval_matches_nothing(self):
+        # Half-open intervals: [110, 120) shares no base with ZERO_MIN's [100, 110)
+        self.assertIsNone(self._detail("chr1", 110, 120, "AT"))
+        self.assertEqual(self._startup_match("chr1", 110, 120, "AT"), (None, None))
 
     def test_a_null_pathogenic_motifs_list_still_matches_by_repeat_unit(self):
         tree = intervaltree.IntervalTree()
@@ -2135,6 +2383,13 @@ class KnownDiseaseMatchTests(ServerTestCase):
                                                                  self.strchive_trees), "TEST_PATHOGENIC")
         self.assertEqual(locus_annotations.matches_disease_locus("chr3-300-310-CAG", self.disease_trees,
                                                                  self.strchive_trees), "NO_MIN")
+
+    def test_a_catalog_locus_without_a_named_disease_matches_nothing(self):
+        # load_known_disease_loci leaves these out of the trees, so compute_known_disease_info
+        # only ever sees catalog loci with a Diseases list
+        for chrom, start, end in (("chr4", 400, 410), ("chr5", 500, 510)):
+            self.assertIsNone(self._detail(chrom, start, end, "CAG"), chrom)
+            self.assertEqual(self._startup_match(chrom, start, end, "CAG"), (None, None), chrom)
 
 
 if __name__ == "__main__":

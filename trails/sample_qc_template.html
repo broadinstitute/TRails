@@ -91,14 +91,7 @@ function createChartsForSection(containerId, data) {
     const bins = MOTIF_BINS.slice();
     if (data.some(item => item.bin === UNKNOWN_MOTIF_BIN)) bins.push(UNKNOWN_MOTIF_BIN);
 
-    // Group data by bin
-    const binData = {};
-    bins.forEach(bin => { binData[bin] = []; });
-    data.forEach(item => {
-        if (binData[item.bin] !== undefined) {
-            binData[item.bin].push({ sample_id: item.sample_id, count: item.count });
-        }
-    });
+    const binData = groupRowsByBin(data, bins);
 
     // Create a chart for each bin, with a table of its top 20 samples
     bins.forEach((bin, idx) => {
@@ -116,33 +109,9 @@ function createChartsForSection(containerId, data) {
 }
 
 // Fetch data and render charts
-async function loadSampleQCData() {
-    try {
-        const response = await fetch(`${API_BASE_URL}/sample_qc_data`);
-        if (!response.ok) throw await errorFromResponse(response);
-        const data = await response.json();
-
-        // Hide loading, show sections
-        document.getElementById('qc-loading').style.display = 'none';
-        document.getElementById('section-rank1').style.display = 'block';
-        document.getElementById('section-top10').style.display = 'block';
-
-        // Create charts
-        createChartsForSection('rank1-charts-row', data.rank1 || []);
-        createChartsForSection('top10-charts-row', data.top10 || []);
-
-    } catch (err) {
-        console.error('Sample QC load error:', err);
-        document.getElementById('qc-loading').style.display = 'none';
-        document.getElementById('qc-error').style.display = 'block';
-        document.getElementById('qc-error').textContent = 'Failed to load sample QC data: ' + err.message;
-    }
-}
-
-
-// Initialize on page load
-document.addEventListener('DOMContentLoaded', function() {
-    loadSampleQCData();
+drawQCPageOnLoad('sample_qc_data', 'sample QC data', ['section-rank1', 'section-top10'], data => {
+    createChartsForSection('rank1-charts-row', data.rank1 || []);
+    createChartsForSection('top10-charts-row', data.top10 || []);
 });
 </script>
 

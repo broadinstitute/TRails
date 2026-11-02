@@ -7,8 +7,6 @@ PyhpoUnknownTermTests builds and uses the real pyhpo ontology, and is skipped wh
 pyhpo is not installed.
 """
 
-import os
-import tempfile
 import unittest
 
 import analysis_columns
@@ -16,6 +14,7 @@ import input_tables
 import phenotype_scoring
 from phenotype_scoring import (
     OUTLIER_TYPE_INHERITANCE,
+    allowed_inheritance_for_locus,
     compute_combined_ic,
     compute_pairwise_shared_counts,
     compute_phenotype_scores,
@@ -24,6 +23,7 @@ from phenotype_scoring import (
     resolvable_hpo_terms,
     score_patient_vs_gene_filtered,
 )
+from tests.temp_file_helpers import write_temporary_file
 
 
 def pyhpo_is_installed():
@@ -138,9 +138,19 @@ class ScorePatientVsGeneTests(ForceJaccardTestCase):
         self.assertIsNone(result["best_disease"])
 
     def test_outlier_type_inheritance_map(self):
-        self.assertEqual(OUTLIER_TYPE_INHERITANCE["AllAlleles"], {"AD", "XD"})
+        self.assertEqual(OUTLIER_TYPE_INHERITANCE["AllAlleles"], {"AD", "XD", "MT", "YL"})
         self.assertEqual(OUTLIER_TYPE_INHERITANCE["ShortAlleles"], {"AR"})
-        self.assertEqual(OUTLIER_TYPE_INHERITANCE["HemizygousAlleles"], {"XR", "XL", "XD"})
+        self.assertEqual(OUTLIER_TYPE_INHERITANCE["HemizygousAlleles"], {"XR", "XL", "XD", "MT", "YL"})
+
+    def test_mitochondrial_and_y_linked_codes_are_allowed_only_on_their_chromosome(self):
+        self.assertEqual(allowed_inheritance_for_locus("AllAlleles", "chr1"), {"AD", "XD"})
+        self.assertEqual(allowed_inheritance_for_locus("AllAlleles", None), {"AD", "XD"})
+        self.assertEqual(allowed_inheritance_for_locus("AllAlleles", "chrY"), {"AD", "XD", "YL"})
+        self.assertEqual(allowed_inheritance_for_locus("HemizygousAlleles", "chrM"),
+                         {"XR", "XL", "XD", "MT"})
+        self.assertEqual(allowed_inheritance_for_locus("HemizygousAlleles", "chrMT"),
+                         {"XR", "XL", "XD", "MT"})
+        self.assertEqual(allowed_inheritance_for_locus("ShortAlleles", "chrY"), {"AR"})
 
 
 class GetQualifyingSamplesTests(ForceJaccardTestCase):
@@ -244,20 +254,12 @@ class GetQualifyingSamplesTests(ForceJaccardTestCase):
 
 class ComputePhenotypeScoresTests(ForceJaccardTestCase):
     def _records(self):
-        # One locus in GENEX with three qualifying AllAlleles outliers.
+        # One locus in GENEX with three qualifying AllAlleles outliers. The scorer reads only
+        # these keys: it derives the qualifying samples from the outlier strings itself.
         # HPO overlaps (Jaccard): s1{A,B} vs s2{A,B} -> 1.0 ; s2{A,B} vs s3{C} -> 0.0
         return [{
             "LocusId": "chr1-100-110-AC",
             "gene_id": "ENSG_X",
-            "IsKnownMotif": 1,
-            "gene_region": "CDS",
-            "gene_region_rank": 1,
-            "MotifSize": 2,
-            "NumRepeatsInReference": 5,
-            "FirstAffectedAlleleSize_AllAlleles": 50,
-            "FirstUnaffectedAlleleSize_AllAlleles": None,
-            "NumAffectedUnsolvedSamplesAboveUnaffected_AllAlleles": 3,
-            "NumAffectedUnsolvedFamiliesAboveUnaffected_AllAlleles": 2,
             "OutlierSampleIds_AllAlleles": "50x:s1,45x:s2,40x:s3",
             "OutlierSampleIds_ShortAlleles": "",
             "OutlierSampleIds_HemizygousAlleles": "",
@@ -355,14 +357,13 @@ class ComputePhenotypeScoresTests(ForceJaccardTestCase):
     def test_mixed_case_gene_symbol_is_matched_case_insensitively(self):
         # HPO's genes_to_phenotype.txt writes the HGNC symbol "C9orf72", while genelookup's gene
         # table upper-cases it to "C9ORF72"; the ALS/FTD repeat locus must still be scored.
-        handle = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
-        handle.write("ncbi_gene_id\tgene_symbol\thpo_id\thpo_name\tfrequency\tdisease_id\n"
-                     "203228\tC9orf72\tHP:0000006\tAutosomal dominant inheritance\t-\tOMIM:105550\n"
-                     "203228\tC9orf72\tHP:A\tphenotype A\t-\tOMIM:105550\n"
-                     "203228\tC9orf72\tHP:B\tphenotype B\t-\tOMIM:105550\n")
-        handle.close()
-        self.addCleanup(os.remove, handle.name)
-        gene_disease_data = input_tables.read_gene_disease_phenotypes(handle.name)
+        gene_disease_data = input_tables.read_gene_disease_phenotypes(write_temporary_file(
+            self,
+            "ncbi_gene_id\tgene_symbol\thpo_id\thpo_name\tfrequency\tdisease_id\n"
+            "203228\tC9orf72\tHP:0000006\tAutosomal dominant inheritance\t-\tOMIM:105550\n"
+            "203228\tC9orf72\tHP:A\tphenotype A\t-\tOMIM:105550\n"
+            "203228\tC9orf72\tHP:B\tphenotype B\t-\tOMIM:105550\n",
+            suffix=".txt"))
         affected, analysis = self._lookups()
         participant_to_hpo = {"s1": {"HP:A", "HP:B"}, "s2": {"HP:A", "HP:B"}, "s3": {"HP:C"}}
 
@@ -378,6 +379,37 @@ class ComputePhenotypeScoresTests(ForceJaccardTestCase):
             # The rows keep the gene table's spelling of the symbol.
             self.assertEqual(all_alleles_rows[0]["gene_symbol"], gene_table_symbol)
             self.assertEqual(records[0]["MaxGenePhenoSim_AllAlleles"], 1.0)
+
+    def test_mitochondrial_and_y_linked_diseases_count_only_on_their_chromosome(self):
+        # KDM5D's only HPO disease is Y-linked (OMIM:415000) and MT-ND5's is mitochondrial
+        # (OMIM:540000). A single-allele chrY or chrM call is an outlier in all three types, and
+        # the disease counts for AllAlleles and HemizygousAlleles, as an X-linked dominant one
+        # does. HPO also tags SURF1's autosomal recessive Leigh syndrome (OMIM:220110) as
+        # mitochondrial; on that chr9 gene only the AR code counts.
+        gene_disease_data = {
+            "KDM5D": {"OMIM:415000": {"phenotypes": {"HP:A", "HP:B"}, "inheritance": {"YL"}}},
+            "MT-ND5": {"OMIM:540000": {"phenotypes": {"HP:A", "HP:B"}, "inheritance": {"MT"}}},
+            "SURF1": {"OMIM:220110": {"phenotypes": {"HP:A", "HP:B"}, "inheritance": {"AR", "MT"}}},
+        }
+        gene_lookup = {gene_symbol: {"gene_symbol": gene_symbol} for gene_symbol in gene_disease_data}
+        records = [{"LocusId": f"{chrom}-100-110-AC", "Chrom": chrom, "gene_id": gene_symbol,
+                    **{f"OutlierSampleIds_{outlier_type}": "50x:s1"
+                       for outlier_type in analysis_columns.OUTLIER_TYPES}}
+                   for chrom, gene_symbol in [("chrY", "KDM5D"), ("chrM", "MT-ND5"), ("chr9", "SURF1")]]
+
+        per_outlier, _ = compute_phenotype_scores(
+            records, {"s1": {"HP:A", "HP:B"}}, gene_lookup, gene_disease_data,
+            {"s1": "affected"}, {"s1": "unsolved"})
+
+        self.assertEqual(
+            {(row["gene_symbol"], row["outlier_type"]): row["best_disease_inheritance"]
+             for row in per_outlier},
+            {("KDM5D", "AllAlleles"): "YL", ("KDM5D", "ShortAlleles"): None,
+             ("KDM5D", "HemizygousAlleles"): "YL",
+             ("MT-ND5", "AllAlleles"): "MT", ("MT-ND5", "ShortAlleles"): None,
+             ("MT-ND5", "HemizygousAlleles"): "MT",
+             ("SURF1", "AllAlleles"): None, ("SURF1", "ShortAlleles"): "AR,MT",
+             ("SURF1", "HemizygousAlleles"): None})
 
 
 @unittest.skipUnless(pyhpo_is_installed(), "pyhpo is not installed")

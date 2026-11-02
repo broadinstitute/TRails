@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import analysis_columns
 import build_database
@@ -191,6 +192,22 @@ class BuildDatabaseEndToEndTests(unittest.TestCase):
                 connection.execute("SELECT COUNT(*) FROM loci").fetchone()[0], 4)
         finally:
             connection.close()
+
+    def test_a_database_in_a_directory_that_does_not_exist_yet_is_built(self):
+        db_path = os.path.join(self.directory, "results", "nested", "cohort.duckdb")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build_database.build(self.matrix_path, self.metadata_path, db_path)
+        self.assertTrue(os.path.exists(db_path))
+
+    def test_a_failed_build_leaves_no_temporary_database(self):
+        # A build that fails after the temporary database is opened must not leave it on disk.
+        with mock.patch.object(result_database, "write_swim_plot", side_effect=RuntimeError("disk full")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                build_database.build(self.matrix_path, self.metadata_path, self.db_path)
+        self.assertFalse(os.path.exists(self.db_path + ".tmp"))
+        self.assertFalse(os.path.exists(self.db_path + ".tmp.wal"))
+        self.assertFalse(os.path.exists(self.db_path))
 
     def test_a_build_without_trexplorer_annotations_warns_that_the_population_gate_is_off(self):
         # Without TRExplorer's 99th percentiles (and none in the matrix), no locus is gated, so

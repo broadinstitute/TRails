@@ -6,14 +6,13 @@ table is written by hand here, with the rows the build derives from the loci tab
 (see LOCI), so these tests cover only how the server reads it.
 """
 
-import gzip
 import os
 import unittest
 
 import duckdb_compat
 import results_server
 from result_database import AFFECTED_UNSOLVED_OUTLIERS_TABLE, write_population_gate_cohorts
-from tests.server_test_fixtures import ServerTestCase
+from tests.server_test_fixtures import ServerTestCase, read_gzipped_tsv_rows
 
 # sample_id -> (family_id, affected status, analysis status, phenotype). S4 is solved and S5
 # unaffected, so neither is ever counted; S6's analysis status is blank, which still counts as
@@ -122,9 +121,7 @@ class GroupedViewTestCase(ServerTestCase):
     def _export(self, **params):
         response = self.client.get("/api/v1/outlier_samples/export", query_string=dict({"outlier_type": "all"}, **params))
         self.assertEqual(response.status_code, 200)
-        lines = gzip.decompress(response.data).decode().splitlines()
-        header = lines[0].split("\t")
-        return response, [dict(zip(header, line.split("\t"))) for line in lines[1:]]
+        return response, read_gzipped_tsv_rows(response)
 
     def _groups(self, **params):
         response = self.client.get("/api/v1/outlier_samples", query_string=dict({"outlier_type": "all"}, **params))
@@ -205,6 +202,9 @@ class GroupedViewTests(GroupedViewTestCase):
         self.assertEqual(samples(sample_id_keyword="s3"), ["S3"])
         self.assertEqual(samples(sample_id_like="S"), ["S1", "S2", "S3", "S6"])
         self.assertEqual(samples(phenotype_keyword="nothing like this"), [])
+        # "_" and "%" match literally, as in the results table's and the swim plot's phenotype_keyword
+        self.assertEqual(samples(phenotype_keyword="atax_a"), [])
+        self.assertEqual(samples(phenotype_keyword="%"), [])
         # In the family view they pick the families with a sample that passes, with all their loci
         rows = {r["group_id"]: r["num_loci"] for r in self._groups(group_by="family", sample_id_keyword="S2")["results"]}
         self.assertEqual(rows, {"F1": 3})

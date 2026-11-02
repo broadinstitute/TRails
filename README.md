@@ -40,7 +40,9 @@ databases, input tables, `reference_data/` cache and `.venv/` stay in place. Opt
 environment variables: `TRAILS_INSTALL_DIR` (install location; default `./TRails`),
 `TRAILS_FORCE=1` (force re-download).
 
-From an existing checkout, `./install.sh` does the same minus the self-download. You can also
+From an existing checkout, `./install.sh` does the same minus the self-download, installing into
+the checkout itself, so it stops with an error if you set `TRAILS_INSTALL_DIR` or pass `--dir`
+there (use the `curl` line above to install somewhere else). You can also
 skip `install.sh` entirely: `trails.py` creates the virtual environment, installs the
 dependencies and downloads the reference data on first run. On Debian or Ubuntu, creating the
 virtual environment needs the `python3-venv` package.
@@ -95,8 +97,10 @@ database tables are documented in [docs/INPUT_FORMATS.md](docs/INPUT_FORMATS.md)
 
 Tab-separated (optionally gzipped). **One row per locus**, the first two columns identify the
 locus and the remaining columns are **one per sample**. Each cell holds that sample's
-per-allele repeat copy numbers, comma-separated (two values for a diploid call, one for a
-hemizygous/haploid call); leave a cell blank or `.` for a no-call.
+per-allele repeat copy numbers as **whole numbers**, comma-separated (two values for a diploid
+call, one for a hemizygous/haploid call); leave a cell blank or `.` for a no-call. Any other cell,
+including a fractional copy number such as `12.5,40`, is silently read as a no-call, so round
+fractional values first.
 
 ```
 trid                            motif   SAMPLE_A   SAMPLE_B   SAMPLE_C
@@ -108,7 +112,7 @@ chrX-148500631-148500691-GCC    GCC     21         20,21      45
 |--------|-----------|-------|
 | `trid` | **required** | locus id, `chrom-start-end-motif` (the TRGT repeat id) |
 | `motif` | **required** | repeat unit, e.g. `AAAAT` |
-| one column per sample | **≥1 required** | header = `sample_id` (must match the sample-metadata TSV); cell = comma-separated per-allele copy numbers |
+| one column per sample | **≥1 required** | header = `sample_id` (must match the sample-metadata TSV); cell = one or two comma-separated whole-number copy numbers |
 
 > This is a per-allele genotype matrix from any TR genotyping tool. `trails.py` reads it
 > directly into the local database — no intermediate files are written (see
@@ -139,7 +143,7 @@ PMGRC-1-2-1    Unaffected        Unaffected        FAM1                         
 | `sample_id` | **required** | joins to the sample columns of the repeat-copy-numbers TSV; may not contain `:` or `,`, which are the delimiters of the packed outlier-sample strings (either character aborts the build) |
 | `affected_status` | optional | affected-vs-unaffected outlier comparison + affected-unsolved prioritization. Values: `Affected`, `Possibly Affected` (treated as `Affected`), `Unaffected`, `Unknown`. A sample counts as affected and unsolved unless its `affected_status` is `Unaffected` or its `analysis_status` is `Solved`, `Probably Solved` or `Unaffected`, so a blank, absent or `Unknown` value counts as affected |
 | `analysis_status` | optional | solved/unsolved filtering + counts. Values: `Solved`, `Unsolved`, `Unknown`, `Unaffected`, `Probably Solved`, `Partially Solved`, and the codes `rncc` and `rcpc` (read as `Unsolved`) and `s_kgfp` (read as `Solved`). A blank, absent or `Unknown` value counts as unsolved |
-| `family_id` | optional | distinct-family outlier counts; pairs with the parent ids for trio QC |
+| `family_id` | optional | distinct-family outlier counts |
 | `maternal_id`, `paternal_id` | optional | Mendelian-violation QC (needs trios) |
 | `sex` | optional | displayed only: shown in the sample tables (the swim plot shows it for chrX/chrY loci). Nothing filters or computes on it. Values: `Male`, `Female`, `Unknown` |
 | `phenotype_description` | optional | free-text shown in the UI |

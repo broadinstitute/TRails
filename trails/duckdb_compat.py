@@ -3,9 +3,9 @@
 
 TRails is a local app: a user installs it, builds a results database from their own TSVs,
 and browses it in the results server. That database is DuckDB, and this module is the only
-place in TRails that imports ``duckdb``. Everything else (``build_database``,
-``result_database``, ``results_server`` and the tests) calls the sqlite3-style surface this
-module presents on top of DuckDB, so three things stay in one place:
+place in TRails that imports ``duckdb``. Everything else (``result_database``,
+``trexplorer_annotations``, ``results_server`` and the tests) calls the sqlite3-style surface
+this module presents on top of DuckDB, so three things stay in one place:
 
   1. Row objects addressable by both column name and position, the way ``sqlite3.Row`` is.
      DuckDB returns plain tuples, and the query code reads columns by name.
@@ -63,7 +63,10 @@ CONNECTION_CONFIG = {"default_null_order": "nulls_first_on_asc_last_on_desc"}
 
 # Cells (rows x columns) per bulk INSERT in insert_rows, and the name the chunk is
 # registered under while that statement runs. The budget is in cells rather than rows
-# because what a chunk costs is cells: loci is ~180 columns wide and swim_plot is ~26.
+# because what a chunk costs is cells: loci has 136 columns (analysis_columns.OUTPUT_COLUMNS,
+# plus any extra annotation columns the matrix supplies) and swim_plot 32
+# (swim_plot.SWIM_PLOT_COLUMNS), so a loci chunk holds about 14,700 rows and a swim_plot chunk
+# about 62,500.
 _INSERT_CHUNK_CELLS = 2_000_000
 _INSERT_VIEW_NAME = "_trails_insert_rows"
 

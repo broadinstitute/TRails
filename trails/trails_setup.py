@@ -178,6 +178,29 @@ def _read_cache_manifest(dest_dir):
         return {}
 
 
+def _describe_where_reference_file_comes_from(source, fetch):
+    """Return what --remote prints for one reference file: its URL, or how trails_setup makes it.
+
+    Two files are not plain downloads, so their manifest source is not something to fetch into
+    the named file: TRExplorer's database is built from its catalog table, and the gene table is
+    exported through genelookup's query service.
+
+    Args:
+        source: The file's REFERENCE_FILES source.
+        fetch: The function that fetches source into the file.
+
+    Returns:
+        A one-line description.
+    """
+    if fetch is _download_trexplorer_annotations:
+        return (f"built by trails_setup.py from the catalog table {urllib.parse.urldefrag(source).url} "
+                f"(about 900 MB; the table itself is not the database)")
+    if fetch is _export_genelookup_gene_table:
+        return (f"exported through genelookup's query service ({GENELOOKUP_QUERY_URL}); "
+                f"run trails_setup.py online to create it")
+    return source
+
+
 def fetch_reference_data(dest_dir=DEFAULT_REFERENCE_DIR, remote=False, force=False):
     """Ensure every class-A reference file is present in dest_dir; return {name: path}.
 
@@ -187,7 +210,8 @@ def fetch_reference_data(dest_dir=DEFAULT_REFERENCE_DIR, remote=False, force=Fal
 
     Args:
         dest_dir: directory the reference files are cached in (created if missing).
-        remote: if True, don't download — just print the URLs (offline / remote mode).
+        remote: if True, don't download; just print where each file comes from (offline /
+            remote mode): its URL, or how trails_setup.py makes it.
         force: re-download even when a file is already present.
     """
     os.makedirs(dest_dir, exist_ok=True)
@@ -196,7 +220,7 @@ def fetch_reference_data(dest_dir=DEFAULT_REFERENCE_DIR, remote=False, force=Fal
     for name, source, fetch, trails_option in REFERENCE_FILES:
         dest = os.path.join(dest_dir, name)
         if remote:
-            print(f"  [remote] {name} -> {source}")
+            print(f"  [remote] {name} -> {_describe_where_reference_file_comes_from(source, fetch)}")
             paths[name] = dest
         elif (not force and os.path.exists(dest) and os.path.getsize(dest) > 0
                 and cached_urls.get(name, source) == source):
@@ -247,7 +271,7 @@ def main():
     parser.add_argument("--dir", default=DEFAULT_REFERENCE_DIR,
                         help="reference-data directory (default: reference_data/ in the TRails directory)")
     parser.add_argument("--remote", action="store_true",
-                        help="don't download — print the reference URLs instead (offline mode)")
+                        help="don't download; print where each reference file comes from instead (offline mode)")
     parser.add_argument("--force", action="store_true", help="re-download even if present")
     args = parser.parse_args()
     print(f"TRails reference-data setup -> {args.dir}")

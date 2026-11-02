@@ -20,6 +20,7 @@ from analysis_columns import (
     list_affected_unsolved_outliers,
     normalize_affected_status_for_logic,
     parse_outlier_entries,
+    parse_outlier_entries_by_type,
     parse_population_gate_cohorts,
     title_case_status_for_display,
 )
@@ -271,14 +272,11 @@ class CollectSamplesTests(unittest.TestCase):
 
 class NumAffectedUnsolvedSamplesTests(unittest.TestCase):
 
-    def _parsed(self, row):
-        return {ot: parse_outlier_entries(row.get(f"OutlierSampleIds_{ot}")) for ot in OUTLIER_TYPES}
-
     def _counts(self, row, affected_lookup, analysis_lookup, sample_lookup=None,
                 population_gate_cohorts=analysis_columns.POPULATION_P99_GATE_COHORTS):
         """Returns (sample counts, family counts) the way add_all_outlier_columns computes them."""
         samples = find_affected_unsolved_samples_above_unaffected(
-            row, affected_lookup, analysis_lookup, self._parsed(row), population_gate_cohorts)
+            row, affected_lookup, analysis_lookup, parse_outlier_entries_by_type(row), population_gate_cohorts)
         return count_affected_unsolved_samples_and_families(samples, sample_lookup or {})
 
     def test_stop_at_first_unaffected(self):
@@ -306,7 +304,7 @@ class NumAffectedUnsolvedSamplesTests(unittest.TestCase):
             [(50, "a1"), (40, "a2"), (40, "a1"), (40, "u1")])}
         affected_lookup = {"a1": "affected", "a2": "affected", "u1": "unaffected"}
         samples = find_affected_unsolved_samples_above_unaffected(
-            row, affected_lookup, {}, self._parsed(row))
+            row, affected_lookup, {}, parse_outlier_entries_by_type(row))
         self.assertEqual(samples[0], {"a1": 50})
 
     def test_stop_at_or_below_p99(self):
@@ -347,7 +345,7 @@ class NumAffectedUnsolvedSamplesTests(unittest.TestCase):
         affected_lookup = {"a1": "affected"}
         analysis_lookup = {"a1": "unsolved"}
         samples = find_affected_unsolved_samples_above_unaffected(
-            row, affected_lookup, analysis_lookup, self._parsed(row))
+            row, affected_lookup, analysis_lookup, parse_outlier_entries_by_type(row))
         self.assertEqual(samples[0], {"a1": 50})
         self.assertEqual(self._counts(row, affected_lookup, analysis_lookup)[0][0], 1)
 
@@ -359,7 +357,7 @@ class NumAffectedUnsolvedSamplesTests(unittest.TestCase):
             [(40, "z")] + [(30, sample_id) for sample_id in sample_ids])}
         affected_lookup = {sample_id: "affected" for sample_id in sample_ids + ["z"]}
         samples = find_affected_unsolved_samples_above_unaffected(
-            row, affected_lookup, {}, self._parsed(row))
+            row, affected_lookup, {}, parse_outlier_entries_by_type(row))
         self.assertEqual(list(samples[0]), ["z"] + sample_ids)
 
     def test_families_dedup_by_family(self):
@@ -405,9 +403,8 @@ class ListAffectedUnsolvedOutliersTests(unittest.TestCase):
         affected_lookup = {"a1": "affected", "a2": "affected", "a3": "affected", "u1": "unaffected"}
         analysis_lookup = {k: "unsolved" for k in affected_lookup}
         sample_lookup = {"a1": {"family_id": "F1"}, "a2": {"family_id": float("nan")}}
-        parsed = {ot: parse_outlier_entries(row[f"OutlierSampleIds_{ot}"]) for ot in OUTLIER_TYPES}
         samples = find_affected_unsolved_samples_above_unaffected(
-            row, affected_lookup, analysis_lookup, parsed)
+            row, affected_lookup, analysis_lookup, parse_outlier_entries_by_type(row))
         self.assertEqual(list_affected_unsolved_outliers("L1", samples, sample_lookup), [
             {"LocusId": "L1", "outlier_type": "AllAlleles", "sample_id": "a1",
              "family_id": "F1", "allele_size": 45},

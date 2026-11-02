@@ -154,6 +154,23 @@ class FetchReferenceDataTests(unittest.TestCase):
         self.fetch("v2", force=True)
         self.assertEqual(self.fetched, ["v1", "v2", "v2"])
 
+    def test_remote_mode_prints_each_files_url_or_how_it_is_made_and_writes_nothing(self):
+        # TRExplorer's database is built from its catalog table and the gene table is exported by
+        # a query service, so neither has a URL to download it from; the SQL query and the
+        # manifest's #database_format suffix are not printed.
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            trails_setup.fetch_reference_data(self.tmpdir, remote=True)
+        printed = dict(line.split("[remote] ", 1)[1].split(" -> ", 1)
+                       for line in output.getvalue().splitlines() if "[remote] " in line)
+        self.assertTrue(printed[trails_setup.HPO_GENES_TO_PHENOTYPE_NAME].startswith("https://"))
+        self.assertIn(f"from the catalog table {trails_setup.TREXPLORER_ANNOTATIONS_TSV_URL} ",
+                      printed[trails_setup.TREXPLORER_ANNOTATIONS_DATABASE_NAME])
+        self.assertIn(trails_setup.GENELOOKUP_QUERY_URL, printed[trails_setup.GENELOOKUP_GENE_TABLE_NAME])
+        self.assertNotIn("SELECT", output.getvalue())
+        self.assertNotIn("#database_format", output.getvalue())
+        self.assertEqual(os.listdir(self.tmpdir), [])
+
     def test_a_failed_fetch_keeps_going_without_the_file(self):
         def failing_fetch(source, dest):
             raise OSError("offline")

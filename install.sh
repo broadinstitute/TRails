@@ -20,7 +20,8 @@
 #      See docs/INPUT_FORMATS.md.
 #
 # Env knobs: TRAILS_REPO=owner/name  TRAILS_VERSION=<branch|tag|commit>  TRAILS_INSTALL_DIR=./TRails
-#            TRAILS_FORCE=1 (force re-download)  TRAILS_REMOTE=1 (print ref-data URLs, don't download)
+#            TRAILS_FORCE=1 (force re-download)
+#            TRAILS_REMOTE=1 (print where each reference file comes from, don't download)
 
 set -euo pipefail
 
@@ -28,6 +29,7 @@ set -euo pipefail
 TRAILS_REPO="${TRAILS_REPO:-broadinstitute/TRails}"
 TRAILS_VERSION="${TRAILS_VERSION:-main}"
 INSTALL_DIR="${TRAILS_INSTALL_DIR:-./TRails}"
+[[ -n "${TRAILS_INSTALL_DIR:-}" ]] && INSTALL_DIR_EXPLICIT=1
 
 # Install directory may also be passed on the command line (takes precedence over the env
 # var). When piping from curl, pass args after `--`, e.g.:
@@ -53,9 +55,10 @@ if [[ "${BASH_SOURCE[0]:-}" == *install.sh ]]; then
 fi
 
 # In checkout mode the install operates on the checkout itself, so an explicit
-# install directory cannot be honored; reject it rather than silently ignoring it.
+# install directory (--dir, a positional directory or TRAILS_INSTALL_DIR) cannot be honored;
+# reject it rather than silently ignoring it.
 if [[ -n "$TRAILS_DIR" && "${INSTALL_DIR_EXPLICIT:-}" == "1" ]]; then
-  echo "ERROR: --dir is not supported when running from a checkout (it installs into the checkout at $TRAILS_DIR)." >&2
+  echo "ERROR: an install directory (--dir or TRAILS_INSTALL_DIR) is not supported when running from a checkout (it installs into the checkout at $TRAILS_DIR)." >&2
   echo "       To install into a different directory, run the curl bootstrap instead:" >&2
   echo "         curl -fsSL https://raw.githubusercontent.com/$TRAILS_REPO/$TRAILS_VERSION/install.sh | bash -s -- --dir $INSTALL_DIR" >&2
   exit 1
@@ -198,8 +201,8 @@ echo ""
 
 # --- Public (class-A) reference data ------------------------------------------------
 # The class-A reference list + fetch logic live in trails_setup.py (one source of truth,
-# shared with trails.py). TRAILS_REMOTE=1 prints URLs instead of downloading;
-# TRAILS_FORCE=1 re-downloads.
+# shared with trails.py). TRAILS_REMOTE=1 prints where each reference file comes from instead of
+# downloading it; TRAILS_FORCE=1 re-downloads.
 REMOTE_FLAG=""; [[ "${TRAILS_REMOTE:-0}" == "1" ]] && REMOTE_FLAG="--remote"
 FORCE_FLAG="";  [[ "${TRAILS_FORCE:-0}"  == "1" ]] && FORCE_FLAG="--force"
 echo "Class A (public, fetched):"

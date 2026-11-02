@@ -13,8 +13,8 @@
         integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4" crossorigin="anonymous"></script>
 
 <script>
-// Every page includes this header. API_BASE_URL is used by all of them; the rest is used by
-// index_page_template.html and swim_plot_template.html.
+// Every page includes this header. API_BASE_URL and errorFromResponse are used by all of them; the
+// rest is used by index_page_template.html and swim_plot_template.html.
 
 // The results server's API
 const API_BASE_URL = window.location.origin + '/api/v1';
@@ -105,6 +105,19 @@ async function fetchJsonOrNull(url, description) {
     }
 }
 
+// Set up a sample-ID filter dropdown, which also takes typed-in ids. The results page restores it
+// from the URL, so a typed-in value is escaped wherever Semantic UI shows it
+// (ESCAPING_ADDITIONS_DROPDOWN_SETTINGS, qc_shared_js.html).
+function setUpSampleIdFilterDropdown($dropdown) {
+    $dropdown.dropdown({
+        ...ESCAPING_ADDITIONS_DROPDOWN_SETTINGS,
+        allowAdditions: true,
+        clearable: true,
+        fullTextSearch: true,
+        forceSelection: false,
+    });
+}
+
 // Fill a sample-ID filter dropdown from an /api/v1/schema response
 function fillSampleIdDropdown($dropdown, schema) {
     setupDropdownMenu($dropdown, (schema.sample_ids || []).map(id => ({ name: id, value: id })));
@@ -165,101 +178,17 @@ async function refreshTagFilterDropdown($dropdown) {
     if (selected) $dropdown.dropdown('set selected', selected);
 }
 
-// The note editor (#edit-note-modal, at the end of this header): a multi-line textarea, so a note
-// keeps its line breaks. onNoteChanged(locusId) runs after a save or a delete, so the page can
-// repaint whatever shows the note.
-//
-// The modal is shared, with one textarea and one locus id, so a slow note fetch for an earlier
-// locus must not fill it after the user has opened a different one: only the newest open commits
-// its response.
-let noteEditorSeq = 0;
-let noteEditorOnNoteChanged = null;
-
-async function openNoteEditor(locusId, onNoteChanged) {
-    const $modal = $('#edit-note-modal');
-    const $textarea = $('#note-textarea');
-    const $existingSection = $('#existing-note-section');
-    const seq = ++noteEditorSeq;
-
-    // Fetch the locus's stored note. The editor must not open until that text is known: Save
-    // replaces the stored note with whatever the textarea holds, so an empty textarea shown over
-    // an existing note destroys it on save.
-    try {
-        const response = await fetch(`${ANNOTATIONS_API_URL}/${encodeURIComponent(locusId)}`);
-        if (!response.ok) throw await errorFromResponse(response);
-        const data = await response.json();
-        if (seq !== noteEditorSeq) return;  // a newer open already owns the modal
-
-        // Store locusId on modal for the save and delete handlers, together with the text it belongs to.
-        $modal.data('locus-id', locusId);
-        noteEditorOnNoteChanged = onNoteChanged;
-        if (data.note && data.note.note_text) {
-            $textarea.val(data.note.note_text);
-            $('#note-updated-at').text(data.note.updated_at || '');
-            $existingSection.show();
-        } else {
-            $textarea.val('');
-            $existingSection.hide();
-        }
-    } catch (e) {
-        if (seq !== noteEditorSeq) return;
-        // Deliberately no empty-editor fallback: the locus may well have a note, and saving over
-        // it would replace it with whatever the user typed. Report the failure and stay closed.
-        console.error('Load note error:', e);
-        alert('Failed to load the existing note: ' + e.message + '\n\nThe note was not opened for editing.');
-        return;
-    }
-
-    $modal
-        .modal({
-            // The swim plot opens the editor over its detail modal, which stays open underneath
-            allowMultiple: true,
-            onApprove: function() {
-                const noteText = $textarea.val().trim();
-                const currentLocusId = $modal.data('locus-id');
-
-                if (!noteText) {
-                    // If empty, just close (don't save empty note)
-                    return true;
-                }
-
-                // Semantic UI reads this return value synchronously, and an async function hands
-                // it a Promise, which is truthy: the modal would close before the save resolved,
-                // and a failed save would discard what the user typed. Hold the modal open and
-                // close it once the save succeeds.
-                saveNote(currentLocusId, noteText).then(function() {
-                    noteEditorOnNoteChanged(currentLocusId);
-                    $modal.modal('hide');
-                }).catch(function(e) {
-                    alert('Failed to save note: ' + e.message);
-                });
-                return false;
-            },
-            // No onHidden reset: the textarea and the existing-note section are set above before
-            // every show, and a reset there would run when the hide animation ends, which can be
-            // after a quick reopen has already filled the editor with the stored note.
-        })
-        .modal('show');
+// Set up a tag filter dropdown (only stored tags can be chosen) and fill it. Returns the fill's
+// promise (refreshTagFilterDropdown).
+function setUpTagFilterDropdown($dropdown) {
+    $dropdown.dropdown({
+        allowAdditions: false,
+        clearable: true,
+        fullTextSearch: true,
+        maxResults: 10,
+    });
+    return refreshTagFilterDropdown($dropdown);
 }
-
-// Delete note button inside the note editor
-$(document).on('click', '#delete-note-btn', async function() {
-    const locusId = $('#edit-note-modal').data('locus-id');
-
-    if (!confirm('Delete this note?')) return;
-
-    try {
-        await deleteNote(locusId);
-
-        // Clear the modal UI
-        $('#note-textarea').val('');
-        $('#existing-note-section').hide();
-
-        noteEditorOnNoteChanged(locusId);
-    } catch (e) {
-        alert('Failed to delete note: ' + e.message);
-    }
-});
 </script>
 
 <style>
@@ -275,15 +204,13 @@ body {
     background-color: #1b1c1d;
     color: white;
     padding: 15px 0;
+    position: relative;
 }
 #header-stripe .ui.grid {
     margin-top: 0; margin-bottom: 0;
 }
 #header-stripe .ui.grid > .column {
     padding-top: 0; padding-bottom: 0;
-}
-#header-stripe {
-    position: relative;
 }
 #header-stripe .header-inner {
     display: flex;
@@ -362,11 +289,11 @@ body {
 #results-table thead th[data-group-sort]:hover { color: #000; }
 #results-table thead th .sort-icon { color: #bbb; margin-left: 3px; font-size: 0.8em; }
 /* Each sortable field's direction is fixed on the server (SORT_MAPPING in results_server.py:
-   Region ascends, the rest descend) and a header click only adds or removes that field from the
-   sort list, so the indicator marks a column as part of the active sort instead of naming a
-   direction. That is also what the static up-down glyph in the header says. The grouped views'
-   header (Group Results By) marks its one sorted column the same way; the ASC / DESC radios next
-   to the group sort menu name that column's direction. */
+   Region and the two σ rank percentiles ascend, the rest descend) and a header click only adds or
+   removes that field from the sort list, so the indicator marks a column as part of the active
+   sort instead of naming a direction. That is also what the static up-down glyph in the header
+   says. The grouped views' header (Group Results By) marks its one sorted column the same way;
+   the ASC / DESC radios next to the group sort menu name that column's direction. */
 #results-table thead th.sorted-active .sort-icon { color: #333; }
 
 /* Right-align numeric columns */
@@ -812,29 +739,5 @@ body {
             </div>
         </div>
         <div class="one wide column"></div>
-    </div>
-</div>
-
-<!-- Edit Note Modal (the shared note editor, opened by openNoteEditor above) -->
-<div id="edit-note-modal" class="ui small modal">
-    <div class="header">Edit Note</div>
-    <div class="content">
-        <!-- Show existing note info if present -->
-        <div id="existing-note-section" style="display: none; margin-bottom: 12px;">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <span style="color: #888; font-size: 0.9em;">Last updated: <span id="note-updated-at"></span></span>
-                <button id="delete-note-btn" class="ui mini red basic button"><i class="trash icon"></i>Delete Note</button>
-            </div>
-        </div>
-        <div class="ui form">
-            <div class="field">
-                <label>Note</label>
-                <textarea id="note-textarea" rows="4" placeholder="Enter your note..."></textarea>
-            </div>
-        </div>
-    </div>
-    <div class="actions">
-        <div class="ui cancel button">Cancel</div>
-        <div class="ui primary ok button">Save</div>
     </div>
 </div>

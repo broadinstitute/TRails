@@ -13,7 +13,8 @@ stages, so there is no pandas dependency. Per row:
   * ``outlier_rank`` is 1-based in the order ``parse_outlier_entries`` yields,
     which is DESCENDING by allele size — so rank 1 is the largest allele.
   * ``motif_category`` bins motif size as ``"{size}bp"`` for sizes <= 24, else
-    ``"25+bp"``; a missing motif size becomes ``"Unknown"``.
+    ``"25+bp"``; a missing or non-positive motif size (0 for a blank motif cell)
+    becomes ``"Unknown"``.
   * A blank family_id, sex or phenotype_description is stored as NULL, as in the
     other tables (``analysis_columns.blank_to_none``), and a blank affected or
     analysis status is shown as ``"Unknown"``.
@@ -68,17 +69,17 @@ SWIM_PLOT_COLUMNS = [
 def _compute_motif_category(motif_size):
     """Bin a motif size into the swim-plot motif_category label.
 
+    A blank motif cell gives MotifSize 0 (``len("")``), which is a supported input
+    class. Binning it as ``"0bp"`` would hide those rows: the swim-plot endpoint
+    queries only ``1bp``..``24bp``, ``25+bp`` and ``Unknown``, so it would never
+    ask for them.
+
     Args:
         motif_size: The locus motif size in bp (int-like), or a missing value.
 
     Returns:
         ``"Unknown"`` if the motif size is missing or non-positive, ``"{size}bp"``
         for sizes <= 24, else ``"25+bp"``.
-
-    A blank motif cell gives MotifSize 0 (``len("")``), which is a supported input
-    class. Binning it as ``"0bp"`` would hide those rows: the swim-plot endpoint
-    queries only ``1bp``..``24bp``, ``25+bp`` and ``Unknown``, so it would never
-    ask for them.
     """
     if is_none_or_nan(motif_size) or int(motif_size) <= 0:
         return "Unknown"

@@ -135,6 +135,24 @@ def open_new_database(db_path):
     return duckdb_compat.connect(tmp_path), tmp_path
 
 
+def discard_new_database(connection, tmp_path):
+    """Closes and deletes a temporary database that a failed build will not finalize.
+
+    A partly written database (gigabytes for a large cohort, hundreds of megabytes for
+    TRExplorer's annotations) and its ``.wal`` sidecar would otherwise stay on disk until the
+    next build's ``open_new_database`` removes them.
+
+    Args:
+        connection: The open duckdb_compat connection to the temporary database. Closing it
+            twice is harmless, so it may already be closed.
+        tmp_path: The temporary database path (from ``open_new_database``).
+    """
+    connection.close()
+    for path in (tmp_path, tmp_path + ".wal"):
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def infer_column_types(column_order, rows):
     """Chooses the DuckDB type to declare each column with, from its values.
 
